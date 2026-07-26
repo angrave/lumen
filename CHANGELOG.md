@@ -4,6 +4,10 @@ All notable changes to Lumen will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- `flask db upgrade` and `flask db downgrade` now exit with a clear error when run against SQLite instead of failing partway through a migration and leaving the database in a partially-migrated state. The migration chain is PostgreSQL-only (three migrations use `ALTER TABLE … ADD/DROP CONSTRAINT`, which SQLite does not support); the SQLite dev path is `db.create_all()` + `flask db stamp head`. The guard is in `migrations/env.py` and allows read-only commands (`stamp`, `current`, `heads`, etc.) through untouched.
+
 ### Changed
 
 - Streaming `/v1/chat/completions` requests now record `duration` in `request_logs`. The streaming API path's `generate()` closure never measured elapsed time, so `update_stats()` was called without `duration` and every streaming API request was logged with `duration = 0.0` (the column default). The non-streaming API path, the audio path, and the chat streaming path (`send_message_stream`) all already recorded duration; only the streaming API path omitted it. No query currently reads `request_logs.duration`, so this has no functional effect today — it corrects the data for future analytics. As with the chat streaming path, the duration for a streaming response includes downstream client download time (the generator's `yield` blocks on the consumer); the two paths are recorded consistently.
