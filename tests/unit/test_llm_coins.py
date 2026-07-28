@@ -179,3 +179,34 @@ def test_subtract_coins_creates_balance_on_first_use(app, test_user, test_model)
         assert float(bal.coins_left) == 90.0
 
 
+def test_subtract_coins_skips_insert_when_balance_exists(app, test_user, test_model):
+    """An existing balance row must not trigger an INSERT.
+
+    An unconditional INSERT here fails the entity_id unique constraint on every
+    request after the first, logging a duplicate-key ERROR in Postgres for each.
+    """
+    entity_id, model_id = test_user["id"], test_model["id"]
+    with app.app_context():
+        from sqlalchemy import event
+        from lumen.extensions import db
+        from lumen.models.entity_balance import EntityBalance
+        from lumen.models.entity_limit import EntityLimit
+        from lumen.services.llm import subtract_coins
+        db.session.add(EntityLimit(entity_id=entity_id, max_coins=100, refresh_coins=0, starting_coins=100))
+        db.session.add(EntityBalance(entity_id=entity_id, coins_left=100))
+        db.session.commit()
+
+        inserts = []
+
+        def record(conn, cursor, statement, parameters, context, executemany):
+            if "INSERT INTO entity_balances" in statement:
+                inserts.append(statement)
+
+        event.listen(db.engine, "before_cursor_execute", record)
+        try:
+            subtract_coins(entity_id, model_id, 10.0)
+            db.session.commit()
+        finally:
+            event.remove(db.engine, "before_cursor_execute", record)
+
+        assert inserts == []
