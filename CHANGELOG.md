@@ -4,6 +4,15 @@ All notable changes to Lumen will be documented in this file.
 
 ## [Unreleased]
 
+### Security
+
+- Fixed a stored XSS in the admin users table (`admin/users.html`). User display names (from the IdP) were interpolated into `innerHTML` unescaped, in both link text and `aria-label`/`title` attributes; a name containing markup could execute JavaScript in an admin's session. Names are now escaped with an `escHtml` helper.
+- Fixed a stored XSS on the project detail page (`project_detail.html`). The manager "Remove"/"Make Owner" buttons passed the manager name into an inline `onclick` string via `| e`, which HTML-escapes quotes but is decoded back before JavaScript parsing — allowing string breakout. The name is now emitted as a safe JS literal with `| tojson`.
+
+### Fixed
+
+- The graylist consent modal on the project detail page threw `ReferenceError: marked is not defined` when enabling a model that carries a consent notice, because the `marked` and `DOMPurify` CDN scripts were never loaded on that page. Both scripts are now loaded, matching the other pages that render notices.
+
 ### Changed
 
 - Minimized the Docker image. The `Dockerfile` is now a multi-stage build: dependencies are installed in a builder stage and only the finished `/app` (venv + source) is copied into a clean runtime stage with `COPY --chown`, eliminating the full-tree duplication that the old `RUN chown -R /app` layer caused. `UV_NO_CACHE=1` is now set before `uv sync` (previously set after, so it had no effect), and uv is pulled from the official image instead of `pip install uv`. `entrypoint.sh` calls `flask`/`uvicorn` directly from the venv on `PATH` rather than via `uv run`, so the uv binary is no longer shipped in the runtime image. Dev-only artifacts (`models/`, `tests/`, `scripts/`, `chart/`, `.github/`, root markdown) are now excluded via `.dockerignore`.
