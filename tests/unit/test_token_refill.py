@@ -193,6 +193,82 @@ def test_new_balance_created_with_last_refill_at(app, test_user, test_model):
         assert updated == 1
 
 
+def test_default_pool_is_refilled(app, test_user):
+    """Users on the global default pool (defaults.tokens) — no EntityLimit, no group limit —
+    must be refilled from TOKEN_DEFAULTS (CODE-H1)."""
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.entity_balance import EntityBalance
+        from lumen.services.token_refill import refill_coin_balances
+        app.config["TOKEN_DEFAULTS"] = {"max": 100, "refresh": 10, "starting": 50}
+        try:
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            _add_balance(db, test_user["id"], coins_left=0,
+                          last_refill_at=now - timedelta(hours=3))
+            db.session.commit()
+
+            assert refill_coin_balances(now=now) == 1
+            bal = db.session.execute(select(EntityBalance).filter_by(entity_id=test_user["id"])).scalar_one_or_none()
+            assert float(bal.coins_left) == 30.0  # 0 + 3*10
+        finally:
+            app.config["TOKEN_DEFAULTS"] = None
+
+
+def test_refill_does_not_clobber_concurrent_deduction(app, test_user):
+    """Refill credits against the live DB balance, so a deduction that lands between the
+    refiller's read and its write is preserved rather than erased (SQL-1)."""
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.entity_balance import EntityBalance
+        from lumen.services import token_refill
+
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        _add_limit(db, test_user["id"], max_coins=1000, refresh_coins=10)
+        _add_balance(db, test_user["id"], coins_left=100,
+                      last_refill_at=now - timedelta(hours=2))
+        db.session.commit()
+
+        # Simulate a concurrent atomic deduction of 50 after the refiller has read the
+        # balance (100) but before it writes: patch _least to deduct mid-computation.
+        real_least = token_refill._least
+        stmt = select(EntityBalance).filter_by(entity_id=test_user["id"])
+
+        def deduct_then_least(*args, **kwargs):
+            bal = db.session.execute(stmt).scalar_one()
+            bal.coins_left = float(bal.coins_left) - 50
+            db.session.flush()
+            token_refill._least = real_least  # only interfere once
+            return real_least(*args, **kwargs)
+
+        token_refill._least = deduct_then_least
+        try:
+            token_refill.refill_coin_balances(now=now)
+        finally:
+            token_refill._least = real_least
+
+        bal = db.session.execute(stmt).scalar_one()
+        # 100 - 50 (concurrent spend) + 2*10 (refill) = 70; the spend is NOT lost.
+        assert float(bal.coins_left) == 70.0
+
+
+def test_aware_last_refill_at_does_not_abort_pass(app, test_user):
+    """A stray aware last_refill_at must not raise and abort the whole refill pass (CODE-H2)."""
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.entity_balance import EntityBalance
+        from lumen.services.token_refill import refill_coin_balances
+
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        _add_limit(db, test_user["id"], max_coins=100, refresh_coins=10)
+        _add_balance(db, test_user["id"], coins_left=50,
+                      last_refill_at=datetime.now(timezone.utc) - timedelta(hours=2))
+        db.session.commit()
+
+        assert refill_coin_balances(now=now) == 1
+        bal = db.session.execute(select(EntityBalance).filter_by(entity_id=test_user["id"])).scalar_one_or_none()
+        assert float(bal.coins_left) == 70.0  # 50 + 2*10
+
+
 def test_start_coin_refiller_starts_daemon_thread(app):
     """start_coin_refiller must start exactly one daemon thread (covers lines 41-51)."""
     import threading

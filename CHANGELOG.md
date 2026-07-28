@@ -12,6 +12,9 @@ All notable changes to Lumen will be documented in this file.
 ### Fixed
 
 - The graylist consent modal on the project detail page threw `ReferenceError: marked is not defined` when enabling a model that carries a consent notice, because the `marked` and `DOMPurify` CDN scripts were never loaded on that page. Both scripts are now loaded, matching the other pages that render notices.
+- Coin refill no longer clobbers concurrent deductions. `refill_coin_balances()` did a read-modify-write of `coins_left` in Python, which could overwrite an atomic `subtract_coins()` deduction that landed in between (lost update). Refill is now a single atomic `UPDATE ... SET coins_left = LEAST(:max, coins_left + :refill) WHERE last_refill_at <= :cutoff`, crediting against the live DB balance; the cutoff predicate also makes a second worker that already refilled a no-op.
+- Users drawing from the global default coin pool (`defaults.tokens`, with no entity- or group-level limit) are now refilled. The refiller previously only resolved entity and group limits and skipped these users entirely, so on a defaults-only deployment every balance drained to zero permanently.
+- First-login coin-balance initialization now stamps `last_refill_at` with `utcnow()` (naive UTC) instead of an aware `datetime.now(timezone.utc)`. The aware value could raise `TypeError` during the refill pass and, because the loop was not per-row guarded, abort refills for all users; the refiller now also tolerates a stray aware timestamp.
 
 ### Changed
 

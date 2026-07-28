@@ -33,6 +33,22 @@ def _greatest_default(element, compiler, **kw):
 def _greatest_sqlite(element, compiler, **kw):
     return "max(%s)" % compiler.process(element.clauses, **kw)
 
+
+class _least(FunctionElement):
+    """SQL LEAST(...); compiles to scalar min(...) on SQLite, which has no LEAST."""
+    name = "least"
+    inherit_cache = True
+
+
+@compiles(_least)
+def _least_default(element, compiler, **kw):
+    return "least(%s)" % compiler.process(element.clauses, **kw)
+
+
+@compiles(_least, "sqlite")
+def _least_sqlite(element, compiler, **kw):
+    return "min(%s)" % compiler.process(element.clauses, **kw)
+
 from lumen.extensions import db
 from lumen.timeutils import utcnow
 from lumen.models.entity_balance import EntityBalance
@@ -375,7 +391,6 @@ def subtract_coins(entity_id: int, model_config_id: int, coin_cost: float, effec
             ))
     except IntegrityError:
         pass
-
     # Single atomic deduction, floored at 0: deduct when affordable, otherwise zero
     # (the budget is a soft limit — see check_coin_budget). One statement so a
     # concurrent refill/credit can never be clobbered back to 0 by a separate zeroing.

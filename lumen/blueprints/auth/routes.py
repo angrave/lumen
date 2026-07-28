@@ -1,5 +1,4 @@
 import hashlib
-from datetime import datetime, timezone
 from http import HTTPStatus
 
 from flask import Blueprint, abort, redirect, url_for, session, render_template, current_app, jsonify
@@ -7,6 +6,7 @@ from flask_wtf.csrf import generate_csrf
 from sqlalchemy import delete, select
 
 from lumen.extensions import db, oauth
+from lumen.timeutils import utcnow
 from lumen.models.entity import Entity
 from lumen.models.entity_balance import EntityBalance
 from lumen.models.entity_limit import EntityLimit
@@ -138,7 +138,7 @@ def sync_user_from_yaml(entity: Entity, email: str, yaml_data: dict, userinfo=No
             db.session.add(EntityBalance(
                 entity_id=entity.id,
                 coins_left=starting_coins,
-                last_refill_at=datetime.now(timezone.utc),
+                last_refill_at=utcnow(),
             ))
 
 
