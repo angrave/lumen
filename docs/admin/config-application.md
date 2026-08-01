@@ -217,6 +217,8 @@ Optional Prometheus metrics endpoint at `/metrics`:
 
 > **Restart required:** Changing `api.prometheus.enabled` or `api.prometheus.multiproc_dir` requires a restart. `api.prometheus.token` is read on each request and takes effect immediately.
 
+`GET /metrics/debug` uses the same bearer token and returns a plain-text diagnostic dump: every outstanding DB connection-pool checkout (with the endpoint, thread and stack that took it) plus a stack dump of every live thread. Use it when `lumen_db_pool_connections{state="checked_out"}` or `{state="stranded"}` climbs and never falls back — whatever is still listed after several minutes is holding a connection it never returned.
+
 ## Environment Variables
 
 Some settings can be controlled via environment variables. The precedence depends on the setting:

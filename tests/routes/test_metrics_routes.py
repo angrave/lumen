@@ -68,3 +68,47 @@ def test_metrics_cumulative_totals_are_counters(app, client):
         "lumen_model_cost_coins_total",
     ):
         assert f"# TYPE {name} counter" in body
+
+
+def test_metrics_debug_requires_token(app, client):
+    original = _set_prometheus(app, {"enabled": True, "token": "secret"})
+    try:
+        assert client.get("/metrics/debug").status_code == HTTPStatus.UNAUTHORIZED
+    finally:
+        app.config["YAML_DATA"] = original
+
+
+def test_metrics_debug_returns_checkouts_and_thread_dump(app, client):
+    original = _set_prometheus(app, {"enabled": True, "token": "secret"})
+    try:
+        resp = client.get("/metrics/debug", headers={"Authorization": "Bearer secret"})
+    finally:
+        app.config["YAML_DATA"] = original
+    assert resp.status_code == HTTPStatus.OK
+    body = resp.get_data(as_text=True)
+    assert "=== all DB pool checkouts ===" in body
+    assert "=== thread dump ===" in body
+
+
+def test_metrics_debug_reports_pool_status(app, client):
+    """The pool's own view ships with the tracker's, so one capture can tell a
+    real leaked connection from a stale tracker entry."""
+    original = _set_prometheus(app, {"enabled": True, "token": "secret"})
+    try:
+        resp = client.get("/metrics/debug", headers={"Authorization": "Bearer secret"})
+    finally:
+        app.config["YAML_DATA"] = original
+    body = resp.get_data(as_text=True)
+    assert "=== DB pool status ===" in body
+    assert "=== what retains those checkouts ===" in body
+    # The test app runs on SQLite, whose pool has no queue semantics.
+    assert "checked_out=" in body or "no queue semantics" in body
+
+
+def test_metrics_exposes_stranded_pool_gauge(app, client):
+    original = _set_prometheus(app, {"enabled": True, "token": "secret"})
+    try:
+        body = client.get("/metrics", headers={"Authorization": "Bearer secret"}).get_data(as_text=True)
+    finally:
+        app.config["YAML_DATA"] = original
+    assert 'lumen_db_pool_connections{state="stranded"}' in body

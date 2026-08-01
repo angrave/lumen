@@ -132,10 +132,10 @@
             </span>
             {% else %}
             <button class="btn btn-sm btn-outline-danger"
-                    onclick="removeManager({{ project.id }}, {{ mgr.id }}, '{{ mgr.name | e }}')"
+                    onclick="removeManager({{ project.id }}, {{ mgr.id }}, {{ mgr.name | tojson }})"
                     aria-label="Remove {{ mgr.name }}">Remove</button>
             <button class="btn btn-sm btn-outline-primary"
-                    onclick="makeOwner({{ project.id }}, {{ mgr.id }}, '{{ mgr.name | e }}')"
+                    onclick="makeOwner({{ project.id }}, {{ mgr.id }}, {{ mgr.name | tojson }})"
                     aria-label="Make {{ mgr.name }} the owner">Make Owner</button>
             {% endif %}
           </div>
@@ -308,6 +308,8 @@
 {% endblock %}
 
 {% block scripts %}
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify/dist/purify.min.js"></script>
 <script src="{{ url_for('static', filename='js/user-search.js') }}"></script>
 <script>
 const PROJECT_ID = {{ project.id }};

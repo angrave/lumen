@@ -33,6 +33,22 @@ def _greatest_default(element, compiler, **kw):
 def _greatest_sqlite(element, compiler, **kw):
     return "max(%s)" % compiler.process(element.clauses, **kw)
 
+
+class _least(FunctionElement):
+    """SQL LEAST(...); compiles to scalar min(...) on SQLite, which has no LEAST."""
+    name = "least"
+    inherit_cache = True
+
+
+@compiles(_least)
+def _least_default(element, compiler, **kw):
+    return "least(%s)" % compiler.process(element.clauses, **kw)
+
+
+@compiles(_least, "sqlite")
+def _least_sqlite(element, compiler, **kw):
+    return "min(%s)" % compiler.process(element.clauses, **kw)
+
 from lumen.extensions import db
 from lumen.timeutils import utcnow
 from lumen.models.entity_balance import EntityBalance
@@ -366,15 +382,23 @@ def subtract_coins(entity_id: int, model_config_id: int, coin_cost: float, effec
         return
 
     # Ensure balance row exists (first API use before login creates it).
-    try:
-        with db.session.begin_nested():
-            db.session.add(EntityBalance(
-                entity_id=entity_id,
-                coins_left=starting,
-                last_refill_at=utcnow(),
-            ))
-    except IntegrityError:
-        pass
+    # Check first: the row exists for every entity after its first request, so an
+    # unconditional INSERT would fail — and log a Postgres duplicate-key ERROR —
+    # on every subsequent request. Same race-safe pattern as update_stats below:
+    # if two concurrent first-requests both see None, the loser's IntegrityError
+    # is swallowed and the atomic UPDATE succeeds for both.
+    if db.session.execute(
+        select(EntityBalance).filter_by(entity_id=entity_id)
+    ).scalar_one_or_none() is None:
+        try:
+            with db.session.begin_nested():
+                db.session.add(EntityBalance(
+                    entity_id=entity_id,
+                    coins_left=starting,
+                    last_refill_at=utcnow(),
+                ))
+        except IntegrityError:
+            pass
 
     # Single atomic deduction, floored at 0: deduct when affordable, otherwise zero
     # (the budget is a soft limit — see check_coin_budget). One statement so a

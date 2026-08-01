@@ -7,6 +7,16 @@ from flask import Blueprint, Response, current_app, request
 from prometheus_client import CollectorRegistry, generate_latest, CONTENT_TYPE_LATEST
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 
+from lumen.extensions import db
+from lumen.services.pool_tracker import (
+    STRANDED_AFTER,
+    format_holders,
+    format_outstanding,
+    stranded_count,
+    thread_dump,
+    watchdog,
+)
+
 logger = logging.getLogger(__name__)
 metrics_bp = Blueprint("metrics", __name__)
 
@@ -147,6 +157,10 @@ class LumenDBCollector:
             pool_m.add_metric(["checked_in"], float(pool.checkedin()))
             pool_m.add_metric(["checked_out"], float(checked_out))
             pool_m.add_metric(["overflow"], float(pool.overflow()))
+            # Checkouts held longer than any legitimate call site holds one (every
+            # streaming path releases its connection before the LLM call), so this
+            # rising is a leak rather than load. See services/pool_tracker.py.
+            pool_m.add_metric(["stranded"], float(stranded_count()))
             if limit:
                 pool_m.add_metric(["limit"], float(limit))
                 if checked_out >= 0.8 * limit:
@@ -154,6 +168,7 @@ class LumenDBCollector:
                         "DB pool near capacity: %d/%d connections checked out",
                         checked_out, limit,
                     )
+                watchdog(checked_out, limit)
         except AttributeError:
             # Pools without queue semantics (SQLite StaticPool/NullPool) lack these.
             pass
@@ -179,3 +194,47 @@ def metrics():
         http_output = generate_latest(REGISTRY)
 
     return Response(db_output + http_output, status=HTTPStatus.OK, mimetype=CONTENT_TYPE_LATEST)
+
+
+def _format_pool_status() -> str:
+    """The pool's own count of checked-out connections.
+
+    Printed alongside the tracker so one capture answers whether a reported
+    checkout is real: the tracker naming a holder while checked_out is 0 means
+    the entry is stale bookkeeping, not a leaked connection.
+    """
+    pool = db.engine.pool
+    try:
+        return (
+            f"{type(pool).__name__}: size={pool.size()} checked_in={pool.checkedin()} "
+            f"checked_out={pool.checkedout()} overflow={pool.overflow()} "
+            f"max_overflow={pool._max_overflow}\n"
+        )
+    except AttributeError:
+        # Pools without queue semantics (SQLite StaticPool/NullPool) lack these.
+        return f"{type(pool).__name__}: no queue semantics, nothing to report\n"
+
+
+@metrics_bp.route("/metrics/debug")
+@_metrics_auth_required
+def metrics_debug():
+    """Outstanding DB pool checkouts and a stack dump of every live thread.
+
+    Two things the gauges can't show: which call site is holding a connection it
+    never returned, and whether a WSGI worker thread is wedged mid-request (the
+    a2wsgi thread pool is small, so a few stuck threads stop the app serving).
+    Authenticated with the same bearer token as /metrics.
+    """
+    body = (
+        "=== DB pool status ===\n"
+        f"{_format_pool_status()}"
+        f"\n=== DB pool checkouts held over {STRANDED_AFTER:.0f}s ===\n"
+        f"{format_outstanding(min_age=STRANDED_AFTER)}"
+        f"\n=== what retains those checkouts ===\n"
+        f"{format_holders()}"
+        "\n=== all DB pool checkouts ===\n"
+        f"{format_outstanding()}"
+        "\n=== thread dump ===\n"
+        f"{thread_dump()}"
+    )
+    return Response(body, status=HTTPStatus.OK, mimetype="text/plain")

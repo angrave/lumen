@@ -3,7 +3,8 @@ import time
 import threading
 from datetime import datetime, timedelta
 
-from sqlalchemy import select
+from flask import current_app
+from sqlalchemy import select, update as sa_update
 
 from lumen.extensions import db
 from lumen.timeutils import utcnow
@@ -12,7 +13,7 @@ from lumen.models.entity_limit import EntityLimit
 from lumen.models.group import Group
 from lumen.models.group_member import GroupMember
 from lumen.models.group_limit import GroupLimit
-from lumen.services.llm import PoolLimit, best_group_pool_limit
+from lumen.services.llm import PoolLimit, best_group_pool_limit, _least
 
 logger = logging.getLogger(__name__)
 
@@ -61,10 +62,22 @@ def refill_coin_balances(now: datetime = None) -> int:
         ).scalars().all():
             group_limits_by_group.setdefault(gl.group_id, []).append(gl)
 
+    # Global default coin pool, used for entities with no entity- or group-level limit
+    # (mirrors get_pool_limit's fallback so default-pool users get refilled too).
+    td = current_app.config.get("TOKEN_DEFAULTS")
+    default_pool = None
+    if td and float(td["max"]) != 0:
+        default_pool = PoolLimit(float(td["max"]), float(td["refresh"]), float(td["starting"]))
+
     updated = 0
     for bal in due:
         eid = bal.entity_id
-        hours_elapsed = (now - bal.last_refill_at).total_seconds() / 3600
+        # last_refill_at is naive UTC; tolerate a stray aware value so one bad row
+        # can't abort the whole pass.
+        last_refill = bal.last_refill_at
+        if last_refill.tzinfo is not None:
+            last_refill = last_refill.replace(tzinfo=None)
+        hours_elapsed = (now - last_refill).total_seconds() / 3600
 
         if eid in entity_limits:
             el = entity_limits[eid]
@@ -76,15 +89,30 @@ def refill_coin_balances(now: datetime = None) -> int:
             group_limits = [gl for gid in gids for gl in group_limits_by_group.get(gid, [])]
             pool = best_group_pool_limit(group_limits)
             if pool is None:
+                pool = default_pool
+            if pool is None:
                 continue
 
         max_coins, refresh_coins, _starting = pool
         if max_coins == -2 or refresh_coins <= 0:
             continue
         refill = hours_elapsed * float(refresh_coins)
-        bal.coins_left = min(max_coins, float(bal.coins_left) + refill)
-        bal.last_refill_at = now
-        updated += 1
+        # Atomic set-based credit against the live DB balance so a concurrent atomic
+        # deduction (subtract_coins) is never clobbered by a stale read-modify-write.
+        # The last_refill_at cutoff makes a second worker that already refilled a no-op.
+        result = db.session.execute(
+            sa_update(EntityBalance)
+            .where(
+                EntityBalance.entity_id == eid,
+                EntityBalance.last_refill_at <= one_hour_ago,
+            )
+            .values(
+                coins_left=_least(float(max_coins), EntityBalance.coins_left + refill),
+                last_refill_at=now,
+            )
+        )
+        if result.rowcount:
+            updated += 1
     db.session.commit()
     return updated
 
