@@ -4,6 +4,8 @@ All notable changes to Lumen will be documented in this file.
 
 ## [Unreleased]
 
+## [1.24.0] - 2026-08-08
+
 ### Added
 
 - The [Connect page](/connect) and Connect guide now include an **R** example, using the [ellmer](https://ellmer.tidyverse.org) package's `chat_openai_compatible()`. The tab follows the model selector (text and vision examples) and reads the key from `LUMEN_API_KEY` via `credentials`.
