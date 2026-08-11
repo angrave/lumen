@@ -4,6 +4,8 @@ All notable changes to Lumen will be documented in this file.
 
 ## [Unreleased]
 
+## [1.24.1] - 2026-08-11
+
 ### Fixed
 
 - The HuggingFace README on the model detail page showed "README unavailable." for disabled models. The detail page renders for a disabled model, but the `/models/<name>/readme` endpoint it fetches from still filtered on `ModelConfig.active` and returned a 404. The README lookup now matches the detail page and only requires the model to exist.
