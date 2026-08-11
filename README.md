@@ -208,7 +208,7 @@ models:
     input_cost_per_million: 5.0    # for usage tracking only
     output_cost_per_million: 15.0
     description: "OpenAI GPT-4o"   # optional short description shown in the UI
-    url: https://huggingface.co/... # optional link shown in model details; HuggingFace URLs also load the model README
+    url: https://huggingface.co/... # optional link shown in model details; HuggingFace URLs also load the model README; a bare repo id (org/name) expands to huggingface.co
     knowledge_cutoff: "2024-04"    # optional, shown in model details
     supports_reasoning: false      # set true to stream chain-of-thought tokens
     supports_function_calling: true # optional, shown in model details

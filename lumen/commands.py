@@ -1,6 +1,8 @@
 import os
+import re
 import shutil
 import tempfile
+from urllib.parse import urlparse
 
 import click
 import yaml
@@ -180,6 +182,22 @@ def _apply_legacy_ack(ack_models, models_by_name):
             mc.needs_ack = True
 
 
+def _normalize_model_url(url):
+    """Expand a bare HuggingFace repo id (`org/name`) to a full huggingface.co URL.
+
+    Common HuggingFace host variants (huggingface.com, www.) are rewritten to
+    huggingface.co so the README lookup recognizes them; any other URL is used
+    as given."""
+    if not url:
+        return None
+    if "://" not in url and re.fullmatch(r"[\w.-]+/[\w.-]+", url):
+        return f"https://huggingface.co/{url}"
+    parsed = urlparse(url)
+    if parsed.netloc.lower() in ("huggingface.com", "www.huggingface.co", "www.huggingface.com"):
+        url = parsed._replace(netloc="huggingface.co").geturl()
+    return url
+
+
 def _apply_model_fields(config, model_def):
     config.input_cost_per_million = model_def["input_cost_per_million"]
     config.output_cost_per_million = model_def["output_cost_per_million"]
@@ -195,7 +213,7 @@ def _apply_model_fields(config, model_def):
         config.audio_cost_per_hour = None
     _apply_model_access(config, model_def)
     config.description = model_def.get("description") or None
-    config.url = model_def.get("url") or None
+    config.url = _normalize_model_url(model_def.get("url"))
     config.supports_function_calling = model_def.get("supports_function_calling")
     config.input_modalities = model_def.get("input_modalities") or None
     config.output_modalities = model_def.get("output_modalities") or None

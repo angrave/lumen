@@ -27,6 +27,32 @@ def test_sync_models_creates_model_config(app):
         assert float(mc.input_cost_per_million) == 1.0
 
 
+def test_sync_models_normalizes_bare_hf_repo_id(app):
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.model_config import ModelConfig
+        yaml_data = {
+            "models": [
+                {"name": "bare-id", "input_cost_per_million": 1.0, "output_cost_per_million": 1.0,
+                 "url": "meta-models/Muse-Glimmer-30B"},
+                {"name": "full-url", "input_cost_per_million": 1.0, "output_cost_per_million": 1.0,
+                 "url": "https://example.com/docs/model"},
+                {"name": "hf-com", "input_cost_per_million": 1.0, "output_cost_per_million": 1.0,
+                 "url": "https://huggingface.com/meta-models/Muse-Glimmer-30B"},
+                {"name": "hf-www", "input_cost_per_million": 1.0, "output_cost_per_million": 1.0,
+                 "url": "https://www.huggingface.co/meta-models/Muse-Glimmer-30B"},
+                {"name": "no-url", "input_cost_per_million": 1.0, "output_cost_per_million": 1.0},
+            ]
+        }
+        sync_models_from_yaml(yaml_data)
+        by_name = {m.model_name: m for m in db.session.execute(select(ModelConfig)).scalars().all()}
+        assert by_name["bare-id"].url == "https://huggingface.co/meta-models/Muse-Glimmer-30B"
+        assert by_name["full-url"].url == "https://example.com/docs/model"
+        assert by_name["hf-com"].url == "https://huggingface.co/meta-models/Muse-Glimmer-30B"
+        assert by_name["hf-www"].url == "https://huggingface.co/meta-models/Muse-Glimmer-30B"
+        assert by_name["no-url"].url is None
+
+
 def test_sync_models_updates_existing(app):
     with app.app_context():
         from lumen.extensions import db

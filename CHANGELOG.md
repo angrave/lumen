@@ -4,6 +4,10 @@ All notable changes to Lumen will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- A model's `url` in config may now be a bare HuggingFace repo id (e.g. `meta-models/Muse-Glimmer-30B`); it is expanded to `https://huggingface.co/<id>` when the config is synced. Common HuggingFace host variants (`huggingface.com`, `www.`) are rewritten to `huggingface.co` so the README still loads; any other full URL is used as given.
+
 ## [1.24.1] - 2026-08-11
 
 ### Fixed

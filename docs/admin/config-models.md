@@ -77,7 +77,7 @@ These fields tell the UI what the model can do and help users pick the right one
 | Field | Description |
 |-------|-------------|
 | `description` | Short text shown next to the model name in the UI |
-| `url` | Link to the model's documentation page (e.g. HuggingFace) |
+| `url` | Link to the model's documentation page. A bare HuggingFace repo id (e.g. `meta-models/Muse-Glimmer-30B`) expands to `https://huggingface.co/<id>`, and HuggingFace host variants (`huggingface.com`, `www.`) are rewritten to `huggingface.co`; any other full URL is used as given. `huggingface.co` URLs also show the model's README on the detail page |
 | `context_window` | Maximum total tokens for input + output in one request |
 | `max_output_tokens` | Maximum tokens the model can generate in a single reply |
 | `knowledge_cutoff` | Month the model's training data extends to, e.g. `"2025-04"` |
