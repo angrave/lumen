@@ -89,7 +89,7 @@ def detail(model_name):
 @models_page_bp.route("/models/<path:model_name>/readme")
 @login_required
 def model_readme(model_name):
-    config = db.first_or_404(select(ModelConfig).where(ModelConfig.model_name == model_name, ModelConfig.active))
+    config = db.first_or_404(select(ModelConfig).where(ModelConfig.model_name == model_name))
     parsed = urlparse(config.url or "")
     if parsed.netloc != "huggingface.co":
         return "", HTTPStatus.NOT_FOUND

@@ -103,3 +103,31 @@ def test_model_detail_inactive_renders(app, auth_client):
     resp = auth_client.get("/models/inactive-detail")
     assert resp.status_code == HTTPStatus.OK
     assert b"inactive-detail" in resp.data
+
+
+def test_model_readme_inactive_serves_card(app, auth_client, monkeypatch):
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.model_config import ModelConfig
+        m = ModelConfig(
+            model_name="inactive-readme",
+            input_cost_per_million=1.0,
+            output_cost_per_million=1.0,
+            url="https://huggingface.co/org/Some-Model",
+            disabled=True,
+        )
+        db.session.add(m)
+        db.session.commit()
+
+    class FakeResponse:
+        text = "---\nlicense: apache-2.0\n---\n# Card body\n"
+
+        def raise_for_status(self):
+            pass
+
+    from lumen.blueprints.models_page import routes
+    monkeypatch.setattr(routes.http_requests, "get", lambda *a, **kw: FakeResponse())
+
+    resp = auth_client.get("/models/inactive-readme/readme")
+    assert resp.status_code == HTTPStatus.OK
+    assert resp.data == b"# Card body\n"
