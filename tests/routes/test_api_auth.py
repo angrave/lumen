@@ -622,10 +622,10 @@ def test_list_models_response_includes_required_openai_fields(
 # Upstream error pass-through
 # ---------------------------------------------------------------------------
 def _make_openai_error(error_cls, status, body):
-    import httpx
-    req = httpx.Request("POST", "http://upstream/v1/chat/completions")
+    import httpx2
+    req = httpx2.Request("POST", "http://upstream/v1/chat/completions")
     return error_cls(body.get("message", "error"),
-                     response=httpx.Response(status, request=req), body=body)
+                     response=httpx2.Response(status, request=req), body=body)
 
 
 @pytest.mark.parametrize("body, expected_msg, expected_type", [

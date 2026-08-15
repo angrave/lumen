@@ -4,6 +4,10 @@ All notable changes to Lumen will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- CI test failures (`ModuleNotFoundError: No module named 'httpx'`): the openai 3.x SDK now uses `httpx2`, and the upstream-error tests were updated to match. Dependency floors were raised to the majors actually locked and tested (`openai>=3`, `flask-limiter>=4`, `pypdf>=6`, `psutil>=7`, `pytest>=9`, `pytest-cov>=7`).
+
 ## [1.25.0] - 2026-08-14
 
 ### Changed
