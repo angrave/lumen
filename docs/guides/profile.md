@@ -36,11 +36,27 @@ Below the stat cards, a row summarizes your web chat activity:
 
 | Column | Description |
 |--------|------------|
-| **Conversations** | Number of conversations you have started |
+| **Conversations** | Number of conversations you have started, all time — kept even if you delete conversations or disable storage |
 | **Requests** | Total messages sent through the chat interface |
 | **Tokens** | Total input + output tokens via web chat |
 | **Coins** | Total coins spent on web chat |
 | **Last Used** | When you most recently sent a message |
+
+### Deleting All Conversations
+
+Click the trash icon in the web chat table to permanently remove every conversation (and all of its messages) from your account. A confirmation dialog opens first — the deletion cannot be undone. Usage statistics (conversation count, requests, tokens, coins) are kept.
+
+### Disabling Conversation Storage
+
+Check **Disable storing conversations** above the web chat table if you do not want Lumen to keep a record of your web chats. Because disabling storage also deletes everything already stored, a confirmation dialog explains this before the switch takes effect; canceling the dialog leaves storage on.
+
+While storage is disabled:
+
+- Chat works normally — you can still hold multi-turn conversations.
+- Nothing is saved: no conversations appear in the chat sidebar, and the sidebar shows a notice with a link back to this setting.
+- Usage statistics, including the conversation count, are still recorded.
+
+Turn the switch off at any time to resume storing new conversations. Previously deleted conversations cannot be recovered.
 
 ## API Keys
 

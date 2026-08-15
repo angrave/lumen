@@ -14,6 +14,7 @@ erDiagram
         string initials
         string gravatar_hash
         bool active
+        bool store_conversations
         datetime created_at
         string model_access_default
     }
@@ -157,6 +158,7 @@ erDiagram
         bigint output_tokens
         bigint audio_seconds
         numeric cost
+        int conversations
         datetime last_used_at
     }
 
@@ -263,6 +265,7 @@ Unified table for both human users (authenticated via OAuth) and programmatic pr
 | `initials` | String(4) | NO | Short initials used in UI avatars |
 | `gravatar_hash` | String(64) | YES | MD5 hash of the user's email for Gravatar lookups; users only |
 | `active` | Boolean | NO | Whether the entity can make requests. Inactive entities are blocked. |
+| `store_conversations` | Boolean | NO | Whether webchat conversations are persisted for this user. Default `true`. |
 | `created_at` | DateTime | NO | UTC timestamp when the entity was created |
 | `model_access_default` | String(16) | YES | Default model access policy for models not explicitly listed: `'allowed'` or `'blocked'`. Used for project entities; users inherit from group membership. |
 
@@ -515,6 +518,7 @@ Pre-aggregated usage totals per entity across all models and sources. One row pe
 | `output_tokens` | BigInteger | NO | Total output tokens produced across all models and sources |
 | `audio_seconds` | BigInteger | NO | Total seconds of audio transcribed/translated across all models and sources |
 | `cost` | Numeric(12,6) | NO | Total cost in USD across all models and sources |
+| `conversations` | Integer | NO | Total webchat conversations started. Retained even when conversations are deleted or storage is disabled. |
 | `last_used_at` | DateTime | YES | UTC timestamp of the most recent request by this entity; null if never used |
 
 **Notes:**

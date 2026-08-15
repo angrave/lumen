@@ -15,6 +15,10 @@
         <span class="fw-semibold small d-none d-md-inline">Conversations</span>
         <button class="btn btn-sm btn-primary ms-auto" id="new-chat-btn">+ New</button>
       </div>
+      {% if not store_conversations %}
+      <p class="text-muted small px-3 py-2 mb-0">Conversation storing is disabled.
+        <a href="{{ url_for('profile.index') }}">Change in profile</a></p>
+      {% endif %}
       <div id="conv-list" class="conv-list overflow-auto flex-fill" role="list" aria-label="Conversations"></div>
     </div>
   </div>

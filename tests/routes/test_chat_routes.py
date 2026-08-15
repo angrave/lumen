@@ -287,6 +287,149 @@ def test_chat_stream_error_path_holds_no_connection(app, auth_client, test_user,
         resp.close()
 
 
+def test_chat_stream_skips_persistence_when_storing_disabled(app, auth_client, test_user, test_model, monkeypatch):
+    """With store_conversations off, a stream persists nothing and the final
+    event carries no conversation_id — even if the client sends one."""
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.entity import Entity
+        _grant_unlimited_pool(app, test_user["id"])
+        db.session.get(Entity, test_user["id"]).store_conversations = False
+        db.session.commit()
+
+    def fake_stream(messages, model, entity_id=None, source="chat", effective=None):
+        yield "Hello", None, None
+        yield None, None, {
+            "reply": "Hello",
+            "model": "test-model",
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "thinking": None,
+            "thinking_tokens": None,
+            "cost": 0.0,
+            "duration": 0.1,
+            "time_to_first_token": 0.05,
+            "output_speed": 10.0,
+        }
+
+    from lumen.blueprints.chat import routes as chat_routes
+    monkeypatch.setattr(chat_routes, "send_message_stream", fake_stream)
+
+    resp = auth_client.post("/chat/stream", json={
+        "messages": [{"role": "user", "content": "hi"}],
+        "model": test_model["model_name"],
+        "conversation_id": 12345,
+    })
+    assert resp.status_code == HTTPStatus.OK
+
+    body = resp.get_data(as_text=True)
+    assert '"done": true' in body
+    assert "conversation_id" not in body
+
+    with app.app_context():
+        from sqlalchemy import func, select
+        from lumen.extensions import db
+        from lumen.models.conversation import Conversation
+        from lumen.models.message import Message
+        assert db.session.scalar(select(func.count(Conversation.id))) == 0
+        assert db.session.scalar(select(func.count(Message.id))) == 0
+
+
+def _fake_stream(messages, model, entity_id=None, source="chat", effective=None):
+    yield "Hello", None, None
+    yield None, None, {
+        "reply": "Hello",
+        "model": "test-model",
+        "input_tokens": 1,
+        "output_tokens": 1,
+        "thinking": None,
+        "thinking_tokens": None,
+        "cost": 0.0,
+        "duration": 0.1,
+        "time_to_first_token": 0.05,
+        "output_speed": 10.0,
+    }
+
+
+def _conversation_counter(app, entity_id):
+    with app.app_context():
+        from sqlalchemy import select
+        from lumen.extensions import db
+        from lumen.models.entity_stat import EntityStat
+        return db.session.scalar(
+            select(EntityStat.conversations).filter_by(entity_id=entity_id)
+        ) or 0
+
+
+def test_chat_stream_counts_conversation_when_storing(app, auth_client, test_user, test_model, monkeypatch):
+    """A new stored conversation bumps the persistent counter; continuing it does not."""
+    with app.app_context():
+        _grant_unlimited_pool(app, test_user["id"])
+
+    from lumen.blueprints.chat import routes as chat_routes
+    monkeypatch.setattr(chat_routes, "send_message_stream", _fake_stream)
+
+    resp = auth_client.post("/chat/stream", json={
+        "messages": [{"role": "user", "content": "hi"}],
+        "model": test_model["model_name"],
+    })
+    body = resp.get_data(as_text=True)
+    assert '"done": true' in body
+    assert _conversation_counter(app, test_user["id"]) == 1
+
+    import json as _json
+    conv_id = _json.loads(body.strip().splitlines()[-1].removeprefix("data: "))["conversation_id"]
+
+    resp = auth_client.post("/chat/stream", json={
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "Hello"},
+            {"role": "user", "content": "more"},
+        ],
+        "model": test_model["model_name"],
+        "conversation_id": conv_id,
+    })
+    assert '"done": true' in resp.get_data(as_text=True)
+    assert _conversation_counter(app, test_user["id"]) == 1
+
+
+def test_chat_stream_counts_conversation_when_storing_disabled(app, auth_client, test_user, test_model, monkeypatch):
+    """With storage off, the first exchange bumps the counter; follow-ups don't."""
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.entity import Entity
+        _grant_unlimited_pool(app, test_user["id"])
+        db.session.get(Entity, test_user["id"]).store_conversations = False
+        db.session.commit()
+
+    from lumen.blueprints.chat import routes as chat_routes
+    monkeypatch.setattr(chat_routes, "send_message_stream", _fake_stream)
+
+    resp = auth_client.post("/chat/stream", json={
+        "messages": [{"role": "user", "content": "hi"}],
+        "model": test_model["model_name"],
+    })
+    assert '"done": true' in resp.get_data(as_text=True)
+    assert _conversation_counter(app, test_user["id"]) == 1
+
+    resp = auth_client.post("/chat/stream", json={
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "Hello"},
+            {"role": "user", "content": "more"},
+        ],
+        "model": test_model["model_name"],
+    })
+    assert '"done": true' in resp.get_data(as_text=True)
+    assert _conversation_counter(app, test_user["id"]) == 1
+
+    with app.app_context():
+        from sqlalchemy import func, select
+        from lumen.extensions import db
+        from lumen.models.conversation import Conversation
+        assert db.session.scalar(select(func.count(Conversation.id))) == 0
+
+
 def test_chat_stream_whitelist_passes_access(app, auth_client, test_user, test_model):
     """Whitelist clears the access gate (stream starts, fails at LLM level)."""
     with app.app_context():

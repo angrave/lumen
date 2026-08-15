@@ -28,6 +28,8 @@ class Entity(db.Model):
     gravatar_hash: Mapped[Optional[str]] = mapped_column(db.String(64), comment="MD5 hash of email for Gravatar lookups; users only")
     # Inactive entities are blocked from making any requests
     active: Mapped[bool] = mapped_column(db.Boolean, default=True, comment="Inactive entities are blocked from making requests")
+    # When False, webchat conversations are not persisted for this user
+    store_conversations: Mapped[bool] = mapped_column(db.Boolean, default=True, comment="Whether webchat conversations are persisted for this user")
     created_at: Mapped[Optional[datetime]] = mapped_column(db.DateTime, default=utcnow, comment="UTC creation timestamp")
     # Default access policy for models not explicitly listed in entity_model_access.
     # 'allowed' | 'blocked'; primarily used for project entities.

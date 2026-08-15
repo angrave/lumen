@@ -28,6 +28,7 @@ class EntityStat(db.Model):
     output_tokens: Mapped[int] = mapped_column(db.BigInteger, default=0, comment="Total output tokens produced across all models and sources")
     audio_seconds: Mapped[int] = mapped_column(db.BigInteger, default=0, comment="Total seconds of audio transcribed/translated across all models and sources")
     cost: Mapped[Decimal] = mapped_column(db.Numeric(12, 6), default=0, comment="Total cost in USD across all models and sources")
+    conversations: Mapped[int] = mapped_column(db.Integer, default=0, comment="Total webchat conversations started; retained even when conversations are deleted or storage is disabled")
     last_used_at: Mapped[Optional[datetime]] = mapped_column(db.DateTime, comment="UTC timestamp of the most recent request by this entity")
 
     __table_args__ = (

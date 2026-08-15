@@ -102,6 +102,15 @@
 
 <!-- Web Chat -->
 <h2 class="mt-3 mb-0">Web Chat</h2>
+{% if not viewing_user %}
+<div class="d-flex justify-content-between align-items-center mt-2 mb-1">
+  <div class="form-check mb-0">
+    <input class="form-check-input" type="checkbox" id="store-conversations-toggle"
+           {% if not profile_entity.store_conversations %}checked{% endif %}>
+    <label class="form-check-label text-muted small" for="store-conversations-toggle">Disable storing conversations</label>
+  </div>
+</div>
+{% endif %}
 <div class="table-responsive mt-2">
   <table class="table table-bordered align-middle mb-0">
     <caption class="visually-hidden">Web chat usage statistics</caption>
@@ -112,6 +121,7 @@
         <th class="text-end">Tokens</th>
         <th class="text-end">Coins</th>
         <th>Last Used</th>
+        {% if not viewing_user %}<th><span class="visually-hidden">Actions</span></th>{% endif %}
       </tr>
     </thead>
     <tbody>
@@ -121,10 +131,22 @@
         <td class="text-end">{{ "{:,}".format((chat_agg[1] or 0) + (chat_agg[2] or 0)) }}</td>
         <td class="text-end">{{ "%.2f"|format((chat_agg[3] or 0)|float) }}</td>
         <td>{% if chat_agg[4] %}<span class="local-datetime" data-utc="{{ chat_agg[4].strftime('%Y-%m-%dT%H:%M:%SZ') }}"></span>{% else %}—{% endif %}</td>
+        {% if not viewing_user %}
+        <td class="text-center">
+          <button class="btn btn-sm btn-outline-danger" id="purge-conversations-btn"
+                  title="Delete all conversations" aria-label="Delete all conversations"
+                  aria-haspopup="dialog"><i class="bi bi-trash" aria-hidden="true"></i></button>
+        </td>
+        {% endif %}
       </tr>
     </tbody>
   </table>
 </div>
+{% if not viewing_user %}
+{# Screen-reader-only feedback: visible text here would change the page height
+   and make the content below jump. #}
+<div id="chat-settings-status" role="alert" aria-live="assertive" class="visually-hidden"></div>
+{% endif %}
 
 
 <!-- API Keys -->
@@ -271,6 +293,25 @@
       <div class="modal-footer">
         <button class="btn btn-secondary" data-bs-dismiss="modal">Discard</button>
         <button class="btn btn-primary" id="save-key-btn" disabled>Save Key</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Delete Conversations confirmation modal -->
+<div class="modal fade" id="purgeConversationsModal" tabindex="-1" aria-labelledby="purgeConversationsModal-title" aria-modal="true" role="dialog">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header border-danger bg-danger bg-opacity-10">
+        <h2 class="modal-title h5" id="purgeConversationsModal-title">Delete all conversations?</h2>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close Delete Conversations dialog"></button>
+      </div>
+      <div class="modal-body">
+        <p class="mb-0" id="purge-conversations-body"></p>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button type="button" class="btn btn-danger" id="purge-conversations-confirm-btn">Delete all conversations</button>
       </div>
     </div>
   </div>
@@ -666,6 +707,75 @@ document.getElementById("save-key-btn").addEventListener("click", async function
     const data = await resp.json();
     alert("Error: " + (data.error || "Unknown"));
   }
+});
+} // end if (!IS_ADMIN_VIEW)
+
+// ── Conversation storage controls ─────────────────────────────────────────
+if (!IS_ADMIN_VIEW) {
+const purgeModalEl = document.getElementById("purgeConversationsModal");
+const purgeModal = new bootstrap.Modal(purgeModalEl);
+const purgeBody = document.getElementById("purge-conversations-body");
+const purgeConfirmBtn = document.getElementById("purge-conversations-confirm-btn");
+const storeToggle = document.getElementById("store-conversations-toggle");
+const chatSettingsStatus = document.getElementById("chat-settings-status");
+let purgeMode = null;      // "purge" | "disable"
+let purgeConfirmed = false;
+
+function openPurgeModal(mode) {
+  purgeMode = mode;
+  purgeConfirmed = false;
+  purgeBody.textContent = mode === "disable"
+    ? "Disabling conversation storage will permanently delete all of your existing webchat conversations, and new conversations will not be saved. This cannot be undone."
+    : "This will permanently delete all of your webchat conversations. This cannot be undone.";
+  purgeModal.show();
+}
+
+document.getElementById("purge-conversations-btn").addEventListener("click", () => openPurgeModal("purge"));
+
+storeToggle.addEventListener("change", async () => {
+  if (storeToggle.checked) {
+    openPurgeModal("disable");
+    return;
+  }
+  // Re-enabling storage needs no confirmation and deletes nothing.
+  const resp = await fetch("/profile/settings/store-conversations", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-CSRFToken": csrfToken },
+    body: JSON.stringify({ enabled: true }),
+  });
+  if (resp.ok) {
+    chatSettingsStatus.textContent = "Conversation storage enabled.";
+  } else {
+    storeToggle.checked = true;
+    chatSettingsStatus.textContent = "Failed to update conversation storage setting.";
+  }
+});
+
+purgeConfirmBtn.addEventListener("click", async () => {
+  purgeConfirmBtn.disabled = true;
+  const resp = purgeMode === "disable"
+    ? await fetch("/profile/settings/store-conversations", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-CSRFToken": csrfToken },
+        body: JSON.stringify({ enabled: false }),
+      })
+    : await fetch("/profile/conversations", { method: "DELETE", headers: { "X-CSRFToken": csrfToken } });
+  purgeConfirmBtn.disabled = false;
+  if (resp.ok) {
+    purgeConfirmed = true;
+    chatSettingsStatus.textContent = purgeMode === "disable"
+      ? "Conversation storage disabled and all conversations deleted."
+      : "All conversations deleted.";
+  } else {
+    chatSettingsStatus.textContent = "Failed to delete conversations.";
+  }
+  purgeModal.hide();
+});
+
+// Covers Cancel, ✕, Esc, and backdrop dismiss: revert the toggle unless confirmed.
+purgeModalEl.addEventListener("hidden.bs.modal", () => {
+  if (!purgeConfirmed && purgeMode === "disable") storeToggle.checked = false;
+  purgeMode = null;
 });
 } // end if (!IS_ADMIN_VIEW)
 

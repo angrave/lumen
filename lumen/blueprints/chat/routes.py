@@ -11,12 +11,15 @@ from werkzeug.utils import secure_filename
 
 logger = logging.getLogger(__name__)
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, or_, select, update as sa_update
+from sqlalchemy.exc import IntegrityError
 
 from lumen.decorators import login_required
 from lumen.extensions import db, limiter
 from lumen.timeutils import utcnow
 from lumen.models.conversation import Conversation
+from lumen.models.entity import Entity
+from lumen.models.entity_stat import EntityStat
 from lumen.models.message import Message
 from lumen.models.model_config import ModelConfig
 from lumen.models.model_endpoint import ModelEndpoint
@@ -54,6 +57,25 @@ def _message_content_to_text(content):
         elif block.get("type") == "image_url":
             parts.append("[Image: attached]")
     return "\n".join(parts)
+
+
+def _count_conversation_started(entity_id):
+    """Bump the persistent conversation counter in entity_stats.
+
+    The counter survives conversation deletion and disabled storage. Uses the
+    same race-safe ensure-row + atomic-increment pattern as llm.py's stats.
+    """
+    if db.session.execute(select(EntityStat).filter_by(entity_id=entity_id)).scalar_one_or_none() is None:
+        try:
+            with db.session.begin_nested():
+                db.session.add(EntityStat(entity_id=entity_id, requests=0, input_tokens=0, output_tokens=0, cost=0))
+        except IntegrityError:
+            pass
+    db.session.execute(
+        sa_update(EntityStat)
+        .where(EntityStat.entity_id == entity_id)
+        .values(conversations=EntityStat.conversations + 1)
+    )
 
 
 def _chat_entity_id():
@@ -104,7 +126,11 @@ def chat_page():
         notice = (m.ack_message or default_ack) if status == "needs_ack" else None
         available_models.append({"model": m, "status": status, "consented": consented, "consent_at": consent_at, "notice": notice})
 
-    return render_template("chat.html", available_models=available_models)
+    store_conversations = db.session.execute(
+        select(Entity.store_conversations).where(Entity.id == entity_id)
+    ).scalar_one()
+
+    return render_template("chat.html", available_models=available_models, store_conversations=store_conversations)
 
 
 
@@ -191,6 +217,15 @@ def chat_stream():
     if not ok:
         return jsonify({"error": msg}), code
 
+    store_conversations = db.session.execute(
+        select(Entity.store_conversations).where(Entity.id == entity_id)
+    ).scalar_one()
+    if not store_conversations:
+        conversation_id = None
+    # With storage disabled there is no conversation row to signal a new chat;
+    # a payload with a single user message is the first exchange of one.
+    is_new_conversation = sum(1 for m in messages if m.get("role") == "user") == 1
+
     # Release the connection checked out by the queries above — the streaming
     # loop below can run for many minutes with no further DB activity, and
     # holding a connection idle-in-transaction that long risks Postgres
@@ -224,53 +259,61 @@ def chat_stream():
                 yield f"data: {json.dumps({'error': 'Empty response from model'})}\n\n"
                 return
 
-            # The conversation write gets its own short-lived app context: its
-            # teardown releases the session before the final yield below, so no
-            # connection is held while the last event is in flight — if the
-            # client disconnected, this generator may never be closed.
-            with app.app_context():
-                conv = None
-                if conversation_id:
-                    conv = db.session.execute(
-                        select(Conversation).filter_by(id=conversation_id, entity_id=entity_id)
-                    ).scalar_one_or_none()
+            if store_conversations:
+                # The conversation write gets its own short-lived app context: its
+                # teardown releases the session before the final yield below, so no
+                # connection is held while the last event is in flight — if the
+                # client disconnected, this generator may never be closed.
+                with app.app_context():
+                    conv = None
+                    if conversation_id:
+                        conv = db.session.execute(
+                            select(Conversation).filter_by(id=conversation_id, entity_id=entity_id)
+                        ).scalar_one_or_none()
 
-                if conv is None:
+                    if conv is None:
+                        user_msg = next((m for m in reversed(messages) if m["role"] == "user"), None)
+                        raw_content = _message_content_to_text(user_msg["content"]) if user_msg else ""
+                        title = raw_content[:40] if raw_content else "New Chat"
+                        conv = Conversation(entity_id=entity_id, title=title, model=model)
+                        db.session.add(conv)
+                        db.session.flush()
+                        _count_conversation_started(entity_id)
+
                     user_msg = next((m for m in reversed(messages) if m["role"] == "user"), None)
-                    raw_content = _message_content_to_text(user_msg["content"]) if user_msg else ""
-                    title = raw_content[:40] if raw_content else "New Chat"
-                    conv = Conversation(entity_id=entity_id, title=title, model=model)
-                    db.session.add(conv)
-                    db.session.flush()
+                    if user_msg:
+                        db.session.add(Message(
+                            conversation_id=conv.id, role="user",
+                            content=_message_content_to_text(user_msg["content"])
+                        ))
 
-                user_msg = next((m for m in reversed(messages) if m["role"] == "user"), None)
-                if user_msg:
                     db.session.add(Message(
-                        conversation_id=conv.id, role="user",
-                        content=_message_content_to_text(user_msg["content"])
+                        conversation_id=conv.id,
+                        role="assistant",
+                        content=result["reply"],
+                        input_tokens=result["input_tokens"],
+                        output_tokens=result["output_tokens"],
+                        thinking=result.get("thinking"),
+                        thinking_tokens=result.get("thinking_tokens"),
+                        time_to_first_token=result.get("time_to_first_token"),
+                        duration=result.get("duration"),
+                        output_speed=result.get("output_speed"),
                     ))
 
-                db.session.add(Message(
-                    conversation_id=conv.id,
-                    role="assistant",
-                    content=result["reply"],
-                    input_tokens=result["input_tokens"],
-                    output_tokens=result["output_tokens"],
-                    thinking=result.get("thinking"),
-                    thinking_tokens=result.get("thinking_tokens"),
-                    time_to_first_token=result.get("time_to_first_token"),
-                    duration=result.get("duration"),
-                    output_speed=result.get("output_speed"),
-                ))
+                    conv.updated_at = utcnow()
+                    # Read conv.id before commit: expire_on_commit would otherwise
+                    # check out a fresh connection to refresh it, and that connection
+                    # would still be held during the final yield below.
+                    conv_id = conv.id
+                    db.session.commit()
 
-                conv.updated_at = utcnow()
-                # Read conv.id before commit: expire_on_commit would otherwise
-                # check out a fresh connection to refresh it, and that connection
-                # would still be held during the final yield below.
-                conv_id = conv.id
-                db.session.commit()
-
-            result["conversation_id"] = conv_id
+                result["conversation_id"] = conv_id
+            elif is_new_conversation:
+                # Storage is off, but the lifetime conversation counter still
+                # counts the chat that just started.
+                with app.app_context():
+                    _count_conversation_started(entity_id)
+                    db.session.commit()
             result["done"] = True
             yield f"data: {json.dumps(result)}\n\n"
 

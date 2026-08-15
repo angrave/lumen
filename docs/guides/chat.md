@@ -17,6 +17,7 @@ The **Chat** page (`/chat`) is the main interface for interacting with AI models
 - **Switch conversations** — Click any conversation in the sidebar to load its history.
 - **Remove conversation** — Hover over a conversation and click the ✕ button.
 - **Conversation title** — Automatically generated from your first message.
+- **Conversation storage** — Conversations are saved automatically. If you have disabled conversation storage on your [profile page](profile.md), chats still work but are not saved, and the sidebar shows a notice instead of a history.
 
 ## Sending Messages
 

@@ -444,6 +444,130 @@ def test_profile_projects_zero_usage_renders_zero_not_dash(app, auth_client, tes
     assert "p.tokens ?" not in body
 
 
+# ---------------------------------------------------------------------------
+# purge_conversations / set_store_conversations
+# ---------------------------------------------------------------------------
+
+def _make_conversation(app, entity_id, title="Chat"):
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.conversation import Conversation
+        from lumen.models.message import Message
+        conv = Conversation(entity_id=entity_id, title=title, model="test-model")
+        db.session.add(conv)
+        db.session.flush()
+        db.session.add(Message(conversation_id=conv.id, role="user", content="hello"))
+        db.session.commit()
+        return conv.id
+
+
+def _conversation_and_message_counts(app, entity_id):
+    with app.app_context():
+        from sqlalchemy import func, select
+        from lumen.extensions import db
+        from lumen.models.conversation import Conversation
+        from lumen.models.message import Message
+        convs = db.session.scalar(
+            select(func.count(Conversation.id)).where(Conversation.entity_id == entity_id)
+        )
+        msgs = db.session.scalar(
+            select(func.count(Message.id))
+            .join(Conversation, Message.conversation_id == Conversation.id)
+            .where(Conversation.entity_id == entity_id)
+        )
+        return convs, msgs
+
+
+def test_purge_conversations_requires_login(client):
+    resp = client.delete("/profile/conversations", follow_redirects=False)
+    assert resp.status_code == HTTPStatus.FOUND
+
+
+def test_purge_conversations_deletes_all_own(app, auth_client, test_user):
+    _make_conversation(app, test_user["id"], title="One")
+    _make_conversation(app, test_user["id"], title="Two")
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.entity_stat import EntityStat
+        db.session.add(EntityStat(entity_id=test_user["id"], requests=0, input_tokens=0,
+                                  output_tokens=0, cost=0, conversations=2))
+        db.session.commit()
+
+    resp = auth_client.delete("/profile/conversations")
+    assert resp.status_code == HTTPStatus.OK
+    assert resp.get_json()["deleted"] == 2
+    assert _conversation_and_message_counts(app, test_user["id"]) == (0, 0)
+
+    # The lifetime conversation counter is a usage stat and survives the purge.
+    with app.app_context():
+        from sqlalchemy import select
+        from lumen.extensions import db
+        from lumen.models.entity_stat import EntityStat
+        assert db.session.scalar(
+            select(EntityStat.conversations).filter_by(entity_id=test_user["id"])
+        ) == 2
+
+
+def test_purge_conversations_does_not_touch_other_users(app, auth_client, test_user, admin_user):
+    _make_conversation(app, test_user["id"])
+    other_conv = _make_conversation(app, admin_user["id"], title="Admin Chat")
+
+    resp = auth_client.delete("/profile/conversations")
+    assert resp.status_code == HTTPStatus.OK
+    assert resp.get_json()["deleted"] == 1
+    assert _conversation_and_message_counts(app, admin_user["id"]) == (1, 1)
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.conversation import Conversation
+        assert db.session.get(Conversation, other_conv) is not None
+
+
+def test_disable_store_conversations_sets_flag_and_purges(app, auth_client, test_user):
+    _make_conversation(app, test_user["id"])
+
+    resp = auth_client.post("/profile/settings/store-conversations", json={"enabled": False})
+    assert resp.status_code == HTTPStatus.OK
+    data = resp.get_json()
+    assert data["store_conversations"] is False
+    assert data["deleted"] == 1
+    assert _conversation_and_message_counts(app, test_user["id"]) == (0, 0)
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.entity import Entity
+        assert db.session.get(Entity, test_user["id"]).store_conversations is False
+
+
+def test_enable_store_conversations_no_purge(app, auth_client, test_user):
+    _make_conversation(app, test_user["id"])
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.entity import Entity
+        db.session.get(Entity, test_user["id"]).store_conversations = False
+        db.session.commit()
+
+    resp = auth_client.post("/profile/settings/store-conversations", json={"enabled": True})
+    assert resp.status_code == HTTPStatus.OK
+    data = resp.get_json()
+    assert data["store_conversations"] is True
+    assert data["deleted"] == 0
+    assert _conversation_and_message_counts(app, test_user["id"]) == (1, 1)
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.entity import Entity
+        assert db.session.get(Entity, test_user["id"]).store_conversations is True
+
+
+@pytest.mark.parametrize("payload", [{}, {"enabled": "yes"}, {"enabled": 1}])
+def test_set_store_conversations_bad_payload(auth_client, payload):
+    resp = auth_client.post("/profile/settings/store-conversations", json=payload)
+    assert resp.status_code == HTTPStatus.BAD_REQUEST
+
+
+def test_set_store_conversations_requires_login(client):
+    resp = client.post("/profile/settings/store-conversations", json={"enabled": True}, follow_redirects=False)
+    assert resp.status_code == HTTPStatus.FOUND
+
+
 def test_project_detail_page_does_not_render_projects_section(app, auth_client, test_user):
     """A project's own detail page (which reuses _get_profile_data) must not
     waste a query building a project list for a project entity, and must not

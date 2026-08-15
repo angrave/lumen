@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 
 from flask import Blueprint, current_app, redirect, render_template, request, jsonify, session, url_for, abort
-from sqlalchemy import func, select, text
+from sqlalchemy import delete, func, select, text
 
 from lumen.decorators import login_required, is_admin as _is_admin
 from lumen.extensions import db
@@ -16,6 +16,7 @@ from lumen.models.entity_balance import EntityBalance
 from lumen.models.entity_manager import get_managed_projects
 from lumen.models.entity_model_consent import EntityModelConsent
 from lumen.models.group import Group
+from lumen.models.message import Message
 from lumen.models.group_member import GroupMember
 from lumen.models.model_config import ModelConfig
 from lumen.models.model_endpoint import ModelEndpoint
@@ -104,8 +105,10 @@ def _fetch_chat_stats(eid: int):
             func.max(ModelStat.last_used_at),
         ).filter_by(entity_id=eid, source="chat")
     ).one()
+    # Lifetime conversations started, not a row count: the counter survives
+    # deleting conversations and disabling storage.
     conversation_count = db.session.scalar(
-        select(func.count(Conversation.id)).filter_by(entity_id=eid)
+        select(EntityStat.conversations).filter_by(entity_id=eid)
     ) or 0
     return chat_agg, conversation_count
 
@@ -295,6 +298,38 @@ def delete_key(kid):
     db.session.delete(api_key)
     db.session.commit()
     return "", HTTPStatus.NO_CONTENT
+
+
+def _purge_conversations(entity_id: int) -> int:
+    """Delete all conversations (and their messages) for an entity. Caller commits."""
+    db.session.execute(delete(Message).where(
+        Message.conversation_id.in_(select(Conversation.id).where(Conversation.entity_id == entity_id))
+    ))
+    result = db.session.execute(delete(Conversation).where(Conversation.entity_id == entity_id))
+    return result.rowcount
+
+
+@profile_bp.route("/profile/conversations", methods=["DELETE"])
+@login_required
+def purge_conversations():
+    deleted = _purge_conversations(session["entity_id"])
+    db.session.commit()
+    return jsonify({"deleted": deleted})
+
+
+@profile_bp.route("/profile/settings/store-conversations", methods=["POST"])
+@login_required
+def set_store_conversations():
+    data = request.get_json() or {}
+    enabled = data.get("enabled")
+    if not isinstance(enabled, bool):
+        return jsonify({"error": "'enabled' must be a boolean"}), HTTPStatus.BAD_REQUEST
+
+    entity = db.session.get(Entity, session["entity_id"])
+    entity.store_conversations = enabled
+    deleted = 0 if enabled else _purge_conversations(entity.id)
+    db.session.commit()
+    return jsonify({"store_conversations": enabled, "deleted": deleted})
 
 
 @profile_bp.route("/profile/consent/<path:model_name>", methods=["POST"])
