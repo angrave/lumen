@@ -4,6 +4,8 @@ All notable changes to Lumen will be documented in this file.
 
 ## [Unreleased]
 
+## [1.25.0] - 2026-08-14
+
 ### Changed
 
 - The SkipTo navigation button is now hidden until it receives keyboard focus (`displayOption:popup`, matching illinois.edu), instead of always being visible in the corner of the page.
