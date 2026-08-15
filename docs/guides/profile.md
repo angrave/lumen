@@ -1,6 +1,6 @@
 # Profile & API Keys
 
-The **Profile** page (`/profile`) shows your coin balance, spending history, model access, and your personal API keys.
+The **Profile** page (`/profile`) shows your coin balance, spending history, model access, and your personal API keys. Below the profile card, the page is organized into tabs: **Chat & API Keys** (web chat settings and your API keys), **Projects** (only shown if you can access any projects), and **Models** (your model access). The selected tab is reflected in the URL (`/profile#chat`, `/profile#projects`, `/profile#models`), so you can bookmark or share a link to a specific tab.
 
 ![Profile page](../img/profile.png)
 
@@ -36,7 +36,7 @@ The right side shows six stat tiles:
 
 ## Web Chat Usage
 
-Below the stat cards, a row summarizes your web chat activity:
+In the **Chat & API Keys** tab, a row summarizes your web chat activity:
 
 | Column | Description |
 |--------|------------|
@@ -64,7 +64,7 @@ Turn the switch off at any time to resume storing new conversations. Previously 
 
 ## API Keys
 
-API keys let you access Lumen's AI models from your own code, scripts, or compatible tools — without opening a browser.
+API keys let you access Lumen's AI models from your own code, scripts, or compatible tools — without opening a browser. They are listed in the **Chat & API Keys** tab.
 
 ### What an API Key Is
 
@@ -98,9 +98,13 @@ The API Keys table shows all your active keys and lets you sort by name, request
 
 Click **Delete** on any active key. The key is deactivated immediately — any code using it will start receiving authentication errors. Usage history is preserved and visible with "Show deleted keys".
 
+## Projects
+
+If you can access any projects, a **Projects** tab lists them with their usage (requests, tokens, coins) and creation date. Each name links to the project's detail page — see the [Projects](../projects/projects.md) documentation.
+
 ## Model Access
 
-The Model Access table lists every model available in Lumen and your access status for each.
+The **Models** tab lists every model available in Lumen and your access status for each.
 
 | Column | Description |
 |--------|------------|

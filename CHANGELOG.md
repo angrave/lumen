@@ -4,6 +4,10 @@ All notable changes to Lumen will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- The profile page is now organized into tabs below the profile card: **Chat & API Keys**, **Projects** (shown only when the user can access projects), and **Models**. The selected tab is reflected in the URL hash (`/profile#models`) so tabs are deep-linkable.
+
 ### Added
 
 - Admin mode: administrators now act as normal users by default and enable admin permissions with a switch under their email address on the profile page. The mode is per-session and resets on logout.

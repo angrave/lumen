@@ -445,6 +445,44 @@ def test_profile_projects_zero_usage_renders_zero_not_dash(app, auth_client, tes
 
 
 # ---------------------------------------------------------------------------
+# profile tabs
+# ---------------------------------------------------------------------------
+
+
+def test_profile_page_renders_tabs(auth_client):
+    """Profile sections are grouped into tabs; Projects tab absent without projects."""
+    resp = auth_client.get("/profile")
+    assert resp.status_code == HTTPStatus.OK
+    body = resp.get_data(as_text=True)
+    assert 'id="profile-tabs"' in body
+    assert 'id="tab-chat"' in body
+    assert 'id="tab-models"' in body
+    assert 'id="tab-projects"' not in body
+    assert 'id="pane-chat"' in body
+    assert 'id="pane-models"' in body
+
+
+def test_profile_page_projects_tab_with_project(app, auth_client, test_user):
+    """A managed project adds the Projects tab and its pane."""
+    _make_managed_project(app, test_user["id"], name="tabbed-client")
+    resp = auth_client.get("/profile")
+    assert resp.status_code == HTTPStatus.OK
+    body = resp.get_data(as_text=True)
+    assert 'id="tab-projects"' in body
+    assert 'id="pane-projects"' in body
+
+
+def test_admin_user_profile_renders_tabs(admin_client, test_user):
+    """Admin read-only profile view uses the same tab layout."""
+    resp = admin_client.get(f"/admin/users/{test_user['id']}/profile")
+    assert resp.status_code == HTTPStatus.OK
+    body = resp.get_data(as_text=True)
+    assert 'id="profile-tabs"' in body
+    assert 'id="tab-chat"' in body
+    assert 'id="tab-models"' in body
+
+
+# ---------------------------------------------------------------------------
 # set_admin_mode / admin mode gating
 # ---------------------------------------------------------------------------
 

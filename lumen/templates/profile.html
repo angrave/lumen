@@ -107,8 +107,28 @@
 {% endif %}
 
 
+<!-- Tabs -->
+<ul class="nav nav-tabs mt-4" id="profile-tabs" role="tablist">
+  <li class="nav-item" role="presentation">
+    <button class="nav-link active" id="tab-chat" data-bs-toggle="tab" data-bs-target="#pane-chat"
+            type="button" role="tab" aria-controls="pane-chat" aria-selected="true">Chat &amp; API Keys</button>
+  </li>
+  {% if project_list %}
+  <li class="nav-item" role="presentation">
+    <button class="nav-link" id="tab-projects" data-bs-toggle="tab" data-bs-target="#pane-projects"
+            type="button" role="tab" aria-controls="pane-projects" aria-selected="false">Projects</button>
+  </li>
+  {% endif %}
+  <li class="nav-item" role="presentation">
+    <button class="nav-link" id="tab-models" data-bs-toggle="tab" data-bs-target="#pane-models"
+            type="button" role="tab" aria-controls="pane-models" aria-selected="false">Models</button>
+  </li>
+</ul>
+<div class="tab-content border border-top-0 rounded-bottom p-3 mb-4">
+
+<div class="tab-pane fade show active" id="pane-chat" role="tabpanel" aria-labelledby="tab-chat">
 <!-- Web Chat -->
-<h2 class="mt-3 mb-0">Web Chat</h2>
+<h2 class="mt-0 mb-0">Web Chat</h2>
 {% if not viewing_user %}
 <div class="d-flex justify-content-between align-items-center mt-2 mb-1">
   <div class="form-check mb-0">
@@ -197,11 +217,13 @@
   </table>
 </div>
 <p id="key-empty" class="text-muted" hidden>No API keys match your filter.</p>
+</div>
 
 
 {% if project_list %}
+<div class="tab-pane fade" id="pane-projects" role="tabpanel" aria-labelledby="tab-projects">
 <!-- Projects (clients this user can access) -->
-<div class="d-flex justify-content-between align-items-center mt-4 mb-0">
+<div class="d-flex justify-content-between align-items-center mt-0 mb-0">
   <h2 class="mb-0">Projects</h2>
 </div>
 <div class="d-flex justify-content-between align-items-center mt-2 mb-1">
@@ -230,11 +252,13 @@
   </table>
 </div>
 <p id="project-empty" class="text-muted" hidden>No projects match your filter.</p>
+</div>
 {% endif %}
 
 
+<div class="tab-pane fade" id="pane-models" role="tabpanel" aria-labelledby="tab-models">
 <!-- Model Access -->
-<div class="d-flex justify-content-between align-items-center mt-4 mb-0">
+<div class="d-flex justify-content-between align-items-center mt-0 mb-0">
   <h2 class="mb-0">Model Access</h2>
 </div>
 <div class="d-flex justify-content-between align-items-center mt-2 mb-1">
@@ -268,6 +292,9 @@
   </table>
 </div>
 <p id="model-empty" class="text-muted" hidden>No models match your filter.</p>
+</div>
+
+</div>
 
 
 {% if not viewing_user %}
@@ -361,6 +388,13 @@ document.querySelectorAll(".local-time[data-utc]").forEach(el => {
 });
 
 let openGraylistModal = () => {};
+
+// ── Tab ↔ URL hash sync (#chat / #projects / #models) ────────────────────
+const hashTabBtn = location.hash && document.getElementById('tab-' + location.hash.slice(1));
+if (hashTabBtn && hashTabBtn.closest('#profile-tabs')) bootstrap.Tab.getOrCreateInstance(hashTabBtn).show();
+document.querySelectorAll('#profile-tabs [data-bs-toggle="tab"]').forEach(btn => {
+  btn.addEventListener('shown.bs.tab', () => history.replaceState(null, '', '#' + btn.id.slice(4)));
+});
 
 // ── Admin mode toggle (only rendered for eligible admins on their own profile)
 const adminModeToggle = document.getElementById("admin-mode-toggle");
