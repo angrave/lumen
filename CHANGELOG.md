@@ -6,6 +6,7 @@ All notable changes to Lumen will be documented in this file.
 
 ### Changed
 
+- The SkipTo navigation button is now hidden until it receives keyboard focus (`displayOption:popup`, matching illinois.edu), instead of always being visible in the corner of the page.
 - The profile page is now organized into tabs below the profile card: **Chat & API Keys**, **Projects** (shown only when the user can access projects), and **Models**. The selected tab is reflected in the URL hash (`/profile#models`) so tabs are deep-linkable.
 
 ### Added
