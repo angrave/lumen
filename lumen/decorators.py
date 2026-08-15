@@ -20,9 +20,19 @@ def login_required(f):
     return decorated
 
 
-def is_admin(entity):
+def is_admin_eligible(entity):
+    """Config-level admin eligibility (the YAML admins list), independent of admin mode."""
     yaml_data = current_app.config.get("YAML_DATA", {})
-    return entity.email in yaml_data.get("admins", [])
+    return entity is not None and entity.email in yaml_data.get("admins", [])
+
+
+def is_admin(entity):
+    """Effective admin: config-eligible AND admin mode enabled for this session.
+
+    Requires a request context (reads the session). Use is_admin_eligible for
+    the context-free config check.
+    """
+    return bool(session.get("admin_mode")) and is_admin_eligible(entity)
 
 
 def admin_required(f):

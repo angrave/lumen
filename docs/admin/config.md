@@ -2,6 +2,8 @@
 
 > 🔒 **Admin only.** This page documents administrator features. Configuration lives in `config.yaml` and the in-app Config editor (`/admin/config`), which are only available to administrators.
 
+> **Note:** Administrators act as normal users by default. To use the admin pages, turn on the **Admin mode** switch on your [profile page](../guides/profile.md#admin-mode); it resets when you log out.
+
 Lumen is configured entirely through a single file: `config.yaml`. You place this file in the Lumen directory and the application reads it on startup, then watches for changes while running.
 
 ## File Version

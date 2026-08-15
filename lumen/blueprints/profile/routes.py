@@ -6,7 +6,7 @@ from http import HTTPStatus
 from flask import Blueprint, current_app, redirect, render_template, request, jsonify, session, url_for, abort
 from sqlalchemy import delete, func, select, text
 
-from lumen.decorators import login_required, is_admin as _is_admin
+from lumen.decorators import login_required, is_admin as _is_admin, is_admin_eligible
 from lumen.extensions import db
 from lumen.timeutils import utcnow
 from lumen.models.api_key import APIKey
@@ -242,6 +242,8 @@ def index():
         profile_entity=profile_entity,
         gravatar_url=_gravatar_url(profile_entity.email if profile_entity else "", size=230),
         profile_groups=_entity_groups(entity_id),
+        admin_eligible=is_admin_eligible(profile_entity),
+        admin_mode=bool(session.get("admin_mode")),
     )
 
 
@@ -330,6 +332,24 @@ def set_store_conversations():
     deleted = 0 if enabled else _purge_conversations(entity.id)
     db.session.commit()
     return jsonify({"store_conversations": enabled, "deleted": deleted})
+
+
+@profile_bp.route("/profile/settings/admin-mode", methods=["POST"])
+@login_required
+def set_admin_mode():
+    entity = db.session.get(Entity, session["entity_id"])
+    if not is_admin_eligible(entity):
+        return jsonify({"error": "Forbidden"}), HTTPStatus.FORBIDDEN
+
+    data = request.get_json() or {}
+    enabled = data.get("enabled")
+    if not isinstance(enabled, bool):
+        return jsonify({"error": "'enabled' must be a boolean"}), HTTPStatus.BAD_REQUEST
+
+    session["admin_mode"] = enabled
+    # The nav cache stores is_admin; drop it so the header re-renders with the new mode.
+    session.pop("_nav", None)
+    return jsonify({"admin_mode": enabled})
 
 
 @profile_bp.route("/profile/consent/<path:model_name>", methods=["POST"])

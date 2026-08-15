@@ -445,6 +445,70 @@ def test_profile_projects_zero_usage_renders_zero_not_dash(app, auth_client, tes
 
 
 # ---------------------------------------------------------------------------
+# set_admin_mode / admin mode gating
+# ---------------------------------------------------------------------------
+
+def test_admin_mode_off_by_default(app, admin_client_no_mode):
+    """Eligible admin without admin mode is a normal user: no /admin access, no admin nav."""
+    resp = admin_client_no_mode.get("/admin/users")
+    assert resp.status_code == HTTPStatus.FORBIDDEN
+    page = admin_client_no_mode.get("/profile")
+    assert page.status_code == HTTPStatus.OK
+    assert "/admin/users" not in page.get_data(as_text=True)
+
+
+def test_admin_mode_toggle_grants_and_revokes_access(app, admin_client_no_mode):
+    # Prime the session _nav cache with is_admin False.
+    admin_client_no_mode.get("/profile")
+
+    resp = admin_client_no_mode.post("/profile/settings/admin-mode", json={"enabled": True})
+    assert resp.status_code == HTTPStatus.OK
+    assert resp.get_json()["admin_mode"] is True
+
+    assert admin_client_no_mode.get("/admin/users").status_code == HTTPStatus.OK
+    page = admin_client_no_mode.get("/profile")
+    assert "/admin/users" in page.get_data(as_text=True)
+
+    resp = admin_client_no_mode.post("/profile/settings/admin-mode", json={"enabled": False})
+    assert resp.status_code == HTTPStatus.OK
+    assert admin_client_no_mode.get("/admin/users").status_code == HTTPStatus.FORBIDDEN
+    page = admin_client_no_mode.get("/profile")
+    assert "/admin/users" not in page.get_data(as_text=True)
+
+
+def test_admin_mode_forbidden_for_non_admin(auth_client):
+    resp = auth_client.post("/profile/settings/admin-mode", json={"enabled": True})
+    assert resp.status_code == HTTPStatus.FORBIDDEN
+    assert auth_client.get("/admin/users").status_code == HTTPStatus.FORBIDDEN
+
+
+@pytest.mark.parametrize("payload", [{}, {"enabled": "yes"}, {"enabled": 1}])
+def test_admin_mode_bad_payload(admin_client_no_mode, payload):
+    resp = admin_client_no_mode.post("/profile/settings/admin-mode", json=payload)
+    assert resp.status_code == HTTPStatus.BAD_REQUEST
+
+
+def test_admin_mode_requires_login(client):
+    resp = client.post("/profile/settings/admin-mode", json={"enabled": True}, follow_redirects=False)
+    assert resp.status_code == HTTPStatus.FOUND
+
+
+def test_admin_mode_toggle_shown_for_eligible_admin(admin_client_no_mode):
+    body = admin_client_no_mode.get("/profile").get_data(as_text=True)
+    assert 'id="admin-mode-toggle"' in body
+
+
+def test_admin_mode_toggle_hidden_for_regular_user(auth_client):
+    body = auth_client.get("/profile").get_data(as_text=True)
+    assert 'id="admin-mode-toggle"' not in body
+
+
+def test_admin_mode_toggle_absent_on_admin_view_of_other_user(admin_client, test_user):
+    body = admin_client.get(f"/admin/users/{test_user['id']}/profile").get_data(as_text=True)
+    assert 'id="admin-mode-toggle"' not in body
+
+
+# ---------------------------------------------------------------------------
 # purge_conversations / set_store_conversations
 # ---------------------------------------------------------------------------
 

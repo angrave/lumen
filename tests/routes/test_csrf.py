@@ -108,6 +108,16 @@ def test_set_store_conversations_rejected_without_csrf_token(csrf_client):
     assert b"CSRF" in resp.data
 
 
+def test_set_admin_mode_rejected_without_csrf_token(csrf_client):
+    resp = csrf_client.post(
+        "/profile/settings/admin-mode",
+        json={"enabled": True},
+        content_type="application/json",
+    )
+    assert resp.status_code == HTTPStatus.BAD_REQUEST
+    assert b"CSRF" in resp.data
+
+
 def test_api_blueprint_exempt_from_csrf(csrf_client):
     """The /v1/ API blueprint must not require CSRF tokens."""
     resp = csrf_client.post(

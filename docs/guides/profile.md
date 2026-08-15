@@ -10,6 +10,10 @@ At the top of the page, a card shows your identity and a summary of your account
 
 The left side displays your avatar (pulled from [Gravatar](https://gravatar.com) based on your email), your display name, and email address.
 
+### Admin Mode
+
+If your account is listed as an administrator, an **Admin mode** switch appears under your email address. Administrators act as normal users by default: admin pages and navigation links (Users, Config, all projects) are hidden until you turn the switch on, and turning it off returns you to normal-user permissions. The setting lasts only for your current session — logging out (or being logged out) always resets you to normal-user mode.
+
 The right side shows six stat tiles:
 
 | Tile | Description |

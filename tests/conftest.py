@@ -115,6 +115,18 @@ def admin_client(client, admin_user):
         sess["entity_name"] = admin_user["name"]
         sess["initials"] = admin_user["initials"]
         sess["gravatar_hash"] = admin_user["gravatar_hash"]
+        sess["admin_mode"] = True
+    return client
+
+
+@pytest.fixture
+def admin_client_no_mode(client, admin_user):
+    """Admin-eligible user with admin mode off (the default after login)."""
+    with client.session_transaction() as sess:
+        sess["entity_id"] = admin_user["id"]
+        sess["entity_name"] = admin_user["name"]
+        sess["initials"] = admin_user["initials"]
+        sess["gravatar_hash"] = admin_user["gravatar_hash"]
     return client
 
 

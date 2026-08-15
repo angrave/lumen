@@ -6,6 +6,7 @@ All notable changes to Lumen will be documented in this file.
 
 ### Added
 
+- Admin mode: administrators now act as normal users by default and enable admin permissions with a switch under their email address on the profile page. The mode is per-session and resets on logout.
 - Users can delete all their webchat conversations from the profile page, and disable conversation storage entirely. Disabling storage deletes all existing conversations after a styled confirmation dialog; while disabled, new chats still work but are not saved, and the chat sidebar shows a notice. The conversation count on the profile page is now a lifetime "conversations started" counter (tracked in `entity_stats`) that keeps counting even when conversations are deleted or storage is disabled.
 
 ## [1.24.2] - 2026-08-11
