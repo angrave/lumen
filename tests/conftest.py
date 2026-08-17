@@ -4,7 +4,6 @@ from pathlib import Path
 import pytest
 
 TEST_CONFIG = str(Path(__file__).parent / "fixtures" / "test_config.yaml")
-DB_PATH = Path(__file__).parent.parent / "test_lumen.db"
 
 
 @pytest.fixture(scope="session")
@@ -19,12 +18,25 @@ def app():
     application.config["WTF_CSRF_ENABLED"] = False
     with application.app_context():
         from lumen.extensions import db
+        # Ask the engine where the file actually is instead of assuming the repo
+        # root: Flask-SQLAlchemy resolves a relative sqlite path against
+        # app.instance_path. Then refuse to run against the dev database — this
+        # suite drops every table at teardown and deletes every row between
+        # tests, so a misrouted URI destroys real data silently. That is not
+        # hypothetical: `app.database_url` in the test config went unread for six
+        # weeks after the key moved to `app.database.url`, and the whole suite ran
+        # against instance/lumen_dev.db the entire time.
+        db_file = db.engine.url.database
+        assert db_file and "lumen_dev" not in Path(db_file).name, (
+            f"tests are pointed at {db_file!r}, which looks like the dev database; "
+            "expected a dedicated test database"
+        )
         db.create_all()
     yield application
     with application.app_context():
         from lumen.extensions import db
         db.drop_all()
-    DB_PATH.unlink(missing_ok=True)
+    Path(db_file).unlink(missing_ok=True)
 
 
 @pytest.fixture(autouse=True)
