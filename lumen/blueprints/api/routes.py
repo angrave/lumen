@@ -455,6 +455,8 @@ def _do_chat(model_name: str, messages: list, stream: bool, **kwargs):
     def generate():
         billed = False
         aborted = False
+        # Which stage a failure came from, for the abort metric's reason label.
+        phase = "upstream"
         usage = None
         content_deltas = 0
         t0 = _time.time()
@@ -519,14 +521,13 @@ def _do_chat(model_name: str, messages: list, stream: bool, **kwargs):
                     yield f"data: {json.dumps(chunk.model_dump())}\n\n"
                 if not aborted:
                     duration = _time.time() - t0
-                    yield "data: [DONE]\n\n"
-
                     if usage is not None:
                         cost = round(
                             usage.prompt_tokens * mc_in_cost / 1_000_000
                             + usage.completion_tokens * mc_out_cost / 1_000_000,
                             6,
                         )
+                        phase = "billing"
                         with app.app_context():
                             subtract_coins(entity_id, mc_id, cost, effective=effective)
                             update_stats(entity_id, mc_id, "api", usage.prompt_tokens, usage.completion_tokens, cost,
@@ -540,6 +541,13 @@ def _do_chat(model_name: str, messages: list, stream: bool, **kwargs):
                             "(model=%s, entity_id=%s) — tokens and cost not recorded.",
                             model_name, entity_id,
                         )
+                    # [DONE] goes last, after billing, matching llm.py. With the
+                    # yield first, a client vanishing on this final event left
+                    # billed=False, so the GeneratorExit handler wrote a
+                    # completed stream up as an abort: a false aborted=True row
+                    # and a false disconnect on the metric. Billing first makes
+                    # _abort() a no-op here.
+                    yield "data: [DONE]\n\n"
             if aborted:
                 # Outside the `with`: the client is closed and the upstream
                 # aborted before this DB round-trip runs (same ordering the
@@ -556,8 +564,11 @@ def _do_chat(model_name: str, messages: list, stream: bool, **kwargs):
         except Exception as exc:
             # An upstream failure (including the read timeout above) ends the
             # stream early too; counted on the same metric as disconnects, with
-            # a reason that tells them apart.
-            observe_stream_abort("api", "upstream_error")
+            # a reason that tells them apart. `phase` keeps a failed DB commit
+            # from being reported as an upstream failure — the stream succeeded
+            # and only the accounting broke, and conflating the two would send
+            # an operator hunting a backend problem that does not exist.
+            observe_stream_abort("api", f"{phase}_error")
             msg, err_type, _ = _classify_upstream_error(
                 exc,
                 f"Error during streaming request "

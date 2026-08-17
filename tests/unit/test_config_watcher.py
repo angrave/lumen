@@ -401,7 +401,7 @@ def test_apply_hot_config_llm_defaults_when_section_absent(app, restore_config):
     with app.app_context():
         apply_hot_config(app, {"version": 2})
         assert app.config["LLM_CONNECT_TIMEOUT"] == 5.0
-        assert app.config["LLM_READ_TIMEOUT"] == 120.0
+        assert app.config["LLM_READ_TIMEOUT"] == 300.0
         assert app.config["LLM_MAX_RETRIES"] == 1
 
 
@@ -420,7 +420,7 @@ def test_apply_hot_config_llm_blank_key_uses_default(app, restore_config):
     from lumen.services.config_watcher import apply_hot_config
     with app.app_context():
         apply_hot_config(app, {"version": 2, "llm": {"read_timeout": None}})
-        assert app.config["LLM_READ_TIMEOUT"] == 120.0
+        assert app.config["LLM_READ_TIMEOUT"] == 300.0
 
 
 def test_apply_hot_config_llm_values_are_floats_and_int(app, restore_config):
@@ -494,7 +494,7 @@ def test_shipped_config_example_has_llm_section(app, restore_config):
     with app.app_context():
         apply_hot_config(app, data)
         assert app.config["LLM_CONNECT_TIMEOUT"] == 5.0
-        assert app.config["LLM_READ_TIMEOUT"] == 120.0
+        assert app.config["LLM_READ_TIMEOUT"] == 300.0
         assert app.config["LLM_REQUEST_TIMEOUT"] == 600.0
         assert app.config["LLM_MAX_RETRIES"] == 1
 

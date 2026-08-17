@@ -1247,7 +1247,7 @@ def test_streaming_chat_client_is_bounded_and_never_retries(
     assert "data: [DONE]" in body
     assert len(calls) == 1
     assert isinstance(calls[0]["timeout"], openai.Timeout)
-    assert calls[0]["timeout"].read == 120.0
+    assert calls[0]["timeout"].read == 300.0
     assert calls[0]["max_retries"] == 0
 
 

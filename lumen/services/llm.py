@@ -97,7 +97,7 @@ def upstream_call_bounds(*, streaming: bool):
     cfg = current_app.config
     connect = float(cfg.get("LLM_CONNECT_TIMEOUT", 5.0))
     if streaming:
-        read = float(cfg.get("LLM_READ_TIMEOUT", 120.0))
+        read = float(cfg.get("LLM_READ_TIMEOUT", 300.0))
         # Never auto-retry a stream: a retry restarts the whole generation while
         # the first attempt may still be draining upstream, which is duplicate
         # backend work for one client request. Not configurable for that reason.
@@ -755,6 +755,8 @@ def _send_message_stream(app, messages, model, entity_id, source, effective, dis
     usage = None
     billed = False
     aborted = False
+    # Which stage a failure came from, for the abort metric's reason label.
+    phase = "upstream"
 
     def _abort():
         """Bill and log what this stream consumed before the client went away.
@@ -840,6 +842,7 @@ def _send_message_stream(app, messages, model, entity_id, source, effective, dis
         output_speed = output_tokens / duration if duration > 0 else 0.0
 
         if entity_id is not None:
+            phase = "billing"
             with app.app_context():
                 subtract_coins(entity_id, mc_id, cost, effective=effective)
                 update_stats(
@@ -859,7 +862,12 @@ def _send_message_stream(app, messages, model, entity_id, source, effective, dis
         # just as surely as a disconnect, and is counted so the two are
         # distinguishable on the same metric. No billing here: the exception
         # propagates to the view, which owns the client-facing error.
-        observe_stream_abort(source, "upstream_error")
+        #
+        # `phase` keeps a failed DB commit out of the upstream bucket: the
+        # stream succeeded and only the accounting broke, and reporting that as
+        # an upstream failure sends an operator hunting a backend problem that
+        # does not exist.
+        observe_stream_abort(source, f"{phase}_error")
         raise
 
     yield None, None, {

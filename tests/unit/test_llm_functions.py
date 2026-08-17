@@ -971,8 +971,8 @@ def test_chat_stream_client_carries_a_structured_timeout(app, test_model_endpoin
     timeout = kwargs["timeout"]
     assert isinstance(timeout, openai.Timeout)  # openai.Timeout IS httpx.Timeout
     assert timeout.connect == 5.0
-    assert timeout.read == 120.0
-    assert timeout.write == 120.0
+    assert timeout.read == 300.0
+    assert timeout.write == 300.0
     assert timeout.pool == 5.0
 
 
@@ -1009,7 +1009,7 @@ def test_upstream_call_bounds_falls_back_to_defaults(app, monkeypatch):
         stream_timeout, stream_retries = upstream_call_bounds(streaming=True)
         plain_timeout, plain_retries = upstream_call_bounds(streaming=False)
     assert isinstance(stream_timeout, openai.Timeout)
-    assert (stream_timeout.connect, stream_timeout.read) == (5.0, 120.0)
+    assert (stream_timeout.connect, stream_timeout.read) == (5.0, 300.0)
     assert stream_retries == 0
     assert (plain_timeout.connect, plain_timeout.read) == (5.0, 600.0)
     assert plain_retries == 1
@@ -1018,7 +1018,7 @@ def test_upstream_call_bounds_falls_back_to_defaults(app, monkeypatch):
 def test_non_streaming_read_bound_is_far_larger_than_the_streaming_one(app):
     """The two read bounds measure different things and must not be shared.
 
-    On a stream the read timeout is the gap BETWEEN chunks, so 120s is safe
+    On a stream the read timeout is the gap BETWEEN chunks, so it is safe
     however long the generation runs. On a non-streaming call the same setting
     caps the entire generation — a long completion or a large audio
     transcription legitimately takes minutes, and one shared value would either

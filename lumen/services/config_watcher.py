@@ -31,6 +31,51 @@ KNOWN_APP_KEYS = frozenset({
 })
 
 
+def _positive_seconds(value, default: float, key: str) -> float:
+    """A positive float from config, or ``default`` with a warning.
+
+    Zero or negative is not a lenient setting: httpx reads it as an *immediate*
+    expiry, so `read_timeout: 0` fails every upstream call instantly rather than
+    disabling the bound. The Helm schema rejects those values, but editing
+    config.yaml directly is the documented hot-reload path and had no such guard.
+    Mirrors ``_send_timeout`` in ``wsgi_disconnect``.
+    """
+    if value is None:
+        return default
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = None
+    if parsed is None or parsed <= 0:
+        logger.warning(
+            "config.yaml: llm.%s must be a positive number, got %r — using %s",
+            key, value, default,
+        )
+        return default
+    return parsed
+
+
+def _non_negative_int(value, default: int, key: str) -> int:
+    """A non-negative int from config, or ``default`` with a warning.
+
+    Zero is meaningful here (never retry), so it must survive — which is why this
+    cannot use the ``value or default`` idiom used elsewhere in this module.
+    """
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = -1
+    if parsed < 0:
+        logger.warning(
+            "config.yaml: llm.%s must be zero or greater, got %r — using %s",
+            key, value, default,
+        )
+        return default
+    return parsed
+
+
 def apply_hot_config(app, yaml_data: dict):
     """Apply hot-reloadable yaml settings to app.config. Called at startup and on config reload."""
     global _version_warned
@@ -86,23 +131,19 @@ def apply_hot_config(app, yaml_data: dict):
     # Bounds on upstream LLM calls. read_timeout is the maximum gap *between
     # chunks* of a streaming response, not the total call duration — a
     # twenty-minute generation is fine as long as tokens keep arriving, which is
-    # what makes a low-ish default safe. max_retries applies to non-streaming
+    # what keeps the default safe. max_retries applies to non-streaming
     # calls; a streaming call must never be auto-retried, because the retry
     # restarts the whole generation while the first may still be draining.
     # A key present but blank ("read_timeout:") parses as None; treat it as absent.
     llm_cfg = yaml_data.get("llm") or {}
-    _connect_timeout = llm_cfg.get("connect_timeout")
-    _read_timeout = llm_cfg.get("read_timeout")
-    _max_retries = llm_cfg.get("max_retries")
-    app.config["LLM_CONNECT_TIMEOUT"] = float(5.0 if _connect_timeout is None else _connect_timeout)
-    app.config["LLM_READ_TIMEOUT"] = float(120.0 if _read_timeout is None else _read_timeout)
-    app.config["LLM_MAX_RETRIES"] = int(1 if _max_retries is None else _max_retries)
+    app.config["LLM_CONNECT_TIMEOUT"] = _positive_seconds(llm_cfg.get("connect_timeout"), 5.0, "connect_timeout")
+    app.config["LLM_READ_TIMEOUT"] = _positive_seconds(llm_cfg.get("read_timeout"), 300.0, "read_timeout")
     # Non-streaming calls need their own, much larger bound: read_timeout is a
     # between-chunks gap for a stream, but for a single-response call the same
     # setting caps the entire generation, and a long completion or a large audio
     # transcription legitimately takes minutes.
-    _request_timeout = llm_cfg.get("request_timeout")
-    app.config["LLM_REQUEST_TIMEOUT"] = float(600.0 if _request_timeout is None else _request_timeout)
+    app.config["LLM_REQUEST_TIMEOUT"] = _positive_seconds(llm_cfg.get("request_timeout"), 600.0, "request_timeout")
+    app.config["LLM_MAX_RETRIES"] = _non_negative_int(llm_cfg.get("max_retries"), 1, "max_retries")
 
     # The in-app config editor is on by default; Helm sets it false for git-managed configs.
     app.config["CONFIG_EDITOR"] = bool(app_cfg.get("config_editor", True))

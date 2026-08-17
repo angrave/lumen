@@ -66,9 +66,11 @@ api:
 # can hold a worker thread for ~30 minutes.
 llm:
   connect_timeout: 5    # seconds to establish the upstream connection
-  read_timeout: 120     # for a streaming response this is the maximum gap BETWEEN CHUNKS,
+  read_timeout: 300     # for a streaming response this is the maximum gap BETWEEN CHUNKS,
                         # not the total call duration — a 20-minute generation is fine as
-                        # long as tokens keep arriving, which is why 120s is safe here.
+                        # long as tokens keep arriving. Sized for a reasoning model that
+                        # goes quiet while thinking before emitting its first content
+                        # token; lower it only if your backends always stream promptly.
   request_timeout: 600  # NON-streaming calls (/v1/completions, non-streaming
                         # /v1/chat/completions, /v1/audio/*) have no chunks to pace them,
                         # so this bounds the whole generation. Much larger than
