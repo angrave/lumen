@@ -30,6 +30,27 @@ _http_latency = Histogram(
     ["method", "path_template"],
     buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0),
 )
+_stream_aborts = Counter(
+    "lumen_stream_aborts_total",
+    "Streaming LLM responses that ended before the client had the whole reply",
+    ["source", "reason"],
+)
+
+
+def observe_stream_abort(source: str, reason: str) -> None:
+    """Count one streaming response that ended early.
+
+    ``source`` is the request source as recorded in ``request_logs`` ("chat" or
+    "api"); ``reason`` is why the stream ended ("disconnect" for the polled
+    client-disconnect flag or a ``GeneratorExit``, "upstream_error" for a
+    failure from the backend).
+
+    Mid-stream disconnects were structurally invisible in production before the
+    ASGI bridge started delivering them (see ``services/wsgi_disconnect.py``);
+    this is the metric that makes them observable, so it has to be incremented
+    on every abort path rather than only defined.
+    """
+    _stream_aborts.labels(source=source, reason=reason).inc()
 
 
 class _ContextCheckingBody:

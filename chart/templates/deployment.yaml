@@ -93,6 +93,8 @@ spec:
               value: {{ .Values.replicaCount | quote }}
             - name: LUMEN_WSGI_WORKERS
               value: {{ .Values.wsgiWorkers | quote }}
+            - name: LUMEN_WSGI_SEND_TIMEOUT
+              value: {{ .Values.wsgiSendTimeout | quote }}
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:

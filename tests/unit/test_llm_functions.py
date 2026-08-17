@@ -946,6 +946,172 @@ def test_record_stream_abort_never_raises_into_a_closing_generator(app, test_use
 
 
 # ---------------------------------------------------------------------------
+# Upstream call bounds — every proxy client must be built with a timeout, and a
+# streaming client must never auto-retry. Unbounded, the SDK's own defaults
+# (600 s, two retries) let one stalled backend pin a WSGI worker for ~30 min.
+# ---------------------------------------------------------------------------
+
+def _stream_client_kwargs(app, chunks=None):
+    """Drive send_message_stream and return the kwargs openai.OpenAI got."""
+    from lumen.services.llm import send_message_stream
+    if chunks is None:
+        chunks = [_Chunk(content="hi"), _Chunk(usage=_Usage())]
+    mock_cls = _mock_openai(chunks)
+    with app.app_context():
+        with patch("lumen.services.llm.openai.OpenAI", mock_cls):
+            _drain(send_message_stream([], "test-model"))
+    assert mock_cls.call_args is not None, "openai.OpenAI was never constructed"
+    return mock_cls.call_args.kwargs
+
+
+def test_chat_stream_client_carries_a_structured_timeout(app, test_model_endpoint):
+    """connect and read are bounded separately, not by one bare float."""
+    import openai
+    kwargs = _stream_client_kwargs(app)
+    timeout = kwargs["timeout"]
+    assert isinstance(timeout, openai.Timeout)  # openai.Timeout IS httpx.Timeout
+    assert timeout.connect == 5.0
+    assert timeout.read == 120.0
+    assert timeout.write == 120.0
+    assert timeout.pool == 5.0
+
+
+def test_chat_stream_client_never_retries(app, test_model_endpoint):
+    """A retried stream is a second backend generation for one client request."""
+    assert _stream_client_kwargs(app)["max_retries"] == 0
+
+
+def test_chat_stream_timeout_comes_from_config(app, test_model_endpoint, monkeypatch):
+    """The bounds are configuration, not constants baked into the call site."""
+    monkeypatch.setitem(app.config, "LLM_CONNECT_TIMEOUT", 1.5)
+    monkeypatch.setitem(app.config, "LLM_READ_TIMEOUT", 9.0)
+    timeout = _stream_client_kwargs(app)["timeout"]
+    assert timeout.connect == 1.5
+    assert timeout.read == 9.0
+
+
+def test_chat_stream_retries_stay_zero_even_when_config_allows_them(
+    app, test_model_endpoint, monkeypatch,
+):
+    """LLM_MAX_RETRIES governs the non-streaming paths only."""
+    monkeypatch.setitem(app.config, "LLM_MAX_RETRIES", 5)
+    assert _stream_client_kwargs(app)["max_retries"] == 0
+
+
+def test_upstream_call_bounds_falls_back_to_defaults(app, monkeypatch):
+    """Works standalone if the config keys are ever absent."""
+    import openai
+    from lumen.services.llm import upstream_call_bounds
+    with app.app_context():
+        for key in ("LLM_CONNECT_TIMEOUT", "LLM_READ_TIMEOUT",
+                    "LLM_REQUEST_TIMEOUT", "LLM_MAX_RETRIES"):
+            monkeypatch.delitem(app.config, key, raising=False)
+        stream_timeout, stream_retries = upstream_call_bounds(streaming=True)
+        plain_timeout, plain_retries = upstream_call_bounds(streaming=False)
+    assert isinstance(stream_timeout, openai.Timeout)
+    assert (stream_timeout.connect, stream_timeout.read) == (5.0, 120.0)
+    assert stream_retries == 0
+    assert (plain_timeout.connect, plain_timeout.read) == (5.0, 600.0)
+    assert plain_retries == 1
+
+
+def test_non_streaming_read_bound_is_far_larger_than_the_streaming_one(app):
+    """The two read bounds measure different things and must not be shared.
+
+    On a stream the read timeout is the gap BETWEEN chunks, so 120s is safe
+    however long the generation runs. On a non-streaming call the same setting
+    caps the entire generation — a long completion or a large audio
+    transcription legitimately takes minutes, and one shared value would either
+    leave streams unbounded or start failing slow requests that work today.
+    """
+    from lumen.services.llm import upstream_call_bounds
+    with app.app_context():
+        stream_timeout, _ = upstream_call_bounds(streaming=True)
+        plain_timeout, _ = upstream_call_bounds(streaming=False)
+    assert plain_timeout.read > stream_timeout.read
+
+
+# ---------------------------------------------------------------------------
+# lumen_stream_aborts_total — the metric that makes mid-stream aborts
+# observable. Wired-but-never-incremented would repeat F1 in a new form, so
+# these assert the increment, not the definition.
+# ---------------------------------------------------------------------------
+
+def _abort_count(source, reason):
+    from prometheus_client import REGISTRY
+    return REGISTRY.get_sample_value(
+        "lumen_stream_aborts_total", {"source": source, "reason": reason}) or 0.0
+
+
+def test_stream_abort_increments_the_disconnect_counter(app, test_user, test_model, test_model_endpoint):
+    from lumen.services.llm import record_stream_abort
+    before = _abort_count("chat", "disconnect")
+    record_stream_abort(
+        app, billed=False, entity_id=test_user["id"], model_config_id=test_model["id"],
+        source="chat", endpoint_id=test_model_endpoint["id"], started_at=0.0,
+    )
+    assert _abort_count("chat", "disconnect") == before + 1
+
+
+def test_stream_abort_counts_anonymous_streams_too(app, test_model):
+    """There is no row to write without an entity, but the abort still happened."""
+    from lumen.services.llm import record_stream_abort
+    before = _abort_count("chat", "disconnect")
+    record_stream_abort(
+        app, billed=False, entity_id=None, model_config_id=test_model["id"],
+        source="chat", endpoint_id=None, started_at=0.0,
+    )
+    assert _abort_count("chat", "disconnect") == before + 1
+
+
+def test_completed_stream_is_not_counted_as_an_abort(app, test_user, test_model):
+    """billed=True means the client got the whole reply — not an abort."""
+    from lumen.services.llm import record_stream_abort
+    before = _abort_count("chat", "disconnect")
+    record_stream_abort(
+        app, billed=True, entity_id=test_user["id"], model_config_id=test_model["id"],
+        source="chat", endpoint_id=None, started_at=0.0,
+    )
+    assert _abort_count("chat", "disconnect") == before
+
+
+def test_disconnected_chat_stream_increments_the_counter(app, test_user, test_model_endpoint):
+    """End to end through the real generator, not just the accounting helper."""
+    import threading
+    disconnected = threading.Event()
+    before = _abort_count("chat", "disconnect")
+    chunks = [_Chunk(content="partial"), _Chunk(content=" more"), _Chunk(usage=_Usage())]
+    with app.app_context():
+        from lumen.services.llm import send_message_stream
+        with patch("lumen.services.llm.openai.OpenAI", _mock_openai(chunks)), \
+             patch("lumen.services.llm.client_disconnect_event", return_value=disconnected):
+            gen = send_message_stream([], "test-model", entity_id=test_user["id"])
+            next(gen)
+            disconnected.set()
+            assert list(gen) == []
+    assert _abort_count("chat", "disconnect") == before + 1
+
+
+def test_upstream_failure_is_counted_with_its_own_reason(app, test_user, test_model_endpoint):
+    """A backend failure ends the stream too, and must be told apart from a
+    disconnect — otherwise the counter cannot distinguish 'clients are leaving'
+    from 'the backend is broken'."""
+    before_up = _abort_count("chat", "upstream_error")
+    before_disc = _abort_count("chat", "disconnect")
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.side_effect = RuntimeError("upstream exploded")
+    mock_client.__enter__ = MagicMock(return_value=mock_client)
+    mock_client.__exit__ = MagicMock(return_value=False)
+    with app.app_context():
+        from lumen.services.llm import send_message_stream
+        with patch("lumen.services.llm.openai.OpenAI", MagicMock(return_value=mock_client)):
+            with pytest.raises(RuntimeError, match="upstream exploded"):
+                _drain(send_message_stream([], "test-model", entity_id=test_user["id"]))
+    assert _abort_count("chat", "upstream_error") == before_up + 1
+    assert _abort_count("chat", "disconnect") == before_disc  # not double-counted
+
+
+# ---------------------------------------------------------------------------
 # Helper stubs for send_message_stream mocking (kept at end so the static
 # analyser does not treat all test functions above as methods of _Chunk)
 # ---------------------------------------------------------------------------

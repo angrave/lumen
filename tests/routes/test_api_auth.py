@@ -1109,3 +1109,278 @@ def test_streaming_disconnect_bills_estimated_usage(
         key = db.session.get(APIKey, key_id)
         assert (key.input_tokens, key.output_tokens) == (100, 1)
         assert float(key.cost) == pytest.approx(0.000102)
+
+
+# ---------------------------------------------------------------------------
+# Upstream call bounds — every proxy client the API path builds must carry a
+# timeout, and the streaming one must never auto-retry. Unbounded, the SDK's
+# own defaults (600 s, two retries) let one stalled backend pin a WSGI worker
+# thread for ~30 minutes on a single client request.
+#
+# The audio case is exercised here rather than in test_api_audio.py so all four
+# proxy clients are covered in one place alongside the chat ones.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def fresh_rate_limit(app):
+    """Give this test the full per-key rate-limit budget, and leave it clean.
+
+    The /v1 limiter is keyed on the API key's id over in-memory storage, and
+    ``clean_db`` lets SQLite hand out id 1 again for every test's key — so the
+    whole suite shares one 30-per-minute bucket. Tests that add API calls tip
+    unrelated later tests into 429 unless they reset it; that is exactly how
+    adding the tests below first surfaced.
+    """
+    from lumen.extensions import limiter
+    with app.app_context():
+        limiter.reset()
+    yield
+    with app.app_context():
+        limiter.reset()
+
+
+def _capturing_openai(monkeypatch, routes, create):
+    """Patch openai.OpenAI and return the list of kwargs each construction got."""
+    calls = []
+
+    class _FakeClient:
+        def __enter__(self): return self
+
+        def __exit__(self, *a): return False
+
+        @property
+        def chat(self):
+            return type("C", (), {
+                "completions": type("X", (), {"create": staticmethod(create)})(),
+            })()
+
+        @property
+        def audio(self):
+            return type("A", (), {
+                "transcriptions": type("T", (), {"create": staticmethod(create)})(),
+                "translations": type("R", (), {"create": staticmethod(create)})(),
+            })()
+
+    def _factory(*a, **kw):
+        calls.append(kw)
+        return _FakeClient()
+
+    monkeypatch.setattr(routes.openai, "OpenAI", _factory)
+    return calls
+
+
+class _NonStreamResponse:
+    """The shape _complete_and_bill expects back from a non-streaming call."""
+
+    class usage:  # noqa: N801 - stands in for the OpenAI usage object
+        prompt_tokens = 1
+        completion_tokens = 1
+
+    def model_dump(self):
+        return {"choices": [{"message": {"role": "assistant", "content": "hi"}}]}
+
+
+def _chat_post(client, token, model_name, stream):
+    return client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"model": model_name,
+              "messages": [{"role": "user", "content": "hi"}], "stream": stream},
+    )
+
+
+def test_non_streaming_chat_client_is_bounded(
+    app, client, monkeypatch, test_user, test_model, test_model_endpoint, api_key,
+    fresh_rate_limit,
+):
+    """connect and read bounded separately; retries allowed — this attempt is
+    finished and nothing has been sent to the client yet."""
+    import openai
+    from lumen.blueprints.api import routes
+    token, _ = api_key
+    _allow_model(app, test_user, test_model)
+    calls = _capturing_openai(monkeypatch, routes, lambda **kw: _NonStreamResponse())
+
+    assert _chat_post(client, token, test_model["model_name"], False).status_code == HTTPStatus.OK
+    assert len(calls) == 1
+    timeout = calls[0]["timeout"]
+    assert isinstance(timeout, openai.Timeout)  # openai.Timeout IS httpx.Timeout
+    # read/write use LLM_REQUEST_TIMEOUT here, not the streaming inter-chunk
+    # bound: with no chunks to pace it, this caps the whole generation.
+    assert (timeout.connect, timeout.read, timeout.write, timeout.pool) == (5.0, 600.0, 600.0, 5.0)
+    assert calls[0]["max_retries"] == 1
+
+
+def test_non_streaming_chat_bounds_come_from_config(
+    app, client, monkeypatch, test_user, test_model, test_model_endpoint, api_key,
+    fresh_rate_limit,
+):
+    from lumen.blueprints.api import routes
+    token, _ = api_key
+    _allow_model(app, test_user, test_model)
+    monkeypatch.setitem(app.config, "LLM_CONNECT_TIMEOUT", 2.5)
+    monkeypatch.setitem(app.config, "LLM_REQUEST_TIMEOUT", 33.0)
+    monkeypatch.setitem(app.config, "LLM_MAX_RETRIES", 3)
+    calls = _capturing_openai(monkeypatch, routes, lambda **kw: _NonStreamResponse())
+
+    _chat_post(client, token, test_model["model_name"], False)
+    assert (calls[0]["timeout"].connect, calls[0]["timeout"].read) == (2.5, 33.0)
+    assert calls[0]["max_retries"] == 3
+
+
+def test_streaming_chat_client_is_bounded_and_never_retries(
+    app, client, monkeypatch, test_user, test_model, test_model_endpoint, api_key,
+    fresh_rate_limit,
+):
+    """A retried stream restarts the whole generation while the first attempt may
+    still be draining upstream — two backend generations for one client request,
+    with chunks already sent that cannot be un-sent."""
+    import openai
+    from lumen.blueprints.api import routes
+    token, _ = api_key
+    _allow_model(app, test_user, test_model)
+    # Even with retries configured, the streaming client must ask for none.
+    monkeypatch.setitem(app.config, "LLM_MAX_RETRIES", 4)
+    calls = _capturing_openai(monkeypatch, routes, lambda **kw: iter([_UsageChunk()]))
+
+    body = _chat_post(client, token, test_model["model_name"], True).get_data(as_text=True)
+    assert "data: [DONE]" in body
+    assert len(calls) == 1
+    assert isinstance(calls[0]["timeout"], openai.Timeout)
+    assert calls[0]["timeout"].read == 120.0
+    assert calls[0]["max_retries"] == 0
+
+
+def test_streaming_bounds_are_captured_into_the_generator_closure():
+    """The bounds must be read in the view and closed over, not read inside
+    ``generate()``.
+
+    The response generator runs after the request's contexts are gone, on
+    whatever worker thread iterates the body: no ``current_app``, so a lazy
+    ``upstream_call_bounds()`` there is a 500 on every stream in production.
+    Nothing in this suite can catch that at runtime — the session-scoped ``app``
+    fixture holds an app context for the whole run, and Flask's test client
+    preserves the request context across the body iteration too, so a misplaced
+    read still finds both. So assert the structure instead, the same way
+    ``test_no_stream_with_context.py`` does: ``timeout`` must be a free variable
+    of ``generate`` (bound in the enclosing view) and not one of its locals.
+    """
+    from lumen.blueprints.api import routes
+
+    generate = next(
+        c for c in routes._do_chat.__code__.co_consts
+        if getattr(c, "co_name", None) == "generate"
+    )
+    assert "timeout" in generate.co_freevars, (
+        "the streaming client's timeout is not captured from the view — if it is "
+        "read inside generate(), there is no current_app there in production"
+    )
+    assert "timeout" not in generate.co_varnames
+
+
+def test_audio_client_is_bounded(
+    app, client, monkeypatch, test_user, test_model, test_model_endpoint, api_key,
+    fresh_rate_limit,
+):
+    from io import BytesIO
+    import openai
+    from lumen.blueprints.api import routes
+    token, _ = api_key
+    _allow_model(app, test_user, test_model)
+    calls = _capturing_openai(
+        monkeypatch, routes,
+        lambda **kw: type("R", (), {"model_dump": lambda self: {"text": "hi"}})(),
+    )
+
+    resp = client.post(
+        "/v1/audio/transcriptions",
+        headers={"Authorization": f"Bearer {token}"},
+        data={"model": test_model["model_name"], "file": (BytesIO(b"audio"), "a.flac")},
+        content_type="multipart/form-data",
+    )
+    assert resp.status_code == HTTPStatus.OK
+    assert len(calls) == 1
+    timeout = calls[0]["timeout"]
+    assert isinstance(timeout, openai.Timeout)
+    # write bounds the upload of the audio file, read the transcription itself.
+    # Both use LLM_REQUEST_TIMEOUT: transcribing a large file has no chunks to
+    # pace it and legitimately takes minutes.
+    assert (timeout.connect, timeout.read, timeout.write) == (5.0, 600.0, 600.0)
+    assert calls[0]["max_retries"] == 1
+
+
+# ---------------------------------------------------------------------------
+# lumen_stream_aborts_total, API side. F1's lesson was that a monitoring hook
+# nobody proves fires is worse than none, so these assert the increment.
+# ---------------------------------------------------------------------------
+
+def _abort_count(source, reason):
+    from prometheus_client import REGISTRY
+    return REGISTRY.get_sample_value(
+        "lumen_stream_aborts_total", {"source": source, "reason": reason}) or 0.0
+
+
+def test_api_stream_disconnect_increments_the_abort_counter(
+    app, client, monkeypatch, test_user, test_model, test_model_endpoint, api_key,
+    fresh_rate_limit,
+):
+    import threading
+    from lumen.blueprints.api import routes
+    token, _ = api_key
+    _allow_model(app, test_user, test_model)
+    disconnected = threading.Event()
+    monkeypatch.setattr(routes, "client_disconnect_event", lambda: disconnected)
+    _fake_openai(monkeypatch, routes, [_ContentChunk(), _ContentChunk(), _UsageChunk()])
+    before = _abort_count("api", "disconnect")
+    before_err = _abort_count("api", "upstream_error")
+
+    resp = _chat_post(client, token, test_model["model_name"], True)
+    assert resp.is_streamed
+    events = iter(resp.response)
+    next(events)
+    disconnected.set()
+    assert list(events) == []
+    resp.close()
+
+    assert _abort_count("api", "disconnect") == before + 1
+    # the other reason is untouched — the label really discriminates
+    assert _abort_count("api", "upstream_error") == before_err
+
+
+def test_api_stream_upstream_error_increments_its_own_reason(
+    app, client, monkeypatch, test_user, test_model, test_model_endpoint, api_key,
+    fresh_rate_limit,
+):
+    """A broken backend must not look like clients hanging up."""
+    from lumen.blueprints.api import routes
+    token, _ = api_key
+    _allow_model(app, test_user, test_model)
+
+    def _boom():
+        yield _ContentChunk()
+        raise RuntimeError("upstream blew up mid-stream")
+
+    _capturing_openai(monkeypatch, routes, lambda **kw: _boom())
+    before_err = _abort_count("api", "upstream_error")
+    before_disc = _abort_count("api", "disconnect")
+
+    body = _chat_post(client, token, test_model["model_name"], True).get_data(as_text=True)
+    assert '"error"' in body
+
+    assert _abort_count("api", "upstream_error") == before_err + 1
+    assert _abort_count("api", "disconnect") == before_disc
+
+
+def test_completed_api_stream_is_not_counted_as_an_abort(
+    app, client, monkeypatch, test_user, test_model, test_model_endpoint, api_key,
+    fresh_rate_limit,
+):
+    from lumen.blueprints.api import routes
+    token, _ = api_key
+    _allow_model(app, test_user, test_model)
+    _fake_openai(monkeypatch, routes, [_UsageChunk()])
+    before = _abort_count("api", "disconnect")
+
+    body = _chat_post(client, token, test_model["model_name"], True).get_data(as_text=True)
+    assert "data: [DONE]" in body
+    assert _abort_count("api", "disconnect") == before

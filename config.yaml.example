@@ -61,6 +61,23 @@ api:
   monitoring:
     token: ""   # Set to a long random string; leave empty to disable
 
+# Bounds on the calls Lumen makes to the upstream model endpoints. Without these
+# the OpenAI SDK defaults apply (600s timeout, 2 retries), so one stalled backend
+# can hold a worker thread for ~30 minutes.
+llm:
+  connect_timeout: 5    # seconds to establish the upstream connection
+  read_timeout: 120     # for a streaming response this is the maximum gap BETWEEN CHUNKS,
+                        # not the total call duration — a 20-minute generation is fine as
+                        # long as tokens keep arriving, which is why 120s is safe here.
+  request_timeout: 600  # NON-streaming calls (/v1/completions, non-streaming
+                        # /v1/chat/completions, /v1/audio/*) have no chunks to pace them,
+                        # so this bounds the whole generation. Much larger than
+                        # read_timeout on purpose: a long completion or a large audio
+                        # transcription can legitimately take minutes.
+  max_retries: 1        # retries for non-streaming upstream calls. Streaming calls are
+                        # never retried: a retry restarts the whole generation while the
+                        # first attempt may still be draining upstream.
+
 chat:
   upload:
     max_size_mb: 10          # maximum file size for document uploads (MB)

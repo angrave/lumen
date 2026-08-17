@@ -83,6 +83,27 @@ def apply_hot_config(app, yaml_data: dict):
     api_cfg = yaml_data.get("api", {})
     app.config["API_REQUIRE_MODEL_CONSENT"] = api_cfg.get("consent", True)
 
+    # Bounds on upstream LLM calls. read_timeout is the maximum gap *between
+    # chunks* of a streaming response, not the total call duration — a
+    # twenty-minute generation is fine as long as tokens keep arriving, which is
+    # what makes a low-ish default safe. max_retries applies to non-streaming
+    # calls; a streaming call must never be auto-retried, because the retry
+    # restarts the whole generation while the first may still be draining.
+    # A key present but blank ("read_timeout:") parses as None; treat it as absent.
+    llm_cfg = yaml_data.get("llm") or {}
+    _connect_timeout = llm_cfg.get("connect_timeout")
+    _read_timeout = llm_cfg.get("read_timeout")
+    _max_retries = llm_cfg.get("max_retries")
+    app.config["LLM_CONNECT_TIMEOUT"] = float(5.0 if _connect_timeout is None else _connect_timeout)
+    app.config["LLM_READ_TIMEOUT"] = float(120.0 if _read_timeout is None else _read_timeout)
+    app.config["LLM_MAX_RETRIES"] = int(1 if _max_retries is None else _max_retries)
+    # Non-streaming calls need their own, much larger bound: read_timeout is a
+    # between-chunks gap for a stream, but for a single-response call the same
+    # setting caps the entire generation, and a long completion or a large audio
+    # transcription legitimately takes minutes.
+    _request_timeout = llm_cfg.get("request_timeout")
+    app.config["LLM_REQUEST_TIMEOUT"] = float(600.0 if _request_timeout is None else _request_timeout)
+
     # The in-app config editor is on by default; Helm sets it false for git-managed configs.
     app.config["CONFIG_EDITOR"] = bool(app_cfg.get("config_editor", True))
 

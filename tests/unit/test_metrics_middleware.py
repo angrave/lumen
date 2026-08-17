@@ -239,3 +239,44 @@ def test_middleware_records_500_on_app_exception():
     wrapped = make_metrics_middleware(exploding_app)
     with pytest.raises(RuntimeError, match="boom"):
         wrapped(_fake_environ("/crash"), lambda *a: None)
+
+
+# ---------------------------------------------------------------------------
+# observe_stream_abort / lumen_stream_aborts_total
+# ---------------------------------------------------------------------------
+
+def _abort_count(source, reason):
+    from prometheus_client import REGISTRY
+    return REGISTRY.get_sample_value(
+        "lumen_stream_aborts_total", {"source": source, "reason": reason}) or 0.0
+
+
+def test_observe_stream_abort_increments_per_label_pair():
+    """Each (source, reason) is its own series — 'clients are leaving' and 'the
+    backend is broken' must not be summed into one number."""
+    from lumen.blueprints.metrics.middleware import observe_stream_abort
+
+    before = {
+        ("chat", "disconnect"): _abort_count("chat", "disconnect"),
+        ("api", "disconnect"): _abort_count("api", "disconnect"),
+        ("api", "upstream_error"): _abort_count("api", "upstream_error"),
+    }
+    observe_stream_abort("api", "upstream_error")
+    observe_stream_abort("api", "upstream_error")
+    observe_stream_abort("chat", "disconnect")
+
+    assert _abort_count("api", "upstream_error") == before[("api", "upstream_error")] + 2
+    assert _abort_count("chat", "disconnect") == before[("chat", "disconnect")] + 1
+    assert _abort_count("api", "disconnect") == before[("api", "disconnect")]
+
+
+def test_stream_abort_counter_is_on_the_default_registry():
+    """It must live on the default registry like the HTTP counters, so
+    prometheus_client's multiprocess mode picks it up and /metrics exposes it."""
+    from prometheus_client import REGISTRY, generate_latest
+    from lumen.blueprints.metrics.middleware import observe_stream_abort
+
+    observe_stream_abort("chat", "disconnect")
+    scrape = generate_latest(REGISTRY).decode()
+    assert "# TYPE lumen_stream_aborts_total counter" in scrape
+    assert 'lumen_stream_aborts_total{reason="disconnect",source="chat"}' in scrape

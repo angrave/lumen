@@ -24,7 +24,8 @@ from lumen.models.model_endpoint import ModelEndpoint
 from lumen.models.request_log import RequestLog
 from lumen.services.cost import calculate_audio_cost
 from lumen.services.wsgi_disconnect import client_disconnect_event
-from lumen.services.llm import bulk_model_access_info, check_coin_budget, subtract_coins, estimate_abort_usage, get_effective_limit, get_next_endpoint, get_pool_limit, update_stats, record_stream_abort
+from lumen.services.llm import bulk_model_access_info, check_coin_budget, subtract_coins, estimate_abort_usage, get_effective_limit, get_next_endpoint, get_pool_limit, update_stats, record_stream_abort, upstream_call_bounds
+from lumen.blueprints.metrics.middleware import observe_stream_abort
 
 api_bp = Blueprint("api", __name__, url_prefix="/v1")
 
@@ -360,11 +361,18 @@ def _complete_and_bill(model_name: str, messages: list, **kwargs):
     mc_id        = model_config.id
     mc_in_cost   = float(model_config.input_cost_per_million)
     mc_out_cost  = float(model_config.output_cost_per_million)
+    timeout, max_retries = upstream_call_bounds(streaming=False)
     db.session.remove()  # return connection to pool before the LLM call
 
     try:
         t0 = _time.time()
-        with openai.OpenAI(api_key=ep_api_key, base_url=ep_url) as client:
+        # Non-streaming, so the read timeout bounds the wait for the *entire*
+        # response body rather than the gap between chunks — a generation that
+        # legitimately runs longer than LLM_READ_TIMEOUT is cut off here.
+        # Retries are allowed (unlike the streaming path): this attempt is
+        # finished and nothing has been sent to the client yet.
+        with openai.OpenAI(api_key=ep_api_key, base_url=ep_url,
+                           timeout=timeout, max_retries=max_retries) as client:
             response = client.chat.completions.create(model=remote_model, messages=messages, **kwargs)
         duration = _time.time() - t0
     except Exception as exc:
@@ -440,6 +448,9 @@ def _do_chat(model_name: str, messages: list, stream: bool, **kwargs):
     # Captured while the request context is still current; polled in the loop
     # below. GeneratorExit alone never fires under uvicorn + a2wsgi.
     disconnected = client_disconnect_event()
+    # Likewise read here, not in generate(): the client is constructed inside
+    # the generator, which runs context-free with no current_app to read from.
+    timeout, max_retries = upstream_call_bounds(streaming=True)
 
     def generate():
         billed = False
@@ -471,7 +482,19 @@ def _do_chat(model_name: str, messages: list, stream: bool, **kwargs):
         # handlers below run. With the ``with`` outside, the abort accounting's
         # DB round-trip happened while the backend was still generating.
         try:
-            with openai.OpenAI(api_key=ep_api_key, base_url=ep_url) as client:
+            # max_retries=0: a streaming call is never auto-retried — a retry
+            # restarts the whole generation while the first attempt may still be
+            # draining upstream, i.e. two backend generations for one client
+            # request, with chunks already sent that cannot be un-sent.
+            # LLM_MAX_RETRIES applies to the non-streaming paths only.
+            #
+            # The read timeout is the maximum gap *between* chunks, so a long
+            # generation is unaffected. It is also what bounds F10: the
+            # disconnect flag below is only polled between chunks, so while
+            # blocked awaiting the next upstream chunk a disconnect cannot be
+            # seen at all — the read timeout caps that blind window.
+            with openai.OpenAI(api_key=ep_api_key, base_url=ep_url,
+                               timeout=timeout, max_retries=max_retries) as client:
                 stream_options = {**kwargs.pop("stream_options", {}), "include_usage": True}
                 resp_stream = client.chat.completions.create(
                     model=remote_model, messages=messages, stream=True,
@@ -531,6 +554,10 @@ def _do_chat(model_name: str, messages: list, stream: bool, **kwargs):
             _abort()
             raise
         except Exception as exc:
+            # An upstream failure (including the read timeout above) ends the
+            # stream early too; counted on the same metric as disconnects, with
+            # a reason that tells them apart.
+            observe_stream_abort("api", "upstream_error")
             msg, err_type, _ = _classify_upstream_error(
                 exc,
                 f"Error during streaming request "
@@ -596,11 +623,16 @@ def _do_audio(kind: str):
     mc_in_cost       = float(model_config.input_cost_per_million)
     mc_out_cost      = float(model_config.output_cost_per_million)
     mc_audio_per_hour = float(model_config.audio_cost_per_hour or 0)
+    timeout, max_retries = upstream_call_bounds(streaming=False)
     db.session.remove()
 
     try:
         t0 = _time.time()
-        with openai.OpenAI(api_key=ep_api_key, base_url=ep_url) as client:
+        # Non-streaming: the read timeout bounds the whole transcription, and
+        # the write timeout the upload of the audio file. A long recording can
+        # legitimately exceed LLM_READ_TIMEOUT — raise it if that bites.
+        with openai.OpenAI(api_key=ep_api_key, base_url=ep_url,
+                           timeout=timeout, max_retries=max_retries) as client:
             create = getattr(client.audio, kind).create
             response = create(model=remote_model, file=(file_name, file_data, file_type), **extra)
         duration = _time.time() - t0

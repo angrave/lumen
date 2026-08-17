@@ -66,7 +66,50 @@ from lumen.models.group_limit import GroupLimit
 from lumen.models.group_model_access import GroupModelAccess
 from lumen.services.crypto import cache_salt_for_entity
 from lumen.services.wsgi_disconnect import client_disconnect_event
+from lumen.blueprints.metrics.middleware import observe_stream_abort
 from lumen.models.entity import Entity
+
+
+def upstream_call_bounds(*, streaming: bool):
+    """Return (timeout, max_retries) for an upstream ``openai.OpenAI`` client.
+
+    ``streaming`` selects which read bound applies, and they mean genuinely
+    different things — one value cannot serve both. On a streaming call the read
+    timeout is the maximum gap *between chunks*, so a low value is safe however
+    long the generation runs. On a non-streaming call the same setting bounds the
+    entire wait for the response body, and a non-streaming completion or a long
+    audio transcription can legitimately take minutes. Sharing one number would
+    either leave streams unbounded or start failing slow non-streaming requests
+    that work today.
+
+    Every proxy client must be bounded. The SDK's own defaults are 600 s and
+    two retries, so a silently stalled backend can pin a WSGI worker thread for
+    ~30 minutes across three attempts of a single client request — long past
+    the gateway deadline that made those attempts orphan work.
+
+    ``openai.Timeout`` is ``httpx.Timeout`` re-exported; a structured timeout
+    rather than a bare float so connecting and reading are bounded separately.
+
+    Must be called while an application context is current; streaming callers
+    capture the result into their generator's closure, since the generator runs
+    context-free and has no ``current_app``.
+    """
+    cfg = current_app.config
+    connect = float(cfg.get("LLM_CONNECT_TIMEOUT", 5.0))
+    if streaming:
+        read = float(cfg.get("LLM_READ_TIMEOUT", 120.0))
+        # Never auto-retry a stream: a retry restarts the whole generation while
+        # the first attempt may still be draining upstream, which is duplicate
+        # backend work for one client request. Not configurable for that reason.
+        max_retries = 0
+    else:
+        read = float(cfg.get("LLM_REQUEST_TIMEOUT", 600.0))
+        max_retries = int(cfg.get("LLM_MAX_RETRIES", 1))
+    # write is bounded like read (it covers pushing the request body, e.g. an
+    # audio upload); pool is bounded like connect, and is near-instant anyway
+    # because every call site builds its own single-use client.
+    return openai.Timeout(connect=connect, read=read, write=read, pool=connect), max_retries
+
 
 def _resolve_allow_block(
     ema_type: str,
@@ -609,12 +652,17 @@ def record_aborted_request(entity_id, model_config_id, source, endpoint_id=None,
 
 
 def record_stream_abort(app, *, billed, entity_id, model_config_id, source, endpoint_id, started_at,
-                        input_tokens=0, output_tokens=0, cost=0.0, effective=_UNSET, record_extra=None):
+                        input_tokens=0, output_tokens=0, cost=0.0, effective=_UNSET, record_extra=None,
+                        reason="disconnect"):
     """Abort accounting for a streaming generator that ends before billing.
 
     Every path that can end a stream early shares this, so they cannot drift:
     the ``GeneratorExit`` raised when the response iterable is closed, and the
     polled client-disconnect flag. Does nothing once billing has completed.
+
+    ``reason`` labels the ``lumen_stream_aborts_total`` counter. It is passed in
+    rather than inferred here: both of this function's callers arrive from a
+    client going away, so nothing distinguishable is available at this seam.
 
     Pushes its own short-lived application context because the streaming
     generators run context-free; call it only from a point with no ``yield``
@@ -623,7 +671,13 @@ def record_stream_abort(app, *, billed, entity_id, model_config_id, source, endp
     is already unwinding, so a failure here (including one raised by the
     context teardown's session release) must not replace the original exit.
     """
-    if billed or entity_id is None:
+    if billed:
+        return
+    # Counted before the anonymous-stream guard so the metric measures aborts,
+    # not billable aborts — and outside the try below so a DB failure still
+    # leaves the abort visible.
+    observe_stream_abort(source, reason)
+    if entity_id is None:
         return
     try:
         with app.app_context():
@@ -690,6 +744,10 @@ def _send_message_stream(app, messages, model, entity_id, source, effective, dis
         # Derive the per-entity prefix-cache salt while a context is current;
         # the create() call below runs context-free (no current_app). See #36.
         cache_salt   = cache_salt_for_entity(entity_id) if entity_id is not None else None
+        # Same reason: read the upstream bounds here, into plain scalars in this
+        # generator's frame. openai.OpenAI() below is constructed after this
+        # context has exited, where current_app does not exist.
+        timeout, max_retries = upstream_call_bounds(streaming=True)
 
     t0 = time.time()
     t_first = None
@@ -715,7 +773,19 @@ def _send_message_stream(app, messages, model, entity_id, source, effective, dis
         )
 
     try:
-        with openai.OpenAI(api_key=ep_api_key, base_url=ep_url) as client:
+        # max_retries=0: a streaming call is never auto-retried. A retry
+        # restarts the whole generation while the first attempt may still be
+        # draining upstream, so one client request becomes two backend
+        # generations — and the tokens already streamed to the client cannot be
+        # un-sent. LLM_MAX_RETRIES applies to the non-streaming paths only.
+        #
+        # The read timeout here is the maximum gap *between* chunks, so a long
+        # generation is unaffected. It is also what bounds F10: the disconnect
+        # flag is only polled between chunks, so while blocked in the upstream's
+        # __next__() a disconnect cannot be observed at all — the read timeout
+        # caps that blind window instead of leaving it unbounded.
+        with openai.OpenAI(api_key=ep_api_key, base_url=ep_url,
+                           timeout=timeout, max_retries=max_retries) as client:
             stream = client.chat.completions.create(
                 model=remote_model,
                 messages=messages,
@@ -783,6 +853,13 @@ def _send_message_stream(app, messages, model, entity_id, source, effective, dis
         # Client disconnected mid-stream before billing — bill what was consumed
         # and log it as an abort, then re-raise to close cleanly.
         _abort()
+        raise
+    except Exception:
+        # An upstream failure (including the read timeout above) ends the stream
+        # just as surely as a disconnect, and is counted so the two are
+        # distinguishable on the same metric. No billing here: the exception
+        # propagates to the view, which owns the client-facing error.
+        observe_stream_abort(source, "upstream_error")
         raise
 
     yield None, None, {
