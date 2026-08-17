@@ -85,6 +85,7 @@ Following rules are here to help the AI avoid the same mistakes again:
 - updates to the schema should be reflected in docs/dbschema.md and columns/tables should have comments.
 - Don't use bare integer HTTP codes, use `HTTPStatus` constants.
 - updates to config file should be reflected in the helm chart values.yaml and values.schema.json.
+- The ASGI→WSGI bridge's `receive()` has exactly one consumer — the pump in `lumen/services/wsgi_disconnect.py`. Never add a second caller (e.g. a disconnect watcher alongside `a2wsgi.Body`): they steal each other's messages, GETs still work and every POST body silently corrupts. Enforced by `tests/unit/test_wsgi_disconnect_body.py`.
 
 ## 6. Accessibility (WCAG 2.1 AA)
 
