@@ -460,11 +460,14 @@ def _do_chat(model_name: str, messages: list, stream: bool, **kwargs):
                 )
                 usage = None
                 for chunk in resp_stream:
+                    # Capture usage before testing the flag — see llm.py: the
+                    # totals ride on the terminal chunk, and a disconnect in that
+                    # window must not discard figures already in hand.
+                    if chunk.usage is not None:
+                        usage = chunk.usage
                     if disconnected.is_set():
                         aborted = True
                         break
-                    if chunk.usage is not None:
-                        usage = chunk.usage
                     yield f"data: {json.dumps(chunk.model_dump())}\n\n"
                 if not aborted:
                     duration = _time.time() - t0

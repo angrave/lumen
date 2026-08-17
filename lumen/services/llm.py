@@ -643,11 +643,15 @@ def _send_message_stream(app, messages, model, entity_id, source, effective, dis
 
             thinking_parts = []
             for chunk in stream:
+                # Capture usage before testing the flag. The totals ride on the
+                # terminal chunk, so a disconnect landing in that same window
+                # would otherwise throw away figures already in hand — and bill
+                # nothing for work the backend actually did.
+                if chunk.usage:
+                    usage = chunk.usage
                 if disconnected.is_set():
                     aborted = True
                     break
-                if chunk.usage:
-                    usage = chunk.usage
                 if chunk.choices:
                     delta = chunk.choices[0].delta
                     reasoning = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)

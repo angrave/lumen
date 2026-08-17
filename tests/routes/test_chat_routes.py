@@ -448,3 +448,41 @@ def test_chat_stream_whitelist_passes_access(app, auth_client, test_user, test_m
         "model": test_model["model_name"],
     })
     assert resp.status_code != HTTPStatus.FORBIDDEN
+
+
+def test_chat_stream_disconnect_is_not_reported_as_empty_response(
+    app, auth_client, test_user, test_model, monkeypatch,
+):
+    """A departed client is not an empty model response.
+
+    send_message_stream stops without emitting its final result tuple when the
+    disconnect flag is set, which leaves `result is None` — the same state as a
+    genuinely empty response. Reporting the two identically is wrong in the log
+    and, on a half-open connection where the socket is still live, delivers
+    "Empty response from model" to a client that just received partial output.
+    """
+    import threading
+
+    disconnected = threading.Event()
+    with app.app_context():
+        _grant_unlimited_pool(app, test_user["id"])
+
+    def fake_stream(messages, model, entity_id=None, source="chat", effective=None):
+        yield "Hello", None, None
+        disconnected.set()  # client vanishes mid-stream
+        yield " world", None, None
+
+    from lumen.blueprints.chat import routes as chat_routes
+    monkeypatch.setattr(chat_routes, "send_message_stream", fake_stream)
+    monkeypatch.setattr(chat_routes, "client_disconnect_event", lambda: disconnected)
+
+    resp = auth_client.post("/chat/stream", json={
+        "messages": [{"role": "user", "content": "hi"}],
+        "model": test_model["model_name"],
+    })
+    assert resp.status_code == HTTPStatus.OK
+    body = b"".join(resp.response)
+    resp.close()
+    assert b"Empty response from model" not in body, (
+        "a client disconnect was reported to the client as an empty model response"
+    )

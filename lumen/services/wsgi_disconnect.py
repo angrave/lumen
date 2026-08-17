@@ -99,21 +99,39 @@ async def _pump(
 ) -> None:
     """The one and only consumer of ``receive()``. See the module docstring."""
     body_open = True
-    while True:
-        message = await receive()
-        if message["type"] == "http.request":
-            if body_open:
-                more_body = message.get("more_body", False)
-                await queue.put((message.get("body", b""), more_body))
-                body_open = more_body
-        elif message["type"] == "http.disconnect":
-            # Set the flag before the put, which blocks while the queue is
-            # full: an app that has stopped reading the body must still see
-            # the disconnect.
-            disconnected.set()
-            if body_open:
+    try:
+        while True:
+            message = await receive()
+            if message["type"] == "http.request":
+                if body_open:
+                    more_body = message.get("more_body", False)
+                    await queue.put((message.get("body", b""), more_body))
+                    body_open = more_body
+            elif message["type"] == "http.disconnect":
+                # Set the flag before the put, which blocks while the queue is
+                # full: an app that has stopped reading the body must still see
+                # the disconnect.
+                disconnected.set()
+                if body_open:
+                    await queue.put(_EOF)
+                return
+    except asyncio.CancelledError:
+        # Normal teardown: the responder cancels the pump once the response is
+        # done. Nobody is waiting on the queue by then.
+        raise
+    except BaseException:
+        # Any other failure would otherwise be silent — the task's exception is
+        # never retrieved — while the WSGI thread stays blocked forever in
+        # _receive_more_data waiting on a queue nothing will fill again. That is
+        # a permanently leaked worker thread per occurrence. Unblock the reader
+        # and report the client as gone before propagating.
+        disconnected.set()
+        if body_open:
+            try:
                 await queue.put(_EOF)
-            return
+            except BaseException:
+                pass
+        raise
 
 
 class _DisconnectAwareWSGIResponder(WSGIResponder):
