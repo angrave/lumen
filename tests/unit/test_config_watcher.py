@@ -269,6 +269,58 @@ def test_no_dev_user_no_warning(app, caplog, restore_config):
 
 
 # ---------------------------------------------------------------------------
+# apply_hot_config: unrecognised keys in the 'app' section
+# ---------------------------------------------------------------------------
+
+def test_unknown_app_key_warns(app, caplog, restore_config):
+    """A key renamed by a schema change must not fail silently.
+
+    Every read of the app section is a .get() with a default, so an orphaned key
+    is simply ignored. `app.database_url` outlived the move to `app.database.url`
+    by six weeks that way, which left the whole test suite running against the
+    developer's dev database and dropping its tables on every run.
+    """
+    import logging
+    from lumen.services.config_watcher import apply_hot_config
+    with caplog.at_level(logging.WARNING, logger="lumen.services.config_watcher"):
+        with app.app_context():
+            apply_hot_config(app, {"app": {"database_url": "sqlite:///stale.db"}})
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "unrecognised key" in messages
+    assert "database_url" in messages
+
+
+def test_known_app_keys_do_not_warn(app, caplog, restore_config):
+    import logging
+    from lumen.services.config_watcher import KNOWN_APP_KEYS, apply_hot_config
+    # Empty dicts are inert placeholders for every shape these keys can take
+    # (str, bool, mapping); the point is only that the key name is recognised.
+    yaml_data = {"app": {key: {} for key in KNOWN_APP_KEYS}}
+    with caplog.at_level(logging.WARNING, logger="lumen.services.config_watcher"):
+        with app.app_context():
+            apply_hot_config(app, yaml_data)
+    assert not any("unrecognised key" in r.getMessage() for r in caplog.records)
+
+
+def test_shipped_configs_have_no_unknown_app_keys():
+    """The fixture and the shipped configs must stay in step with the schema.
+
+    This is the check that would have caught the database_url regression on the
+    day the key moved, rather than six weeks later.
+    """
+    from pathlib import Path
+
+    import yaml as _yaml
+
+    from lumen.services.config_watcher import KNOWN_APP_KEYS
+    root = Path(__file__).resolve().parents[2]
+    for rel in ("tests/fixtures/test_config.yaml", "config.yaml.example", "dev.config.yaml"):
+        data = _yaml.safe_load((root / rel).read_text()) or {}
+        unknown = sorted(set(data.get("app") or {}) - KNOWN_APP_KEYS)
+        assert not unknown, f"{rel} has unrecognised app key(s): {unknown}"
+
+
+# ---------------------------------------------------------------------------
 # apply_hot_config: global defaults and config-editor flag (orthogonal access)
 # ---------------------------------------------------------------------------
 

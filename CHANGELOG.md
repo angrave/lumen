@@ -7,6 +7,13 @@ All notable changes to Lumen will be documented in this file.
 ### Fixed
 
 - CI test failures (`ModuleNotFoundError: No module named 'httpx'`): the openai 3.x SDK now uses `httpx2`, and the upstream-error tests were updated to match. Dependency floors were raised to the majors actually locked and tested (`openai>=3`, `flask-limiter>=4`, `pypdf>=6`, `psutil>=7`, `pytest>=9`, `pytest-cov>=7`).
+- The test suite ran against the developer's dev database and dropped its tables on every run. `tests/fixtures/test_config.yaml` set `app.database_url`, but since 1.15.0 the app reads `app.database.url`; the orphaned key was silently ignored, so `SQLALCHEMY_DATABASE_URI` fell back to the default `sqlite:///lumen_dev.db`. The fixture now uses the nested key, and `conftest` asks the engine where the database actually is (Flask-SQLAlchemy resolves relative SQLite paths against `instance/`) and refuses to run against anything that looks like the dev database.
+- `tests/unit/test_token_refill.py::test_aware_last_refill_at_does_not_abort_pass` failed intermittently with `69.999999 != 70.0`. It read the clock twice, so the elapsed span was fractionally under two hours; both values now derive from a single reading.
+
+### Added
+
+- Unrecognised keys under `app:` in config.yaml now log a warning at startup and on every hot reload, naming the offending keys. Every read of that section is a `.get()` with a default, so a setting renamed by a schema change was previously ignored in silence.
+- `pytest-timeout` (dev dependency) with a 300-second default, so a hanging test fails with a stack trace naming it instead of stalling CI.
 
 ## [1.25.0] - 2026-08-14
 
