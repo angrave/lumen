@@ -279,10 +279,24 @@ small and it is a prerequisite for everything after it.
    indefinitely — during a burst, which is when workers are most likely to be OOM-killed and when the
    gauge matters most. **Add a reconciliation pass**: scan the multiproc dir for PID-suffixed files
    whose PID is no longer alive (`os.kill(pid, 0)`) and `mark_process_dead` them. Run it at worker
-   startup **and** on each scrape — it is a directory listing and a handful of signal-0 probes.
-   **Known limitation, accept and document:** a reused PID reads as alive and its predecessor's file
-   survives. It is rare, bounded by the pod's lifetime, and cheap to cross-check by comparing the
-   file's mtime against the PID's start time if it ever proves to matter.
+   startup **and** on each scrape (a directory listing plus a handful of signal-0 probes), and
+   **before** `MultiProcessCollector(...)` is constructed in
+   `lumen/blueprints/metrics/routes.py:192`, not after.
+
+   **Wrap every `mark_process_dead` call.** **[FACT]** the library's implementation
+   (`prometheus_client/multiprocess.py:177-183`) does an unguarded `glob` + `os.remove` with no
+   `try`/`except`. Two processes reaping the same dead PID concurrently means the loser raises
+   `FileNotFoundError` **into the scrape** — an unhandled 500 on `/metrics`. With N workers plus a
+   ServiceMonitor scraping every pod, concurrent reaps are routine, and they cluster right after an
+   OOM kill: the scrape breaks exactly when a worker just died. Catch `(FileNotFoundError, OSError)`
+   per call, or serialise the reap behind the same non-blocking flock as item 7.
+
+   **PID reuse is worse than "a stale file survives".** Files are named `gauge_{mode}_{pid}.db`, so a
+   respawned worker that draws the same PID opens the **same mmap** and inherits the dead worker's
+   values — a worker killed holding `queue_depth=5` gives its successor a permanent +5 offset on
+   every `inc`/`dec`. An mtime cross-check does not help, because the new process rewrites mtime.
+   Mitigate by having each worker unlink **its own** PID's files at startup, before touching any
+   metric.
 4. **Document the invariant at the definition site** in `lumen/blueprints/metrics/middleware.py`: every `Gauge` added from
    here on declares an explicit `multiprocess_mode`; `Counter`/`Histogram` need nothing. State the
    asymmetry explicitly so nobody "fixes" it later: **dead PIDs' counter files are summed, and that
@@ -307,6 +321,15 @@ small and it is a prerequisite for everything after it.
    `BaseException` unwinds the request; `teardown_request` runs regardless. The middleware's existing
    `except BaseException` path plus the `"<unmatched>"` fallback would cover the gap, but there is no
    reason to leave one.
+
+   **Bound `method` in the same change — the label set has three dimensions, not one.**
+   **[FACT]** `_http_requests` is labelled `["method", "path_template", "status"]`
+   (`lumen/blueprints/metrics/middleware.py:22-26`) and `method` comes straight from
+   `environ["REQUEST_METHOD"]` (`:117`). HTTP methods are RFC token grammar, so a scanner sending
+   `PROPFIND`, `TRACK`, `FOOBARBAZ`, … mints a new series per method — the same unbounded growth,
+   the same N× amplification across processes. Allow-list against the standard methods with an
+   `"<other>"` bucket. **The Phase 1 exit gate must scan junk *methods* as well as junk paths**,
+   otherwise it passes while the bug it exists to close stays open through the other dimension.
 6. **Chart: a `ServiceMonitor`** (guarded by `serviceMonitor.enabled`, default false), scraping every
    pod. Multi-replica aggregation is Prometheus's job; it cannot do it if nothing is scraped.
 7. **Elect a single health-probe runner.** **[FACT]** `lumen/services/health.py:27` holds a module-global
@@ -327,9 +350,26 @@ small and it is a prerequisite for everything after it.
    someone holds it. A *blocking* flock would be strictly worse than the problem it solves:
    `lumen/services/health.py:81` commits inside the pass, that commit can block up to `pool_timeout` on an exhausted
    pool, and every other process would then queue behind a hung holder — stalling all health probing
-   during exactly the burst when health data matters. Add a pass deadline after which the holder
-   releases regardless, and write a heartbeat into the lock file so a hung holder is visible rather
-   than merely quiet.
+   during exactly the burst when health data matters.
+
+   **Do not add a "deadline after which the holder releases".** An earlier draft did; it recreates
+   the problem. Nothing in the pass is preemptible — `future.result(timeout=_PROBE_TIMEOUT)`
+   (`lumen/services/health.py:60`) is serial and legitimately runs 10 s × N endpoints,
+   `_probe_executor` abandons stuck threads rather than killing them (documented at `:22-25`), and a
+   blocked `commit()` cannot be interrupted from another thread. A watchdog could only unlock the
+   flock **while the holder is still running**, admitting a second concurrent pass against the same
+   GPU endpoints and raising the odds of the `StaleDataError` already handled at `:82`.
+   **Instead: bound the pass by construction** (the probes already are; give the `commit()` a short
+   statement timeout) and use **lock-file mtime staleness** — a non-holder that finds the heartbeat
+   older than 3× the interval takes over.
+
+   **Two mechanical details that decide whether it works:**
+   - **Open mode.** Opening the lock file `"w"` truncates *before* the `flock` attempt, so every
+     non-holder's failed attempt wipes the holder's heartbeat. Use `os.open(..., O_CREAT | O_RDWR)`
+     or `"a+"`.
+   - **Path.** Use a fixed container path (`/tmp/lumen-health.lock`), **not** the multiproc emptyDir:
+     that volume only exists when `multiprocDir` is configured, and all uvicorn workers share one
+     container anyway — a plain container path is already pod-scoped, so the emptyDir buys nothing.
 
 ### Tests
 
@@ -405,15 +445,37 @@ argument — the queue is per-process, and per-process queues sum.
    few seconds of budget that do not exist. If the budget is spent, fail fast with 429 +
    `Retry-After` rather than starting a generation that cannot be delivered.
 
+   **The 429 must happen in the VIEW, not "at the start of the upstream call".** **[FACT]** On both
+   streaming paths the upstream call lives inside a generator that does not begin executing until
+   body iteration — by which time Flask has already called `start_response`, and a2wsgi has already
+   queued `http.response.start` with **status 200** to the client
+   (`a2wsgi/wsgi.py:244-256`; chat at `lumen/blueprints/chat/routes.py:247`, API at
+   `lumen/blueprints/api/routes.py:584`). A check placed where an earlier draft said would leave only
+   an in-band SSE `error` event on a 200 — which the OpenAI SDK does not treat as a retryable 429 and
+   which carries no `Retry-After`, defeating the anti-synchronisation argument in item 4. **Put the
+   admission check in the views, before the `Response(...)` is constructed**, using T1 (the value
+   available there); state plainly that it therefore excludes the generator's own preflight.
+
    **Two cases, and be honest that this catches one of them.** The admission check catches requests
-   whose budget is *already* spent at T2. A request that starts with 100 s of budget and then streams
-   for 200 s is still cut mid-generation by the gateway, and Lumen's disconnect detection fires — so
-   it records `disconnect`, which is exactly the conflation this item claims to fix. Closing that
-   requires a **mid-stream deadline check** at the existing inter-chunk poll (`lumen/services/llm.py:807`, which
-   already runs per chunk and already costs nothing extra): when elapsed exceeds the budget, end the
-   stream and record `outcome='timeout'` **before** the gateway's cut can be mistaken for a
-   disconnect. Do both, or ship the admission check alone and state the limitation in the column
-   comment — but do not claim the distinction is made when only half of it is.
+   whose budget is *already* spent at admission. A request that starts with 100 s of budget and then
+   streams for 200 s is still cut mid-generation by the gateway, and Lumen's disconnect detection
+   fires — so it records `disconnect`, which is exactly the conflation this item claims to fix.
+   Closing that requires a **mid-stream deadline check** at the existing inter-chunk poll
+   (`lumen/services/llm.py:807`, which already runs per chunk and costs nothing extra): when elapsed
+   exceeds the budget, end the stream and record `outcome='timeout'` **before** the gateway's cut can
+   be mistaken for a disconnect. Give it a **safety margin**: the check only runs *between* chunks
+   (bounded by `LLM_READ_TIMEOUT`) and the gateway's clock starts before Lumen's T0, so a budget of
+   exactly the gateway's own value loses the race and still records `disconnect`.
+
+   **The budget is a new config key — it does not exist in the app today.** **[FACT]**
+   `gateway.timeout` is a Helm value consumed only by `chart/templates/httproute.yaml`, guarded by
+   `gateway.enabled` (default false), and it is never rendered into `config.yaml` — grep
+   `chart/templates/` confirms no `gateway` key reaches the app. In the default ingress deployment
+   the real cut comes from ingress annotations, so copying `gateway.timeout` would be wrong rather
+   than merely missing. **Add an explicit `api.request_budget_seconds`**, hot-loaded (see
+   `lumen/services/config_watcher.py` for the pattern), mirrored into `chart/values.yaml` and
+   `values.schema.json` per CLAUDE.md §5, documented as "must match whatever fronts Lumen". Do not
+   derive it from `gateway.timeout`.
 7. **DB pool checkout-wait histogram.** `pool_tracker` already hooks SQLAlchemy's `checkout`/`checkin`
    events, so the wait is a subtraction away. Today the pool is observable only as a *depth*, so
    "the pool is full" and "the pool is full **and requests are queued behind it**" look identical.
@@ -469,11 +531,33 @@ fixing this ships untested.
      like a queued one.
    - `send_blocked` (Float) — accumulated time blocked handing chunks to the server. Separates
      "slow client" from "slow backend", which `duration` currently conflates.
-   - `outcome` (String(16)) — small enum: `ok`, `disconnect`, `upstream_error`, `stalled_client`,
-     `timeout`, `billing_error`. The last is not padding: `lumen/services/llm.py:845` already sets
-     `phase = "billing"` precisely so a failed commit is not misattributed to the upstream, and
-     `observe_stream_abort` already emits `billing_error` on the abort counter. Omitting it from
-     `outcome` would make the column disagree with the metric next to it.
+   - `outcome` (String(16)) — **enum limited to what can actually be written: `ok` and `disconnect`.**
+
+     **[FACT] An earlier draft listed six values, four of which are unwritable, and defended
+     `billing_error` on reasoning that is exactly backwards.** `request_logs` rows are only ever
+     created inside `update_stats`, which ends at `db.session.flush()`
+     (`lumen/services/llm.py:565-568`) — the `commit()` belongs to the caller. So:
+     - **`billing_error` is unreachable.** The failing commit is the one that would have persisted
+       the row; the rollback takes the flushed `RequestLog` with it
+       (`lumen/services/llm.py:845-853`, `lumen/blueprints/api/routes.py:530-537`). The counter fires
+       and the row does not exist. Including the value would *guarantee* the disagreement with the
+       metric that including it was meant to prevent.
+     - **`upstream_error` is unreachable.** Those paths return or re-raise before any `update_stats`
+       (`lumen/blueprints/api/routes.py:378-380`, `lumen/services/llm.py:860-871`).
+     - **`stalled_client` is indistinguishable from `disconnect`.** `_StalledClient` unwinds through
+       a2wsgi's `finally: iterable.close()` into `GeneratorExit` → `_abort()` →
+       `record_stream_abort(...)` with the default `reason="disconnect"`, and `send` has already
+       called `self.disconnected.set()`. `record_stream_abort`'s own docstring says "nothing
+       distinguishable is available at this seam."
+     - **`timeout`** depends on §6 item 6 shipping the mid-stream check; add the value in that change,
+       not this one.
+
+     **[DECISION]** Ship `ok` and `disconnect`. Any further value must arrive together with the code
+     that writes it. Making `upstream_error`/`billing_error` real requires a **best-effort insert on a
+     fresh session after rollback**, which is new failure-path work and breaks the "statement count
+     unchanged" property below — price it separately or not at all. `stalled_client` requires the
+     responder to publish a distinct flag through a shared mutable holder (`_StalledClient` is caught
+     in `__call__`, not in the generator, so an exception type cannot carry it).
 
    Nullable **with a server default**, per the precedent documented in
    `migrations/versions/e6f7a8b9c0d1_add_request_logs_aborted.py` — Timescale rejects propagating a non-defaulted NOT NULL
@@ -527,13 +611,39 @@ fixing this ships untested.
 These five were found by round-2 review as places an engineer would have to invent a design. They
 are decided here.
 
-**(a) One clock. All spans are `time.monotonic()`.** **[FACT]** T2 today is
-`t0 = time.time()` (`lumen/services/llm.py:752`, wall-clock; likewise `lumen/blueprints/api/routes.py:368,462,641`), while this
-plan stamps T0/T1 with `time.monotonic()`. **Subtracting them is meaningless**, and
-`queue_wait + preflight + ttft_visible` would mix three clocks. §14's "monotonic for durations" is
-therefore **not** a review-checklist aspiration — it is a required Phase 3 change: convert `t0` and
-`duration = time.monotonic() - t0` on all four paths. Only `started_at` is wall-clock, because it is
-a stored instant rather than a span.
+**(a) One clock. All spans are `time.monotonic()` — and the conversion is SIX sites, not four.**
+**[FACT]** T2 today is `t0 = time.time()` (`lumen/services/llm.py:752`, wall-clock; likewise
+`lumen/blueprints/api/routes.py:368,462,641`), while this plan stamps T0/T1 with `time.monotonic()`.
+**Subtracting them is meaningless**, and `queue_wait + preflight + ttft_visible` would mix three
+clocks. §14's "monotonic for durations" is therefore **not** a review-checklist aspiration — it is a
+required Phase 3 change.
+
+**[FACT] The dangerous part is that `t0` escapes its function.** An earlier draft scoped the
+conversion to "the four paths' own `duration` lines". That is wrong and would have shipped a
+catastrophe. `record_stream_abort` computes its own duration **from the caller's `t0`**:
+
+```
+lumen/services/llm.py:686     duration=time.time() - started_at     # started_at IS the caller's t0
+lumen/services/llm.py:772     started_at=t0                          # chat stream
+lumen/blueprints/api/routes.py:475   started_at=t0                   # API stream
+```
+
+Convert `t0` to monotonic without touching `:686` and **every aborted row stores
+`duration ≈ 1.76e9`** — about 55 years. That is the exact row set this plan exists to study
+(disconnects during a class-start burst), it poisons `lumen_llm_duration_seconds` permanently into
+`+Inf`, it makes any `AVG(duration)` on `/usage` garbage the moment one student closes a tab, and
+**nothing raises**. The same applies to `t_first = time.time() - t0` (`llm.py:819`), which is
+user-visible: it flows to `Message.time_to_first_token` and is rendered in the chat UI, and §7 item 2
+defines `ttft_visible` as "today's `t_first`".
+
+**Enumerate all six, convert all six:** `lumen/services/llm.py:686`, `:819`, `:832`;
+`lumen/blueprints/api/routes.py:377`, `:523`, `:649`. Only `started_at` stays wall-clock, because it
+is a stored instant rather than a span.
+
+**Guard it with a static test** in the shape of `tests/unit/test_no_stream_with_context.py`: no
+`time.time()` may appear in a subtraction anywhere in `lumen/services/llm.py` or
+`lumen/blueprints/api/routes.py`. A grep-shaped invariant is the only thing that stops the seventh
+site being added later.
 
 **(b) `started_at` is stamped with `datetime.now(timezone.utc)`, not `utcnow()`.** CLAUDE.md §5
 mandates `lumen.timeutils.utcnow()`, which returns **naive** UTC. Writing naive into a `TIMESTAMPTZ`
@@ -541,27 +651,66 @@ column makes Postgres interpret it against the session `TimeZone` — a silent, 
 offset bug. `request_logs.time` already does the right thing (`lumen/services/llm.py:555`); `started_at` follows it
 for the same reason and the same documented exception.
 
-**(c) Threading the values into the generators.** `update_stats` is called from five sites, **two of
-which are context-free streaming generators** (`lumen/services/llm.py:848`, `lumen/blueprints/api/routes.py:533`) that must never
-touch `request`. The pattern already exists and is documented: `client_disconnect_event()`
-(`lumen/services/wsgi_disconnect.py:338-352`) is called in the view while the context is live and captured into the
-generator's closure. Do exactly that — read `started_at`/`queue_wait` from `request.environ` in the
-view, pass them as parameters into `send_message_stream`/`_do_chat`/`_do_audio`, and add them to the
-`update_stats` signature. Fall back to `None` when the keys are absent, so the Flask test client,
-the Werkzeug dev server and direct unit-test calls keep working — same reasoning as
-`client_disconnect_event`'s docstring.
+**(c) Threading the values into the generators — including the abort path.** `update_stats` is
+called from five sites, **two of which are context-free streaming generators**
+(`lumen/services/llm.py:848`, `lumen/blueprints/api/routes.py:533`) that must never touch `request`.
+The pattern already exists and is documented: `client_disconnect_event()`
+(`lumen/services/wsgi_disconnect.py:338-352`) is called in the view while the context is live and
+captured into the generator's closure. Do exactly that — read `started_at`/`queue_wait` from
+`request.environ` in the view, pass them as parameters into
+`send_message_stream`/`_do_chat`/`_do_audio`, and add them to the `update_stats` signature.
 
-**(d) Rename to avoid a collision.** `record_stream_abort(..., started_at=...)` (`lumen/services/llm.py:654`, called
-at `:772` with `t0`) already uses `started_at` to mean **T2**. Rename that parameter to `stream_t0`
-in the same change; two meanings of `started_at` one function apart is a bug waiting to be written.
+**The fifth call site is the one that matters most and an earlier draft omitted it.**
+`update_stats` is also reached at `lumen/services/llm.py:641` inside `record_aborted_request`, via
+`record_stream_abort` (`:684`). **Both signatures must be threaded too.** Miss them and every
+*aborted* row gets `started_at`/`queue_wait` NULL — the disconnect rows the headline "who was
+waiting" query needs most, and the ones §6 item 5 and the abort-share SLI are about.
 
-**(e) `send_blocked` needs a mechanism, or it ships dead.** **[FACT]**
+**Absent-key behaviour, stated to resolve a contradiction.** Falling back to `None` keeps the
+Werkzeug dev server, the Flask test client and direct unit-test calls working (same reasoning as
+`client_disconnect_event`'s docstring) — but note two consequences an earlier draft did not
+reconcile:
+- `None` inserts SQL NULL and **bypasses** the `server_default='0'` above. That is correct — "not
+  measured" must stay distinguishable from "zero wait" — but it must be deliberate.
+- It makes the Phase 3 test "all four paths write non-null `queue_wait`" **unsatisfiable under
+  `test_client`**, which bypasses `asgi.py` entirely so T0 is never stamped. Move that assertion to
+  the real-uvicorn harness (`tests/integration/test_disconnect.py:205-226`); the `test_client` suites
+  assert `ttft`/`outcome` only.
+
+**(d) Rename to avoid a collision — at BOTH call sites.**
+`record_stream_abort(..., started_at=...)` (`lumen/services/llm.py:654`) already uses `started_at` to
+mean **T2**. Rename it to `stream_t0`; two meanings of `started_at` one function apart is a bug
+waiting to be written. It has **two** callers — `lumen/services/llm.py:772` **and**
+`lumen/blueprints/api/routes.py:475`. Renaming only the first leaves the second raising `TypeError`
+*inside* `_abort()`, which runs from the `except GeneratorExit` handler — so the `TypeError` replaces
+the `GeneratorExit`, Python raises `RuntimeError: generator ignored GeneratorExit`, and **the abort
+is never billed**. Only caught by tests if the API stream path is covered in
+`tests/integration/test_disconnect.py`; check that it is.
+
+**(e) `send_blocked` needs a mechanism, and the obvious one is wrong three ways.** **[FACT]**
 `_DisconnectAwareWSGIResponder.send` (`lumen/services/wsgi_disconnect.py:241-269`) calls
 `future.result(self.send_timeout)` and accumulates nothing, so the column as specified would be
-permanently 0. Time each `future.result()` with `time.monotonic()`, accumulate into a counter on the
-responder, and publish it into `environ` for the view to read at billing time. **If that lands after
-Phase 3, cut the column from Phase 3** rather than shipping a permanently-zero column that reads as
-"no client backpressure ever".
+permanently 0. The naive fix — "time each `future.result()`, publish into `environ`, read at billing
+time" — fails on all three counts:
+
+1. **It records zero for the stalled client.** The largest block of the request's life happens on the
+   `except concurrent.futures.TimeoutError` branch, which raises `_StalledClient` without
+   accumulating. So the column reads ~0 for exactly the outcome it exists to identify. **Accumulate
+   in a `finally` around `future.result()`, so the timeout branch is counted.**
+2. **The view cannot read it.** Billing on both streaming paths happens **in the generator**
+   (`lumen/services/llm.py:846-853`, `lumen/blueprints/api/routes.py:531-536`), and at view time
+   nothing has been sent yet — a value captured into the closure per contract (c) is `0.0` forever.
+   **Capture a mutable holder** (a small dataclass or one-element list) published in `environ`
+   alongside `ENVIRON_KEY`, so the generator reads the live total at billing time. Note the responder
+   and the generator are on the *same* worker thread (`send` runs inside `run_in_executor`), so this
+   is a timing problem, not a threading one.
+3. **It excludes the tail.** Billing precedes the final chunks and `data: [DONE]`, by design, so the
+   recorded value always omits them. Say so in the column comment.
+
+**And be honest about what it measures:** time to enqueue onto a bounded `asyncio.Queue`, which also
+absorbs event-loop scheduling latency. Under a 300-user burst that is *not* purely "slow client" —
+which is what a naive column comment would claim. **If this lands after Phase 3, cut the column**
+rather than shipping a permanently-zero one that reads as "no client backpressure ever".
 
 **Per-path semantics of `preflight` — document, do not pretend uniformity.** It is *not* purely DB
 contention on every path:
@@ -963,3 +1112,71 @@ and one paragraph respectively; they stay unless the team wants a leaner documen
 **Buildability, per round 2:** Phase 1 was executable with minor questions; Phases 2–3 had four
 places an engineer would have to stop and design (A1, A2, A3, A6). All four are now decided in the
 implementation contract above. That was the point of the round.
+
+### Round 3
+
+Two reviews, run against material nobody had checked: (3a) the round-2 fixes, and (3b) Phases 4–8,
+which no round had assessed. Both found more than rounds 1 and 2 did. This is the third consecutive
+round in which **the corrections were the weakest text in the document** — the pattern is now
+established well enough to treat as a rule (see the lessons doc, §1.1).
+
+#### 3a — the round-2 fixes. Two criticals.
+
+| # | Finding | Disposition |
+|---|---|---|
+| **C1** | Contract (a) scoped the monotonic conversion to "the four paths' own `duration` lines" and missed that `t0` **escapes its function**: `record_stream_abort` computes `duration = time.time() - started_at` at `lumen/services/llm.py:686` from the caller's `t0`. Converting without it writes **`duration ≈ 1.76e9`** — ~55 years — on every aborted row, silently. `t_first` (`:819`) is a second such site and is user-visible in the chat UI | **Accepted; verified myself.** Contract (a) now enumerates all six sites and mandates a grep-shaped static test |
+| **C2** | Four of the six `outcome` values are unwritable. `billing_error` especially: `update_stats` only `flush()`es, the caller `commit()`s, so the failing commit rolls back the very row that would record the failure. The round-2 argument for including it was exactly backwards | **Accepted.** Enum cut to `ok` and `disconnect`; any further value must arrive with the code that writes it |
+| **M3** | The 429 in §6 item 6 is impossible where specified — on both streaming paths, `start_response` has already committed **200** before the generator runs, leaving only an in-band SSE error the OpenAI SDK will not retry | **Accepted.** Admission check moves into the views, before `Response(...)`, using T1 |
+| **M4** | The budget it compares against does not exist in the app: `gateway.timeout` is Helm-only, consumed by `httproute.yaml` under `gateway.enabled` (default false), never rendered into `config.yaml` | **Accepted.** New hot-loaded `api.request_budget_seconds`, plus a safety margin for the inter-chunk check |
+| **M5** | Contract (e) records **zero** for the stalled client (the timeout branch raises without accumulating), and the view cannot read the value because streaming billing happens in the generator | **Accepted.** Accumulate in a `finally`; publish a mutable holder in `environ` |
+| **M6** | Contract (c) omitted the fifth `update_stats` call site (`record_aborted_request` via `record_stream_abort`) — so aborted rows, the ones the headline query needs most, would carry NULLs. Its `None` fallback also made the Phase 3 "all four paths populate" test unsatisfiable under `test_client` | **Accepted.** Both signatures threaded; the assertion moves to the real-uvicorn harness |
+| **M7** | `mark_process_dead` does an unguarded `os.remove`; concurrent reaps 500 the scrape — clustering right after an OOM kill | **Accepted.** Wrapped, and ordered before `MultiProcessCollector` |
+| **M8** | The cardinality fix bounds `path_template` and leaves `method` unbounded, so the Phase 1 gate would pass with the bug open | **Accepted.** Allow-list methods; the gate now scans junk methods too |
+| **M9** | The flock's "pass deadline" cannot be implemented — nothing in the pass is preemptible, so releasing the lock admits a concurrent second pass. Plus: `"w"` truncates before `flock`, and the proposed emptyDir path does not exist at defaults | **Accepted.** Deadline dropped for mtime-staleness takeover; open mode and a fixed container path specified |
+| **m10–m13** | `record_stream_abort` has two callers (renaming one leaves a `TypeError` inside `_abort()` → `RuntimeError: generator ignored GeneratorExit` → abort never billed); PID reuse inherits the dead worker's mmap rather than merely leaving a stale file; `send_blocked = 0.0` on non-streaming paths is justified by the wrong reason; chat `preflight` also spans a `send()` of the response-start | **All accepted** |
+
+#### 3b — Phases 4–8 buildability. The structural finding matters more than any single item.
+
+**Phases 4–8 are not buildable as written.** §7 has an implementation contract because round 2 forced
+one into existence; Phases 4–8 have none, which is why they *read* as buildable. Fourteen findings,
+of which these change the design rather than the prose:
+
+- **F1 (critical):** Phase 4 says to model the snapshot refresher on `lumen/services/health.py` — but
+  Phase 1 item 7 has just turned that file into a **single-runner election**. Copying it would leave
+  N−1 workers serving an empty snapshot; Prometheus reads absent-then-present as a counter **reset**,
+  producing sawtooth garbage in the multi-process deployment Phase 1 exists to enable. The refresher
+  must run in **every** process and must never be flock-elected: election is for work whose result
+  lands in the DB, not for in-memory snapshots. Also unaddressed: per-process refresh means Phase 4
+  can *increase* total DB load rather than reduce it.
+- **F2 (critical):** Phase 5's Redis structure is wrong. **Redis sets have no per-member TTL**, and
+  `SREM` on a user's first of three concurrent requests removes them while two are still in flight —
+  under-reporting exactly the double-submitting student the burst scenario is full of. `SCARD` is
+  also offered as both unique-users and in-flight, which are different numbers. Needs a sorted set
+  keyed `{entity_id}:{request_id}` with expiry as score; `LocalLiveState` needs the same multiplicity
+  fix (a counter, not a set).
+- **F3:** `admit`/`release` has no contract — call sites, disconnect-path release, and whether
+  "waiting" ends at TTFT or at completion are all undecided. The last changes the headline number by
+  ~10× during a long generation, and it drives Phase 7's "N ahead of you" and Phase 9's cap sizing.
+- **F4/F5:** Phase 8's ordering omits the step that actually protects per-user history — **rewriting
+  the `/usage` per-entity queries onto the new aggregate**. Creating the aggregate protects nothing
+  on its own, so following §12's numbered list literally still truncates every user's "All Time"
+  chart. And the entity aggregate itself is unspecified: bucket width (daily collapses the heatmap's
+  `EXTRACT(HOUR …)` to hour 0), and a full-history backfill that **cannot run inside an Alembic
+  transaction**.
+- **F7:** Phase 7 consumes Phase 8's 1-minute aggregate and its percentile decision, while the G0.5
+  clause authorises moving Phase 7 *earlier*. Split it: 7a live tiles (may jump the queue, zero SQL),
+  7b historical charts (strictly after §12.2).
+- **F9:** Phase 6's "already detects the backend type" is half true — only SGLang is ever tagged;
+  vLLM is the fall-through, indistinguishable from OpenAI, Azure, or any OpenAI-compatible proxy.
+  Guessing "not-sglang ⇒ vllm" would send scrapes, possibly carrying the endpoint's API key, to
+  arbitrary third-party hosts. And vLLM exposes no capacity gauge, so the denominator must be
+  operator-configured.
+- **F6, F8, F10–F14:** the refresher's real leak mode is a context spanning `sleep` (CLAUDE.md's rule
+  says `yield`, so it reads as silent — worth generalising the rule); nobody owns the snapshot's
+  schema while three phases add to it; compression is a one-way door for further `request_logs`
+  columns; and several smaller unmade decisions.
+
+**[DECISION] Phases 4–8 do not start until each has an implementation contract in the shape of §7's.**
+Phase 4's must at minimum settle: the refresher runs per-process and unelected; the snapshot's schema
+and each field's query cost; `admit`/`release` call sites and the meaning of "waiting"; one
+`app_context()` per pass, exited before the sleep.

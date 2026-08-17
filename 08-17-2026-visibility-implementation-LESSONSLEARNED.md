@@ -113,7 +113,25 @@ Also worth doing: give the reviewer the one place you **overrode** it and ask wh
 ruled against its own predecessor after reading the Flask source, which is far stronger evidence than
 either side asserting.
 
-### 1.9 Exit code 0 does not mean success
+### 1.9 Check for evidence of progress, not liveness
+
+`opencode run` failed three distinct ways in one session, each time looking fine from outside:
+it exited **0** while printing `Error: No healthy endpoints`; it exited **0** after dying on its own
+context mid-review, having produced only a tool trace; and three parallel instances in one repo hung
+for 35 minutes, having burned **48 seconds of CPU each**.
+
+A process being alive says nothing. What distinguishes working from hung is *evidence of progress*:
+CPU time consumed, output bytes growing, files changing on disk. `ps -o time` and a file size, taken
+twice, answer in seconds what an elapsed-time indicator never will. Check the **content** of a tool's
+output before building on it, especially for wrapped CLIs and anything proxying a network service.
+
+Corollary for delegated work: **verify the artifact, not the report.** A subagent reported full `helm
+template` verification of the chart work; the changes it verified included passing `--workers 1` to
+every default deployment (adding a supervisor process where there was none) and setting
+`PROMETHEUS_MULTIPROC_DIR` to a directory that was not mounted at one process — a combination it
+tested and recorded as correct. Both were caught by reading the diff, not the summary.
+
+### 1.10 Exit code 0 does not mean success
 
 `opencode run` exited **0** while printing `Error: No healthy endpoints for model 'glm-5.2'` and
 writing an empty result. This was briefly reported as "the review is running." Check the *content* of
