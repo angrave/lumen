@@ -17,6 +17,19 @@ logger = logging.getLogger(__name__)
 # Log the config-version deprecation warning at most once per process.
 _version_warned = False
 
+# Every key the 'app' section may contain, read either here, in _apply_theme, or
+# in create_app. An unrecognised key is almost always a stale name left behind by
+# a schema change, and it fails silently because every read is a .get() with a
+# default: `app.database_url` survived the move to `app.database.url` for six
+# weeks, ignored, which left the entire test suite running against the developer's
+# dev database and dropping its tables on every run. Warn rather than fail, so a
+# config written for a newer version still boots.
+KNOWN_APP_KEYS = frozenset({
+    "announcement", "database", "debug", "dev_user", "encryption_key",
+    "github_url", "graylist_default_notice", "logs", "name", "secret_key",
+    "tagline", "theme",
+})
+
 
 def apply_hot_config(app, yaml_data: dict):
     """Apply hot-reloadable yaml settings to app.config. Called at startup and on config reload."""
@@ -29,6 +42,13 @@ def apply_hot_config(app, yaml_data: dict):
         _version_warned = True
 
     app_cfg = yaml_data.get("app", {})
+    if unknown := sorted(set(app_cfg) - KNOWN_APP_KEYS):
+        logger.warning(
+            "config.yaml: unrecognised key(s) under 'app': %s. They are ignored — check "
+            "for a setting renamed by a schema change (app.database_url, for example, "
+            "became app.database.url).",
+            ", ".join(unknown),
+        )
     app.config["APP_NAME"] = app_cfg.get("name", "Lumen")
     app.config["APP_TAGLINE"] = app_cfg.get("tagline", "")
     raw_announcement = app_cfg.get("announcement", "") or ""
