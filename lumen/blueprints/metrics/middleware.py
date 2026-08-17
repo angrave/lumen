@@ -28,7 +28,11 @@ _http_latency = Histogram(
     "lumen_http_request_duration_seconds",
     "HTTP request latency in seconds",
     ["method", "path_template"],
-    buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0),
+    # Buckets run to 300s because this now times streaming responses too, and a
+    # long generation is measured in minutes. With the old 10s ceiling every
+    # stream landed in +Inf, which records that it was slow but never how slow.
+    buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+             30.0, 60.0, 120.0, 300.0),
 )
 _stream_aborts = Counter(
     "lumen_stream_aborts_total",
@@ -67,11 +71,13 @@ class _ContextCheckingBody:
     request that did it, at the moment it happens.
     """
 
-    def __init__(self, iterable, method, path, baseline_ctx):
+    def __init__(self, iterable, method, path, baseline_ctx, observe_latency=None):
         self._iterable = iterable
         self._method = method
         self._path = path
         self._baseline_ctx = baseline_ctx
+        self._observe_latency = observe_latency
+        self._observed = False
 
     def __iter__(self):
         return iter(self._iterable)
@@ -82,6 +88,15 @@ class _ContextCheckingBody:
             if close is not None:
                 close()
         finally:
+            # Latency is observed here, not when wsgi_app() returned. A streaming
+            # view returns its generator immediately, so timing the call measured
+            # how long it took to *build* the generator — microseconds — while the
+            # response the user actually waited for was still being produced.
+            # close() is the last moment the request runs on this thread and the
+            # WSGI server guarantees it, so it is the honest end of the request.
+            if self._observe_latency is not None and not self._observed:
+                self._observed = True
+                self._observe_latency()
             ctx = _cv_app.get(None)
             if ctx is not None and ctx is not self._baseline_ctx:
                 record_context_anomaly(
@@ -146,6 +161,10 @@ def make_metrics_middleware(wsgi_app):
                 _cv_app.set(None)
                 baseline_ctx = None
         start = time.time()
+
+        def _observe_latency():
+            _http_latency.labels(method=method, path_template=path).observe(time.time() - start)
+
         try:
             body = wsgi_app(environ, _start_response)
         except BaseException:
@@ -162,19 +181,20 @@ def make_metrics_middleware(wsgi_app):
                     "never ran for it and its DB session is stranded",
                     id(ctx), method, path,
                 )
+            # Nothing will close a body that was never returned, so the
+            # close()-time observation cannot happen — record it here instead.
+            _observe_latency()
             raise
         else:
-            return _ContextCheckingBody(body, method, path, baseline_ctx)
+            return _ContextCheckingBody(
+                body, method, path, baseline_ctx, observe_latency=_observe_latency,
+            )
         finally:
             _http_requests.labels(
                 method=method,
                 path_template=path,
                 status=status_holder[0],
             ).inc()
-            _http_latency.labels(
-                method=method,
-                path_template=path,
-            ).observe(time.time() - start)
 
     return middleware
 

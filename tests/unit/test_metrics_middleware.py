@@ -280,3 +280,97 @@ def test_stream_abort_counter_is_on_the_default_registry():
     scrape = generate_latest(REGISTRY).decode()
     assert "# TYPE lumen_stream_aborts_total counter" in scrape
     assert 'lumen_stream_aborts_total{reason="disconnect",source="chat"}' in scrape
+
+
+# ---------------------------------------------------------------------------
+# Streaming latency — the histogram must time the response the user waited for,
+# not the microseconds it took to build a generator.
+# ---------------------------------------------------------------------------
+
+def _latency_sum(path):
+    """Observed seconds for a path label, or 0.0 before any observation."""
+    from prometheus_client import REGISTRY
+    return REGISTRY.get_sample_value(
+        "lumen_http_request_duration_seconds_sum",
+        {"method": "POST", "path_template": path},
+    ) or 0.0
+
+
+def test_streaming_latency_is_measured_over_the_whole_body(monkeypatch):
+    """A streaming view returns its generator instantly; the work happens later.
+
+    Timing `wsgi_app()` therefore measured generator construction, so every SSE
+    request — the ones this service exists to serve — recorded a near-zero
+    duration however long the client actually waited. The observation belongs at
+    close(), the last moment the request runs on this thread.
+    """
+    import time
+    from lumen.blueprints.metrics.middleware import make_metrics_middleware
+
+    body_time = 0.25
+    path = "/stream-latency-probe"
+
+    def streaming_app(environ, start_response):
+        start_response("200 OK", [("Content-Type", "text/event-stream")])
+
+        def generate():
+            time.sleep(body_time)      # the part the user waits for
+            yield b"data: done\n\n"
+
+        return generate()
+
+    before = _latency_sum(path)
+    wrapped = make_metrics_middleware(streaming_app)
+    body = wrapped(_fake_environ(path, "POST"), lambda s, h, *_: None)
+    assert list(body) == [b"data: done\n\n"]
+    body.close()
+
+    observed = _latency_sum(path) - before
+    assert observed >= body_time, (
+        f"observed {observed:.3f}s for a response whose body took {body_time}s — "
+        "the histogram is timing generator construction, not the request"
+    )
+
+
+def test_latency_is_still_recorded_when_the_app_raises(monkeypatch):
+    """No body is returned, so nothing will ever call close() — the failure path
+    has to observe its own latency or 500s vanish from the histogram."""
+    from lumen.blueprints.metrics.middleware import make_metrics_middleware
+
+    path = "/raising-latency-probe"
+
+    def exploding_app(environ, start_response):
+        raise RuntimeError("boom")
+
+    import pytest
+
+    before = _latency_sum(path)
+    wrapped = make_metrics_middleware(exploding_app)
+    with pytest.raises(RuntimeError):
+        wrapped(_fake_environ(path, "POST"), lambda s, h, *_: None)
+    assert _latency_sum(path) > before
+
+
+def test_latency_is_observed_once_per_request():
+    """close() can be called more than once; the histogram must not double-count."""
+    from lumen.blueprints.metrics.middleware import make_metrics_middleware
+    from prometheus_client import REGISTRY
+
+    path = "/double-close-probe"
+
+    def fake_app(environ, start_response):
+        start_response("200 OK", [])
+        return [b"x"]
+
+    def count():
+        return REGISTRY.get_sample_value(
+            "lumen_http_request_duration_seconds_count",
+            {"method": "POST", "path_template": path},
+        ) or 0.0
+
+    before = count()
+    body = make_metrics_middleware(fake_app)(_fake_environ(path, "POST"), lambda s, h, *_: None)
+    list(body)
+    body.close()
+    body.close()
+    assert count() - before == 1
