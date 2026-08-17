@@ -258,10 +258,15 @@ def test_aware_last_refill_at_does_not_abort_pass(app, test_user):
         from lumen.models.entity_balance import EntityBalance
         from lumen.services.token_refill import refill_coin_balances
 
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        # One clock reading for both values: reading it twice makes the elapsed
+        # span fractionally under two hours, so the refill lands on 19.999999
+        # and the assertion below fails intermittently. last_refill_at stays
+        # aware on purpose — that is what this test is about.
+        now_aware = datetime.now(timezone.utc)
+        now = now_aware.replace(tzinfo=None)
         _add_limit(db, test_user["id"], max_coins=100, refresh_coins=10)
         _add_balance(db, test_user["id"], coins_left=50,
-                      last_refill_at=datetime.now(timezone.utc) - timedelta(hours=2))
+                      last_refill_at=now_aware - timedelta(hours=2))
         db.session.commit()
 
         assert refill_coin_balances(now=now) == 1
