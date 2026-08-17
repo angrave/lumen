@@ -331,12 +331,9 @@ def session_cookie(app, test_user):
 def _wait_for_abort_row(app, source, timeout=10.0):
     """Poll for the ``request_logs`` row that records the mid-stream abort.
 
-    Existence alone is the assertion, deliberately: the stub upstream never emits
-    a usage chunk, and both streaming views only bill when usage arrives, so the
-    normal accounting path cannot write a row here. Any row for this source is
-    the abort accounting. Asserting on the *contents* would bind this test to the
-    current zero-cost convention, which Phase 2 of the plan replaces with an
-    estimated charge.
+    The stub upstream never emits a usage chunk, and the completed path only
+    bills when usage arrives, so any row for this source is necessarily the abort
+    accounting. See ``_assert_billed_for_abort`` for what must be true of it.
     """
     from lumen.extensions import db
     from lumen.models.request_log import RequestLog
@@ -348,6 +345,35 @@ def _wait_for_abort_row(app, source, timeout=10.0):
             ).scalars().all()
             if rows or time.monotonic() > deadline:
                 return rows
+
+
+def _assert_billed_for_abort(rows, label):
+    """The abort row must be marked, and must charge for what was streamed.
+
+    Existence alone used to be the assertion here, which was correct while an
+    abort recorded zero cost. It is not correct now, and leaving it that way
+    would let the test pass whether the client is billed or not — the one
+    dimension where being wrong is exploitable. A client that reads content and
+    then hangs up before the usage chunk must still pay for the tokens it read,
+    or disconnecting becomes a way to get inference for free.
+
+    Cost is asserted rather than balance because this fixture grants an unlimited
+    pool (``max_coins=-2``), which makes ``subtract_coins`` a no-op by design;
+    the balance-decrement path is covered by the unit tests.
+    """
+    row = rows[0]
+    assert row.aborted is True, (
+        f"{label}: the abort row is not marked aborted, so it is indistinguishable "
+        "from a completed request now that aborts carry a real cost"
+    )
+    assert row.output_tokens >= 1, (
+        f"{label}: {row.output_tokens} output tokens billed, but the client read "
+        f"{_CHUNKS_BEFORE_DISCONNECT} content chunks before disconnecting"
+    )
+    assert float(row.cost) > 0.0, (
+        f"{label}: the aborted stream was billed {row.cost} — a client that reads "
+        "content and hangs up before the usage chunk is getting it for free"
+    )
 
 
 def _leftover_context_count():
@@ -414,6 +440,7 @@ def test_api_stream_disconnect_stops_generation(
 
     aborted = _wait_for_abort_row(app, "api")
     assert aborted, "no request_logs row was written for the aborted stream"
+    _assert_billed_for_abort(aborted, "/v1/chat/completions")
 
     # Task 1.6 — pool hygiene. A generator abandoned mid-flight is exactly how a
     # connection gets stranded idle-in-transaction and an app context gets left
@@ -463,6 +490,7 @@ def test_chat_stream_disconnect_stops_generation(
 
     aborted = _wait_for_abort_row(app, "chat")
     assert aborted, "no request_logs row was written for the aborted stream"
+    _assert_billed_for_abort(aborted, "/chat/stream")
 
     assert pool.checkedout() == 0, "a DB connection is still checked out after the abort"
     assert len(db.session.registry.registry) == sessions_before, (

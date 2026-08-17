@@ -447,8 +447,14 @@ def update_stats(
     endpoint_id: int = None,
     duration: float = 0.0,
     audio_seconds: int = 0,
+    aborted: bool = False,
 ):
-    """Update or create ModelStat/EntityStat running totals and append a RequestLog row."""
+    """Update or create ModelStat/EntityStat running totals and append a RequestLog row.
+
+    ``aborted`` marks the RequestLog row as one whose stream ended before the
+    client had read it; its token counts may be estimated (see
+    estimate_abort_usage).
+    """
     now = utcnow()
 
     # Ensure ModelStat row exists before the atomic increment.
@@ -513,38 +519,97 @@ def update_stats(
         audio_seconds=audio_seconds,
         cost=cost,
         duration=duration,
+        aborted=aborted,
     )
     db.session.add(log)
     db.session.flush()
 
 
-def record_aborted_request(entity_id, model_config_id, source, endpoint_id=None, duration=0.0):
-    """Log a zero-cost request_logs row for a stream the client abandoned mid-response.
+# Characters per token for the prompt fallback estimate. The upstream reports the
+# exact prompt_tokens only in its terminal usage chunk, which an aborted stream
+# never reaches, and Lumen has no tokenizer for the (arbitrary, per-endpoint) model.
+_CHARS_PER_TOKEN = 4
 
-    Lets us monitor how often clients disconnect mid-stream. Tokens and cost are 0
-    because the upstream usage totals only arrive in the final chunk, which we never
-    received; since every hosted model has a coin cost, ``cost = 0`` identifies these
-    aborted requests. Best-effort: never raise into the (already closing) generator.
+
+def estimate_prompt_tokens(messages) -> int:
+    """Estimate prompt tokens from the request messages at ~4 characters per token.
+
+    Multimodal content arrives as a list of parts; only their text is counted, so a
+    prompt carrying images or audio is under-estimated.
+    """
+    chars = 0
+    for message in messages or ():
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, str):
+            chars += len(content)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and isinstance(part.get("text"), str):
+                    chars += len(part["text"])
+    return round(chars / _CHARS_PER_TOKEN)
+
+
+def estimate_abort_usage(usage, messages, content_deltas, in_cost_per_million, out_cost_per_million):
+    """Return (input_tokens, output_tokens, cost) for a stream that ended early.
+
+    Prefers the upstream's exact totals when the terminal usage chunk had already
+    arrived — both streaming loops capture ``chunk.usage`` before they test the
+    disconnect flag precisely so a disconnect landing in that window keeps the real
+    figures. Otherwise both counts are estimates: the prompt from its character
+    count, and the output as one token per content delta received, the ratio most
+    OpenAI-compatible backends emit.
+    """
+    if usage is not None:
+        input_tokens = usage.prompt_tokens or 0
+        output_tokens = usage.completion_tokens or 0
+    else:
+        input_tokens = estimate_prompt_tokens(messages)
+        output_tokens = content_deltas
+    cost = round(
+        input_tokens * in_cost_per_million / 1_000_000
+        + output_tokens * out_cost_per_million / 1_000_000,
+        6,
+    )
+    return input_tokens, output_tokens, cost
+
+
+def record_aborted_request(entity_id, model_config_id, source, endpoint_id=None, duration=0.0,
+                           input_tokens=0, output_tokens=0, cost=0.0,
+                           effective=_UNSET, record_extra=None):
+    """Bill and log a request_logs row for a stream the client abandoned mid-response.
+
+    Billed exactly like a completed request — coins deducted and running totals
+    updated — because the backend really produced the tokens the client walked away
+    from; leaving it free is an unlimited free-inference method. The counts are the
+    upstream's exact totals when its terminal usage chunk had arrived, and otherwise
+    the estimate from estimate_abort_usage.
+
+    The row is marked ``aborted``, which is how mid-stream disconnects are monitored.
+    That replaces the old "cost == 0 identifies an abort" convention, which stopped
+    being unique the moment aborted requests started carrying a real cost.
+
+    ``record_extra``, if given, runs inside the same session before the commit, for
+    accounting the caller owns (the API path's per-API-key totals).
+
+    Best-effort: never raise into the (already closing) generator.
     """
     try:
-        db.session.add(RequestLog(
-            time=datetime.now(timezone.utc),
-            entity_id=entity_id,
-            model_config_id=model_config_id,
-            model_endpoint_id=endpoint_id,
-            source=source,
-            input_tokens=0,
-            output_tokens=0,
-            cost=0,
-            duration=duration,
-        ))
+        subtract_coins(entity_id, model_config_id, cost, effective=effective)
+        update_stats(
+            entity_id, model_config_id, source,
+            input_tokens, output_tokens, cost,
+            endpoint_id=endpoint_id, duration=duration, aborted=True,
+        )
+        if record_extra is not None:
+            record_extra()
         db.session.commit()
     except Exception:
         logger.exception("failed to record aborted request (entity_id=%s, model=%s)", entity_id, model_config_id)
         db.session.rollback()
 
 
-def record_stream_abort(app, *, billed, entity_id, model_config_id, source, endpoint_id, started_at):
+def record_stream_abort(app, *, billed, entity_id, model_config_id, source, endpoint_id, started_at,
+                        input_tokens=0, output_tokens=0, cost=0.0, effective=_UNSET, record_extra=None):
     """Abort accounting for a streaming generator that ends before billing.
 
     Every path that can end a stream early shares this, so they cannot drift:
@@ -565,6 +630,8 @@ def record_stream_abort(app, *, billed, entity_id, model_config_id, source, endp
             record_aborted_request(
                 entity_id, model_config_id, source,
                 endpoint_id=endpoint_id, duration=time.time() - started_at,
+                input_tokens=input_tokens, output_tokens=output_tokens, cost=cost,
+                effective=effective, record_extra=record_extra,
             )
     except Exception:
         logger.exception("abort accounting failed (entity_id=%s, model=%s)", entity_id, model_config_id)
@@ -631,6 +698,22 @@ def _send_message_stream(app, messages, model, entity_id, source, effective, dis
     billed = False
     aborted = False
 
+    def _abort():
+        """Bill and log what this stream consumed before the client went away.
+
+        Reads ``usage``/``parts`` at call time, so it reflects however far the
+        stream got. Shared by the break-on-disconnect path and GeneratorExit so
+        the two cannot bill differently.
+        """
+        input_tokens, output_tokens, cost = estimate_abort_usage(
+            usage, messages, len(parts), mc_in_cost, mc_out_cost)
+        record_stream_abort(
+            app, billed=billed, entity_id=entity_id, model_config_id=mc_id,
+            source=source, endpoint_id=ep_id, started_at=t0,
+            input_tokens=input_tokens, output_tokens=output_tokens, cost=cost,
+            effective=effective,
+        )
+
     try:
         with openai.OpenAI(api_key=ep_api_key, base_url=ep_url) as client:
             stream = client.chat.completions.create(
@@ -671,10 +754,7 @@ def _send_message_stream(app, messages, model, entity_id, source, effective, dis
             # Keyed off the break rather than the flag itself: a client that
             # disappears *after* a complete stream still has usage in hand and
             # must be billed normally, not written off as an abort.
-            record_stream_abort(
-                app, billed=billed, entity_id=entity_id, model_config_id=mc_id,
-                source=source, endpoint_id=ep_id, started_at=t0,
-            )
+            _abort()
             return
 
         duration = time.time() - t0
@@ -700,12 +780,9 @@ def _send_message_stream(app, messages, model, entity_id, source, effective, dis
                 db.session.commit()
             billed = True
     except GeneratorExit:
-        # Client disconnected mid-stream before billing — log a zero-cost request
-        # so we can monitor how often this happens, then re-raise to close cleanly.
-        record_stream_abort(
-            app, billed=billed, entity_id=entity_id, model_config_id=mc_id,
-            source=source, endpoint_id=ep_id, started_at=t0,
-        )
+        # Client disconnected mid-stream before billing — bill what was consumed
+        # and log it as an abort, then re-raise to close cleanly.
+        _abort()
         raise
 
     yield None, None, {

@@ -24,7 +24,7 @@ from lumen.models.model_endpoint import ModelEndpoint
 from lumen.models.request_log import RequestLog
 from lumen.services.cost import calculate_audio_cost
 from lumen.services.wsgi_disconnect import client_disconnect_event
-from lumen.services.llm import bulk_model_access_info, check_coin_budget, subtract_coins, get_effective_limit, get_next_endpoint, get_pool_limit, update_stats, record_stream_abort
+from lumen.services.llm import bulk_model_access_info, check_coin_budget, subtract_coins, estimate_abort_usage, get_effective_limit, get_next_endpoint, get_pool_limit, update_stats, record_stream_abort
 
 api_bp = Blueprint("api", __name__, url_prefix="/v1")
 
@@ -444,7 +444,27 @@ def _do_chat(model_name: str, messages: list, stream: bool, **kwargs):
     def generate():
         billed = False
         aborted = False
+        usage = None
+        content_deltas = 0
         t0 = _time.time()
+
+        def _abort():
+            """Bill and log what this stream consumed before the client went away.
+
+            Reads ``usage``/``content_deltas`` at call time, so it reflects however
+            far the stream got. Shared by the break-on-disconnect path and
+            GeneratorExit so the two cannot bill differently.
+            """
+            input_tokens, output_tokens, cost = estimate_abort_usage(
+                usage, messages, content_deltas, mc_in_cost, mc_out_cost)
+            record_stream_abort(
+                app, billed=billed, entity_id=entity_id, model_config_id=mc_id,
+                source="api", endpoint_id=ep_id, started_at=t0,
+                input_tokens=input_tokens, output_tokens=output_tokens, cost=cost,
+                effective=effective,
+                record_extra=lambda: _record_api_key_usage(ak_id, input_tokens, output_tokens, cost),
+            )
+
         # The ``with`` is nested inside the ``try`` (matching llm.py) so that an
         # exit through it — a GeneratorExit from a client disconnect above all —
         # closes the client, aborting the upstream generation, *before* the
@@ -458,7 +478,6 @@ def _do_chat(model_name: str, messages: list, stream: bool, **kwargs):
                     stream_options=stream_options,
                     **kwargs,
                 )
-                usage = None
                 for chunk in resp_stream:
                     # Capture usage before testing the flag — see llm.py: the
                     # totals ride on the terminal chunk, and a disconnect in that
@@ -468,6 +487,12 @@ def _do_chat(model_name: str, messages: list, stream: bool, **kwargs):
                     if disconnected.is_set():
                         aborted = True
                         break
+                    # Counted for the abort estimate: without the terminal usage
+                    # chunk, one content delta is the stand-in for one token.
+                    choices = getattr(chunk, "choices", None)
+                    delta = getattr(choices[0], "delta", None) if choices else None
+                    if getattr(delta, "content", None):
+                        content_deltas += 1
                     yield f"data: {json.dumps(chunk.model_dump())}\n\n"
                 if not aborted:
                     duration = _time.time() - t0
@@ -498,18 +523,12 @@ def _do_chat(model_name: str, messages: list, stream: bool, **kwargs):
                 # GeneratorExit path relies on). Keyed off the break, not the
                 # flag — a client that vanishes after a complete stream still
                 # has usage and is billed normally above.
-                record_stream_abort(
-                    app, billed=billed, entity_id=entity_id, model_config_id=mc_id,
-                    source="api", endpoint_id=ep_id, started_at=t0,
-                )
+                _abort()
                 return
         except GeneratorExit:
-            # Client disconnected mid-stream before billing — log a zero-cost
-            # request so we can monitor how often this happens, then re-raise.
-            record_stream_abort(
-                app, billed=billed, entity_id=entity_id, model_config_id=mc_id,
-                source="api", endpoint_id=ep_id, started_at=t0,
-            )
+            # Client disconnected mid-stream before billing — bill what was
+            # consumed and log it as an abort, then re-raise.
+            _abort()
             raise
         except Exception as exc:
             msg, err_type, _ = _classify_upstream_error(

@@ -836,6 +836,7 @@ def test_chat_completions_streaming_records_duration(
         assert log.input_tokens == 5
         assert log.output_tokens == 7
         assert log.duration > 0
+        assert log.aborted is False  # a completed stream is not an abort
 
 
 def _allow_model(app, test_user, test_model):
@@ -1023,4 +1024,88 @@ def test_streaming_abort_closes_upstream_before_logging(
             select(RequestLog).filter_by(entity_id=test_user["id"])
         ).scalars().all()
     assert len(logs) == 1
-    assert float(logs[0].cost) == 0.0
+    # The first chunk already carried usage, so the abort is billed exactly —
+    # 1 input @ $1/M + 1 output @ $2/M — rather than estimated.
+    assert logs[0].aborted is True
+    assert (logs[0].input_tokens, logs[0].output_tokens) == (1, 1)
+    assert float(logs[0].cost) == pytest.approx(0.000003)
+
+
+class _ContentChunk:
+    """A content-delta chunk with no usage — the shape an abort must estimate from."""
+
+    usage = None
+
+    def __init__(self, text="hi"):
+        self.text = text
+        self.choices = [type("Choice", (), {"delta": type("Delta", (), {"content": text})()})()]
+
+    def model_dump(self):
+        return {"choices": [{"delta": {"content": self.text}}]}
+
+
+def test_streaming_disconnect_bills_estimated_usage(
+    app, client, monkeypatch, test_user, test_model, test_model_endpoint, api_key,
+):
+    """A client that hangs up mid-stream is billed for what the backend produced.
+
+    No usage chunk arrived, so the counts are estimates: the prompt from its
+    character count, the output as one token per content delta delivered. A
+    zero-cost row here (the old behaviour) meant anyone could stream, disconnect
+    before the terminal chunk, and pay nothing — repeatably.
+    """
+    import threading
+    from lumen.blueprints.api import routes
+    from lumen.models.api_key import APIKey
+    from lumen.models.entity_balance import EntityBalance
+    from lumen.models.entity_limit import EntityLimit
+    from lumen.models.entity_model_access import EntityModelAccess
+    from lumen.models.request_log import RequestLog
+    from sqlalchemy import select
+    from lumen.extensions import db
+
+    token, key_id = api_key
+    with app.app_context():
+        db.session.add(EntityLimit(
+            entity_id=test_user["id"], max_coins=10, refresh_coins=0, starting_coins=10,
+        ))
+        db.session.add(EntityBalance(entity_id=test_user["id"], coins_left=10))
+        db.session.add(EntityModelAccess(
+            entity_id=test_user["id"], model_config_id=test_model["id"], access_type="allowed",
+        ))
+        db.session.commit()
+
+    disconnected = threading.Event()
+    monkeypatch.setattr(routes, "client_disconnect_event", lambda: disconnected)
+    _fake_openai(monkeypatch, routes, [_ContentChunk(), _ContentChunk(), _ContentChunk()])
+
+    resp = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"model": test_model["model_name"],
+              "messages": [{"role": "user", "content": "x" * 400}], "stream": True},
+    )
+    assert resp.is_streamed
+    events = iter(resp.response)
+    next(events)  # one content delta delivered
+    disconnected.set()
+    assert list(events) == []  # the stream stops itself — no [DONE]
+    resp.close()
+
+    with app.app_context():
+        log = db.session.execute(
+            select(RequestLog).filter_by(entity_id=test_user["id"])
+        ).scalar_one()
+        assert log.aborted is True
+        assert log.input_tokens == 100  # 400 prompt characters / 4
+        assert log.output_tokens == 1   # one content delta made it out
+        # 100 input @ $1/M + 1 output @ $2/M
+        assert float(log.cost) == pytest.approx(0.000102)
+        balance = db.session.execute(
+            select(EntityBalance).filter_by(entity_id=test_user["id"])
+        ).scalar_one()
+        assert float(balance.coins_left) == pytest.approx(10 - 0.000102)
+        # the per-key totals move too, exactly as on the completed path
+        key = db.session.get(APIKey, key_id)
+        assert (key.input_tokens, key.output_tokens) == (100, 1)
+        assert float(key.cost) == pytest.approx(0.000102)
