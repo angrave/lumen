@@ -703,6 +703,150 @@ def test_stream_client_disconnect_records_zero_cost_log(app, test_user, test_mod
         assert db.session.scalar(select(func.count()).select_from(ModelStat)) == 0
 
 
+def test_disconnect_flag_aborts_stream_without_generator_exit(app, test_user, test_model_endpoint):
+    """The flag alone must end the stream — nothing closes the generator.
+
+    Under uvicorn + a2wsgi a departed client never causes GeneratorExit, so this
+    is the path that actually runs in production. Closing the generator is not
+    simulated here on purpose.
+    """
+    import threading
+    entity_id = test_user["id"]
+    disconnected = threading.Event()
+    chunks = [
+        _Chunk(content="partial"),
+        _Chunk(content=" more"),
+        _Chunk(usage=_Usage(prompt_tokens=10, completion_tokens=5)),
+    ]
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.entity_limit import EntityLimit
+        from lumen.models.model_stat import ModelStat
+        from lumen.models.request_log import RequestLog
+        from lumen.services.llm import send_message_stream
+        db.session.add(EntityLimit(entity_id=entity_id, max_coins=-2, refresh_coins=0, starting_coins=0))
+        db.session.commit()
+        with patch("lumen.services.llm.openai.OpenAI", _mock_openai(chunks)), \
+             patch("lumen.services.llm.client_disconnect_event", return_value=disconnected):
+            gen = send_message_stream([], "test-model", entity_id=entity_id)
+            assert next(gen) == ("partial", None, None)
+            disconnected.set()
+            # Keep iterating rather than closing: the stream must stop itself,
+            # and must not emit the final result dict.
+            assert list(gen) == []
+        logs = db.session.execute(select(RequestLog).filter_by(entity_id=entity_id)).scalars().all()
+        assert len(logs) == 1
+        assert float(logs[0].cost) == 0.0
+        assert db.session.scalar(select(func.count()).select_from(ModelStat)) == 0
+
+
+def test_disconnect_flag_set_after_stream_completes_still_bills(app, test_user, test_model_endpoint):
+    """A client that vanishes after the last chunk must still be billed.
+
+    The usage totals arrived, so the work is real and chargeable. Keying the
+    abort off the flag rather than the loop break would write this off as a
+    zero-cost abort and hand out free inference to anyone who disconnects a
+    few milliseconds late.
+    """
+    import threading
+    entity_id = test_user["id"]
+    disconnected = threading.Event()
+
+    def chunks():
+        yield _Chunk(content="hello")
+        yield _Chunk(usage=_Usage(prompt_tokens=1_000_000, completion_tokens=1_000_000))
+        disconnected.set()  # client goes away exactly as the stream ends
+
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.entity_balance import EntityBalance
+        from lumen.models.entity_limit import EntityLimit
+        from lumen.models.model_stat import ModelStat
+        from lumen.models.request_log import RequestLog
+        from lumen.services.llm import send_message_stream
+        db.session.add(EntityLimit(entity_id=entity_id, max_coins=100, refresh_coins=0, starting_coins=100))
+        db.session.add(EntityBalance(entity_id=entity_id, coins_left=100))
+        db.session.commit()
+        with patch("lumen.services.llm.openai.OpenAI", _mock_openai(chunks())), \
+             patch("lumen.services.llm.client_disconnect_event", return_value=disconnected):
+            _, _, result = _drain(send_message_stream([], "test-model", entity_id=entity_id))
+        assert result is not None, "the final result dict must still be emitted"
+        assert result["output_tokens"] == 1_000_000
+        # Billed normally: stats recorded and balance drawn down.
+        assert db.session.scalar(select(func.count()).select_from(ModelStat)) == 1
+        balance = db.session.execute(select(EntityBalance).filter_by(entity_id=entity_id)).scalar_one()
+        assert float(balance.coins_left) < 100.0
+        # ...and no zero-cost abort row was written.
+        logs = db.session.execute(select(RequestLog).filter_by(entity_id=entity_id)).scalars().all()
+        assert len(logs) == 1
+        assert float(logs[0].cost) > 0.0
+
+
+# ---------------------------------------------------------------------------
+# record_stream_abort — the single abort-accounting seam shared by every path
+# that can end a stream early (GeneratorExit, client-disconnect flag).
+# ---------------------------------------------------------------------------
+
+def _abort_rows(app, entity_id):
+    from lumen.extensions import db
+    from lumen.models.request_log import RequestLog
+    with app.app_context():
+        return db.session.execute(
+            select(RequestLog).filter_by(entity_id=entity_id)
+        ).scalars().all()
+
+
+def test_record_stream_abort_writes_row_without_ambient_context(app, test_user, test_model, test_model_endpoint):
+    """Called context-free (as the streaming generators are), it pushes its own."""
+    from lumen.services.llm import record_stream_abort
+    entity_id = test_user["id"]
+
+    record_stream_abort(
+        app, billed=False, entity_id=entity_id, model_config_id=test_model["id"],
+        source="api", endpoint_id=test_model_endpoint["id"], started_at=0.0,
+    )
+
+    rows = _abort_rows(app, entity_id)
+    assert len(rows) == 1
+    assert float(rows[0].cost) == 0.0
+    assert rows[0].input_tokens == 0
+    assert rows[0].output_tokens == 0
+    assert rows[0].source == "api"
+    assert rows[0].model_endpoint_id == test_model_endpoint["id"]
+    assert rows[0].duration > 0  # measured from started_at
+
+
+def test_record_stream_abort_skips_when_already_billed(app, test_user, test_model):
+    """Billing completed before the client went away — no abort row."""
+    from lumen.services.llm import record_stream_abort
+    record_stream_abort(
+        app, billed=True, entity_id=test_user["id"], model_config_id=test_model["id"],
+        source="chat", endpoint_id=None, started_at=0.0,
+    )
+    assert _abort_rows(app, test_user["id"]) == []
+
+
+def test_record_stream_abort_skips_anonymous_stream(app, test_user, test_model):
+    """send_message_stream may run with no entity (entity_id=None) — nothing to log."""
+    from lumen.services.llm import record_stream_abort
+    record_stream_abort(
+        app, billed=False, entity_id=None, model_config_id=test_model["id"],
+        source="chat", endpoint_id=None, started_at=0.0,
+    )
+    assert _abort_rows(app, test_user["id"]) == []
+
+
+def test_record_stream_abort_never_raises_into_a_closing_generator(app, test_user, test_model):
+    """A failure here must not replace the GeneratorExit that is already unwinding."""
+    from lumen.services import llm
+    with patch.object(llm, "record_aborted_request", side_effect=RuntimeError("boom")):
+        llm.record_stream_abort(
+            app, billed=False, entity_id=test_user["id"], model_config_id=test_model["id"],
+            source="chat", endpoint_id=None, started_at=0.0,
+        )
+    assert _abort_rows(app, test_user["id"]) == []
+
+
 # ---------------------------------------------------------------------------
 # Helper stubs for send_message_stream mocking (kept at end so the static
 # analyser does not treat all test functions above as methods of _Chunk)

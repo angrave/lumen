@@ -23,7 +23,8 @@ from lumen.models.model_config import ModelConfig
 from lumen.models.model_endpoint import ModelEndpoint
 from lumen.models.request_log import RequestLog
 from lumen.services.cost import calculate_audio_cost
-from lumen.services.llm import bulk_model_access_info, check_coin_budget, subtract_coins, get_effective_limit, get_next_endpoint, get_pool_limit, update_stats, record_aborted_request
+from lumen.services.wsgi_disconnect import client_disconnect_event
+from lumen.services.llm import bulk_model_access_info, check_coin_budget, subtract_coins, get_effective_limit, get_next_endpoint, get_pool_limit, update_stats, record_stream_abort
 
 api_bp = Blueprint("api", __name__, url_prefix="/v1")
 
@@ -436,12 +437,21 @@ def _do_chat(model_name: str, messages: list, stream: bool, **kwargs):
     # context onto that thread and poisons it if the generator is abandoned),
     # so push short-lived app contexts around the DB work — never across a yield.
     app = current_app._get_current_object()
+    # Captured while the request context is still current; polled in the loop
+    # below. GeneratorExit alone never fires under uvicorn + a2wsgi.
+    disconnected = client_disconnect_event()
 
     def generate():
         billed = False
+        aborted = False
         t0 = _time.time()
-        with openai.OpenAI(api_key=ep_api_key, base_url=ep_url) as client:
-            try:
+        # The ``with`` is nested inside the ``try`` (matching llm.py) so that an
+        # exit through it — a GeneratorExit from a client disconnect above all —
+        # closes the client, aborting the upstream generation, *before* the
+        # handlers below run. With the ``with`` outside, the abort accounting's
+        # DB round-trip happened while the backend was still generating.
+        try:
+            with openai.OpenAI(api_key=ep_api_key, base_url=ep_url) as client:
                 stream_options = {**kwargs.pop("stream_options", {}), "include_usage": True}
                 resp_stream = client.chat.completions.create(
                     model=remote_model, messages=messages, stream=True,
@@ -450,51 +460,66 @@ def _do_chat(model_name: str, messages: list, stream: bool, **kwargs):
                 )
                 usage = None
                 for chunk in resp_stream:
+                    if disconnected.is_set():
+                        aborted = True
+                        break
                     if chunk.usage is not None:
                         usage = chunk.usage
                     yield f"data: {json.dumps(chunk.model_dump())}\n\n"
-                duration = _time.time() - t0
-                yield "data: [DONE]\n\n"
+                if not aborted:
+                    duration = _time.time() - t0
+                    yield "data: [DONE]\n\n"
 
-                if usage is not None:
-                    cost = round(
-                        usage.prompt_tokens * mc_in_cost / 1_000_000
-                        + usage.completion_tokens * mc_out_cost / 1_000_000,
-                        6,
-                    )
-                    with app.app_context():
-                        subtract_coins(entity_id, mc_id, cost, effective=effective)
-                        update_stats(entity_id, mc_id, "api", usage.prompt_tokens, usage.completion_tokens, cost,
-                                     endpoint_id=ep_id, duration=duration)
-                        _record_api_key_usage(ak_id, usage.prompt_tokens, usage.completion_tokens, cost)
-                        db.session.commit()
-                    billed = True
-                else:
-                    logger.warning(
-                        "Upstream did not return usage data for streaming request "
-                        "(model=%s, entity_id=%s) — tokens and cost not recorded.",
-                        model_name, entity_id,
-                    )
-            except GeneratorExit:
-                # Client disconnected mid-stream before billing — log a zero-cost
-                # request so we can monitor how often this happens, then re-raise.
-                if not billed:
-                    with app.app_context():
-                        record_aborted_request(entity_id, mc_id, "api", endpoint_id=ep_id,
-                                               duration=_time.time() - t0)
-                raise
-            except Exception as exc:
-                msg, err_type, _ = _classify_upstream_error(
-                    exc,
-                    f"Error during streaming request "
-                    f"(endpoint={ep_id} {ep_url} model={remote_model}, entity_id={entity_id})",
+                    if usage is not None:
+                        cost = round(
+                            usage.prompt_tokens * mc_in_cost / 1_000_000
+                            + usage.completion_tokens * mc_out_cost / 1_000_000,
+                            6,
+                        )
+                        with app.app_context():
+                            subtract_coins(entity_id, mc_id, cost, effective=effective)
+                            update_stats(entity_id, mc_id, "api", usage.prompt_tokens, usage.completion_tokens, cost,
+                                         endpoint_id=ep_id, duration=duration)
+                            _record_api_key_usage(ak_id, usage.prompt_tokens, usage.completion_tokens, cost)
+                            db.session.commit()
+                        billed = True
+                    else:
+                        logger.warning(
+                            "Upstream did not return usage data for streaming request "
+                            "(model=%s, entity_id=%s) — tokens and cost not recorded.",
+                            model_name, entity_id,
+                        )
+            if aborted:
+                # Outside the `with`: the client is closed and the upstream
+                # aborted before this DB round-trip runs (same ordering the
+                # GeneratorExit path relies on). Keyed off the break, not the
+                # flag — a client that vanishes after a complete stream still
+                # has usage and is billed normally above.
+                record_stream_abort(
+                    app, billed=billed, entity_id=entity_id, model_config_id=mc_id,
+                    source="api", endpoint_id=ep_id, started_at=t0,
                 )
-                # Any half-finished billing was already rolled back when its app
-                # context exited; nothing is held while the error events below
-                # are in flight — a client that has gone away can leave those
-                # yields pending forever.
-                yield f"data: {json.dumps({'error': {'message': msg, 'type': err_type}})}\n\n"
-                yield "data: [DONE]\n\n"
+                return
+        except GeneratorExit:
+            # Client disconnected mid-stream before billing — log a zero-cost
+            # request so we can monitor how often this happens, then re-raise.
+            record_stream_abort(
+                app, billed=billed, entity_id=entity_id, model_config_id=mc_id,
+                source="api", endpoint_id=ep_id, started_at=t0,
+            )
+            raise
+        except Exception as exc:
+            msg, err_type, _ = _classify_upstream_error(
+                exc,
+                f"Error during streaming request "
+                f"(endpoint={ep_id} {ep_url} model={remote_model}, entity_id={entity_id})",
+            )
+            # Any half-finished billing was already rolled back when its app
+            # context exited; nothing is held while the error events below
+            # are in flight — a client that has gone away can leave those
+            # yields pending forever.
+            yield f"data: {json.dumps({'error': {'message': msg, 'type': err_type}})}\n\n"
+            yield "data: [DONE]\n\n"
 
     return Response(generate(), content_type="text/event-stream")
 

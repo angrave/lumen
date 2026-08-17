@@ -957,3 +957,70 @@ def test_streaming_abandoned_by_client_releases_connection(
     resp.close()
 
     assert pool.checkedout() == 0
+
+
+def test_streaming_abort_closes_upstream_before_logging(
+    app, client, monkeypatch, test_user, test_model, test_model_endpoint, api_key,
+):
+    """The upstream client closes — aborting the backend — before the abort log.
+
+    Exiting ``with openai.OpenAI(...)`` aborts the upstream generation promptly.
+    While that ``with`` sat outside the ``try``, the ``except GeneratorExit``
+    handler's DB round-trip ran first and the backend kept generating for its
+    whole duration.
+    """
+    from lumen.blueprints.api import routes
+    from lumen.services import llm as llm_service
+    token, _ = api_key
+    _allow_model(app, test_user, test_model)
+
+    events = []
+
+    def _stream():
+        yield _UsageChunk()
+        yield _UsageChunk()
+
+    class _ClosingClient:
+        def __enter__(self): return self
+
+        def __exit__(self, *a):
+            events.append("upstream closed")
+            return False
+
+        @property
+        def chat(self):
+            def _create(**kwargs):
+                return _stream()
+            return type("C", (), {"completions": type("X", (), {"create": staticmethod(_create)})()})()
+
+    monkeypatch.setattr(routes.openai, "OpenAI", lambda *a, **k: _ClosingClient())
+
+    real_record = llm_service.record_aborted_request
+
+    def _spy(*a, **k):
+        events.append("abort logged")
+        return real_record(*a, **k)
+
+    monkeypatch.setattr(llm_service, "record_aborted_request", _spy)
+
+    resp = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"model": test_model["model_name"],
+              "messages": [{"role": "user", "content": "hi"}], "stream": True},
+    )
+    assert resp.is_streamed
+    next(iter(resp.response))  # one event, then walk away mid-stream
+    resp.close()
+
+    assert events == ["upstream closed", "abort logged"]
+
+    with app.app_context():
+        from sqlalchemy import select
+        from lumen.extensions import db
+        from lumen.models.request_log import RequestLog
+        logs = db.session.execute(
+            select(RequestLog).filter_by(entity_id=test_user["id"])
+        ).scalars().all()
+    assert len(logs) == 1
+    assert float(logs[0].cost) == 0.0

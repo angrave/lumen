@@ -65,6 +65,7 @@ from lumen.models.group_member import GroupMember
 from lumen.models.group_limit import GroupLimit
 from lumen.models.group_model_access import GroupModelAccess
 from lumen.services.crypto import cache_salt_for_entity
+from lumen.services.wsgi_disconnect import client_disconnect_event
 from lumen.models.entity import Entity
 
 def _resolve_allow_block(
@@ -543,6 +544,32 @@ def record_aborted_request(entity_id, model_config_id, source, endpoint_id=None,
         db.session.rollback()
 
 
+def record_stream_abort(app, *, billed, entity_id, model_config_id, source, endpoint_id, started_at):
+    """Abort accounting for a streaming generator that ends before billing.
+
+    Every path that can end a stream early shares this, so they cannot drift:
+    the ``GeneratorExit`` raised when the response iterable is closed, and the
+    polled client-disconnect flag. Does nothing once billing has completed.
+
+    Pushes its own short-lived application context because the streaming
+    generators run context-free; call it only from a point with no ``yield``
+    in scope, so no context can span one. Best-effort, like the
+    ``record_aborted_request`` it wraps: the caller is usually a generator that
+    is already unwinding, so a failure here (including one raised by the
+    context teardown's session release) must not replace the original exit.
+    """
+    if billed or entity_id is None:
+        return
+    try:
+        with app.app_context():
+            record_aborted_request(
+                entity_id, model_config_id, source,
+                endpoint_id=endpoint_id, duration=time.time() - started_at,
+            )
+    except Exception:
+        logger.exception("abort accounting failed (entity_id=%s, model=%s)", entity_id, model_config_id)
+
+
 def send_message_stream(
     messages: list,
     model: str,
@@ -562,12 +589,18 @@ def send_message_stream(
     re-pushes the request's context onto whichever worker thread iterates the
     body, and an abandoned generator leaves it stuck there, poisoning every
     later request on that thread.
+
+    The client-disconnect flag is captured here, while the request context is
+    still current, and polled inside the generator. GeneratorExit alone is not
+    enough: under uvicorn + a2wsgi the response generator is never closed on a
+    disconnect, so that handler never fires in production.
     """
     app = current_app._get_current_object()
-    return _send_message_stream(app, messages, model, entity_id, source, effective)
+    disconnected = client_disconnect_event()
+    return _send_message_stream(app, messages, model, entity_id, source, effective, disconnected)
 
 
-def _send_message_stream(app, messages, model, entity_id, source, effective):
+def _send_message_stream(app, messages, model, entity_id, source, effective, disconnected):
     with app.app_context():
         config = db.session.execute(select(ModelConfig).where(ModelConfig.model_name == model, ModelConfig.active)).scalar_one_or_none()
         if config is None:
@@ -596,6 +629,7 @@ def _send_message_stream(app, messages, model, entity_id, source, effective):
     parts = []
     usage = None
     billed = False
+    aborted = False
 
     try:
         with openai.OpenAI(api_key=ep_api_key, base_url=ep_url) as client:
@@ -609,6 +643,9 @@ def _send_message_stream(app, messages, model, entity_id, source, effective):
 
             thinking_parts = []
             for chunk in stream:
+                if disconnected.is_set():
+                    aborted = True
+                    break
                 if chunk.usage:
                     usage = chunk.usage
                 if chunk.choices:
@@ -623,6 +660,18 @@ def _send_message_stream(app, messages, model, entity_id, source, effective):
                             t_first = time.time() - t0
                         parts.append(text)
                         yield text, None, None
+
+        if aborted:
+            # Control has left the `with`, so the client is closed and the
+            # upstream generation already aborted; only now do the DB work.
+            # Keyed off the break rather than the flag itself: a client that
+            # disappears *after* a complete stream still has usage in hand and
+            # must be billed normally, not written off as an abort.
+            record_stream_abort(
+                app, billed=billed, entity_id=entity_id, model_config_id=mc_id,
+                source=source, endpoint_id=ep_id, started_at=t0,
+            )
+            return
 
         duration = time.time() - t0
         reply = "".join(parts)
@@ -649,9 +698,10 @@ def _send_message_stream(app, messages, model, entity_id, source, effective):
     except GeneratorExit:
         # Client disconnected mid-stream before billing — log a zero-cost request
         # so we can monitor how often this happens, then re-raise to close cleanly.
-        if entity_id is not None and not billed:
-            with app.app_context():
-                record_aborted_request(entity_id, mc_id, source, endpoint_id=ep_id, duration=time.time() - t0)
+        record_stream_abort(
+            app, billed=billed, entity_id=entity_id, model_config_id=mc_id,
+            source=source, endpoint_id=ep_id, started_at=t0,
+        )
         raise
 
     yield None, None, {
