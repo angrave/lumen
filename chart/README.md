@@ -271,6 +271,7 @@ models:
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `replicaCount` | `1` | Number of Lumen pods |
+| `wsgiProcesses` | `1` | uvicorn worker processes per pod (wired to `--workers` and `WEB_CONCURRENCY`); >1 requires `api.prometheus.multiprocDir` |
 | `image.repository` | `ghcr.io/ncsa/lumen` | Container image repository |
 | `image.tag` | `""` | Image tag (defaults to chart appVersion) |
 | `image.pullPolicy` | `IfNotPresent` | Image pull policy |
@@ -299,6 +300,9 @@ models:
 | `gateway.hostname` | `""` | Gateway hostname |
 | `gateway.timeout` | `"600s"` | Request timeout |
 | `models` | `[]` | Model definitions (see Models section) |
+| `serviceMonitor.enabled` | `false` | Create a Prometheus Operator ServiceMonitor scraping `/metrics` |
+| `serviceMonitor.interval` | `"30s"` | ServiceMonitor scrape interval |
+| `serviceMonitor.scrapeTimeout` | `"10s"` | ServiceMonitor scrape timeout |
 
 ## Database Migrations
 

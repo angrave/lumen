@@ -7,6 +7,7 @@
       "type": "integer",
       "minimum": 1
     },
+    "wsgiProcesses": { "type": "integer", "minimum": 1 },
     "wsgiWorkers": {
       "oneOf": [
         { "type": "integer", "minimum": 1 },
@@ -253,6 +254,15 @@
             "token": { "type": "string" }
           }
         }
+      }
+    },
+    "serviceMonitor": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "interval": { "type": "string" },
+        "scrapeTimeout": { "type": "string" }
       }
     },
     "groups": {

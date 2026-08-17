@@ -4,6 +4,13 @@
 # -- Number of Lumen app replicas. ≥2 requires redis for shared rate-limit state.
 replicaCount: 1
 
+# -- Number of uvicorn worker processes per pod. Wired to both the
+# WEB_CONCURRENCY env var (so lumen/services/db_pool.py:detect_workers() agrees
+# with uvicorn on one number) and uvicorn's --workers flag. Values >1 require
+# api.prometheus.multiprocDir to be set; the chart then mounts a shared
+# emptyDir there so Prometheus can aggregate metrics across processes.
+wsgiProcesses: 1
+
 # -- Concurrent requests served per pod (a2wsgi thread pool). Requests beyond
 # this queue. Use "auto" to derive it from this pod's connection pool
 # (database.poolSize + database.maxOverflow, clamped to 10-64); a number sets it
@@ -146,6 +153,20 @@ api:
   monitoring:
     # -- Bearer token for the monitoring endpoint. Empty disables it.
     token: ""
+
+## Prometheus Operator ServiceMonitor -----------------------------------------------
+
+serviceMonitor:
+  # -- Create a ServiceMonitor (Prometheus Operator CRD) scraping /metrics on every
+  # pod. Requires the Prometheus Operator CRDs and api.prometheus.enabled=true.
+  # NOTE: api.prometheus.token is not wired in as scrape auth — see the comment in
+  # templates/servicemonitor.yaml — so /metrics will reject unauthenticated scrapes
+  # until that is set up some other way.
+  enabled: false
+  # -- Scrape interval
+  interval: "30s"
+  # -- Scrape timeout
+  scrapeTimeout: "10s"
 
 ## Groups ---------------------------------------------------------------------------
 # Each key is the group name. Groups are matched in order; the first match wins.
