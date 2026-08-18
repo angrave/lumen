@@ -392,7 +392,7 @@ def test_no_retention_policy_is_created_by_any_migration(pg_migrated):
 
 
 def test_downgrade_and_upgrade_round_trip(pg_url, pg_migrated, seeded):
-    """`flask db downgrade` must actually reverse all three migrations.
+    """`flask db downgrade` must actually reverse every migration below it.
 
     Run through the CLI, like ``entrypoint.sh``, and asserted on the way back
     up: a downgrade that leaves the policies behind blocks the DROP, and one
