@@ -450,6 +450,47 @@ was pulled and run locally; every claim below is a transcript, not an inference.
   so CI would validate §8 against semantics production does not have (or, after the next release,
   against semantics production does not have *yet*). Pin CI to the production version.
 
+**2026-08-18 — two continuous-aggregate behaviours found during implementation, both measured.**
+Neither is in the Timescale docs in a form that would have warned us, and both silently produce the
+*exact* regression §12 exists to prevent, from directions the contract did not anticipate.
+
+- **A refresh whose window END is in the future disables real-time aggregation for the current
+  bucket.** The obvious month-by-month backfill loop refreshes `[month_start, month_start + 1 month)`,
+  and on the final iteration that end is in the future. Timescale then advances the aggregate's
+  watermark past `now()`, and real-time aggregation only unions raw rows *above* the watermark — so
+  the current bucket is served from materialised data alone, frozen at refresh time. Measured:
+
+  ```
+  watermark after refresh | 2026-08-18 16:00:00+00   (now() was 15:19)
+  raw 7 | cagg 2                                     <- 5 of 7 invisible
+  ```
+
+  Clamping each window end to `now()` leaves the watermark behind the current bucket and the later
+  insert appears (6 = 6). **The backfill command, run to protect history, would otherwise have
+  broken the present.** Note the first attempt at reproducing this did *not* fail: with
+  `start => NULL` the watermark only advances to the end of existing data. It takes an explicit
+  window over the current month to push it forward — which is precisely what the month loop does.
+
+- **Rows older than the policy's `start_offset` become invisible, not merely un-materialised.**
+  Once a policy job runs it advances the watermark, and real-time aggregation scans raw rows only
+  above it. History that was never materialised sits below the watermark and simply vanishes from the
+  view — a 40-day-old row disappeared from a 30-day `start_offset` aggregate the moment the
+  background job first fired. This is contract (c) confirmed empirically rather than argued:
+  **the query rewrite shows near-empty per-user history until the backfill has run**, and since
+  `entrypoint.sh` runs `flask db upgrade` at container start, the aggregate and its policy go live
+  the moment the code deploys. The raw-table fallback in §12(a) is therefore mandatory, not the
+  "if they must ship together" contingency the contract phrased it as.
+
+- **A background policy job racing an explicit refresh fails outright rather than waiting.**
+  `LockNotAvailable` (SQLSTATE `55P03`), not a block-and-proceed. With a 1-minute schedule on
+  `request_metrics_1m`, a 13-month backfill will collide; without a retry it aborts partway and
+  leaves the operator with a half-filled aggregate and no record of which months completed.
+
+- **`COMMENT ON MATERIALIZED VIEW` does not work on a continuous aggregate.** Despite the
+  `CREATE MATERIALIZED VIEW` spelling, the object is `pg_class.relkind = 'v'` — a plain view over a
+  hidden materialisation hypertable. Postgres answers `"..." is not a materialized view`.
+  Use `COMMENT ON VIEW`.
+
 ---
 
 ## 5. Phase 1 — multi-process integrity

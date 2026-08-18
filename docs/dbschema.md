@@ -250,6 +250,8 @@ erDiagram
 - [conversations](#conversations)
 - [messages](#messages)
 - [request\_logs](#request_logs)
+- [request\_counts\_hourly\_by\_entity](#request_counts_hourly_by_entity) *(continuous aggregate)*
+- [request\_metrics\_1m](#request_metrics_1m) *(continuous aggregate)*
 
 ---
 
@@ -600,6 +602,121 @@ Append-only log of every proxied request. On PostgreSQL this table is converted 
 - **`outcome` carries only values the code can actually write.** There is deliberately no `billing_error` or `upstream_error`: the row is created inside `update_stats`, which only flushes, so a failing commit rolls back the very row that would have recorded the failure. Enum values are added together with the code that writes them.
 - `ttft` and `ttft_visible` are both stored because on a reasoning model they differ by the whole thinking phase — which is what separates "the model was queued" from "the model was thinking".
 - `aborted` replaces the earlier "`cost` = 0 identifies an abandoned stream" convention: aborted streams are now billed for what they consumed, so their cost is usually non-zero. Rows written before the column was added are all `false` and were not backfilled — a completed request can also cost 0 (zero-priced model, audio model with no `audio_cost_per_hour`, missing upstream usage, or a cost that rounds to 0 at `Numeric(12,6)`), so the old convention could not be applied retroactively without false positives.
+
+---
+
+## Continuous aggregates
+
+PostgreSQL only. TimescaleDB continuous aggregates over `request_logs`, refreshed by
+background policies. They are what makes the usage charts survive a retention policy
+dropping raw chunks — anything not carried here is unrecoverable once the raw rows are gone.
+
+The two views added below are **real-time**: they set `timescaledb.materialized_only = false`, so
+a query unions the materialised rows with a live scan of the raw rows newer than the
+materialisation watermark. Without that — and `true` is the default on TimescaleDB 2.13+ — the
+current bucket is missing, and a user who ran forty requests this hour sees zero.
+
+**They are views, not tables.** Despite the `CREATE MATERIALIZED VIEW` spelling, a continuous
+aggregate is a plain view (`pg_class.relkind = 'v'`) over a hidden materialisation hypertable,
+so its comment is set with `COMMENT ON VIEW`.
+
+**Rows older than a policy's `start_offset` are invisible until backfilled.** Once the scheduled
+policy runs, the watermark advances past them, and real-time aggregation only scans raw rows
+*above* the watermark — so history that was never materialised silently disappears from queries.
+That is why the full-history backfill is a deliberate operator command, and why refreshing a
+window whose raw chunks have already been dropped is destructive: it recomputes the window as
+empty and deletes the materialised rows, without erroring.
+
+### request_counts_hourly
+
+`time_bucket('1 hour', time)` grouped by `bucket, model_config_id, source`, carrying `requests`,
+`input_tokens`, `output_tokens`, `cost`. Org-wide only — it has no `entity_id`, which is why the
+per-entity charts needed the aggregate below. `materialized_only` is at its default (`true`),
+`start_offset` 3 hours, `end_offset` 1 hour, refreshed hourly.
+
+### request_counts_hourly_by_entity
+
+Answers *"what did this user do, and how did it feel?"* — the per-entity `/usage` charts read it
+instead of raw `request_logs`, so an individual's "All Time" history is not truncated when
+retention drops raw chunks.
+
+**Grouped by:** `bucket` (`time_bucket('1 hour', time)`), `entity_id`, `model_config_id`, `source`
+
+| Column | Expression | Description |
+|--------|------------|-------------|
+| `bucket` | `time_bucket('1 hour', time)` | Start of the hour, TIMESTAMPTZ. One hour, not one day: the heatmap does `EXTRACT(HOUR FROM bucket)` and a daily bucket would collapse the 7×24 grid to a single column |
+| `entity_id` | `entity_id` | The entity that made the requests; NULL once the entity is deleted |
+| `model_config_id` | `model_config_id` | The model used; NULL once the model is deleted |
+| `source` | `source` | `'chat'` or `'api'` |
+| `requests` | `COUNT(*)` | Requests in the bucket |
+| `input_tokens` | `SUM(input_tokens)` | Input tokens |
+| `output_tokens` | `SUM(output_tokens)` | Output tokens |
+| `cost` | `SUM(cost)` | Cost in USD |
+| `duration_sum` | `SUM(duration)` | Total proxy response seconds; divide by `requests` for the mean |
+| `duration_max` | `MAX(duration)` | Worst response time in the bucket |
+| `aborts` | `COUNT(*) FILTER (WHERE outcome = 'disconnect')` | Client disconnects. Follows `outcome`, not the older `aborted` boolean |
+| `ttft_count` | `COUNT(ttft_visible)` | Non-null denominator for the TTFT measures |
+| `ttft_sum` | `SUM(ttft_visible)` | Total seconds to first visible content |
+| `ttft_max` | `MAX(ttft_visible)` | Worst time to first visible content |
+| `ttft_le_0_5` … `ttft_le_30` | `COUNT(*) FILTER (WHERE ttft_visible <= edge)` | Cumulative histogram at 0.5, 1, 2, 5, 10 and 30 seconds |
+
+**Refresh policy:** `start_offset` 30 days, `end_offset` 1 hour, `schedule_interval` 1 hour.
+Created `WITH NO DATA`; full history is materialised by the operator backfill command.
+
+**Notes:**
+- **The `ttft_le_*` columns are cumulative**, in the Prometheus-histogram sense: each counts
+  everything at or below its edge, so `ttft_le_0_5 <= ttft_le_1 <= … <= ttft_le_30 <= ttft_count`.
+  p95 is found by walking the edges and interpolating. They exist because `timescaledb_toolkit`
+  is not installed on the deployed image, so `percentile_agg` is unavailable.
+- **A NULL `ttft_visible` counts in none of the buckets and not in `ttft_count`.** Rows predating
+  the timing columns have NULL there; counting them would make every historical bucket read as
+  uniformly fast.
+- **`start_offset` (30 days) must stay comfortably inside the retention window (13 months).**
+  If they cross, the scheduled refresh reaches into dropped chunks and erases materialised history.
+- Cardinality is bounded by *active* user-hours: a student uses one or two models in an hour, so a
+  300-student class produces a few hundred rows per hour, not users × models × hours.
+
+### request_metrics_1m
+
+Answers *"what is happening right now, per model?"* — a ten-minute burst is over before an hourly
+bucket closes, so the hourly views cannot resolve a class-start incident at all.
+
+**Grouped by:** `bucket` (`time_bucket('1 minute', time)`), `model_config_id`, `source`
+
+Same measures as `request_counts_hourly_by_entity` (`requests`, `input_tokens`, `output_tokens`,
+`cost`, `duration_sum`, `duration_max`, `aborts`, `ttft_count`, `ttft_sum`, `ttft_max`,
+`ttft_le_0_5` … `ttft_le_30`), with the same cumulative-histogram and NULL semantics.
+
+**Refresh policy:** `start_offset` 3 hours, `end_offset` 1 minute, `schedule_interval` 1 minute.
+Created `WITH NO DATA`; it needs no historical backfill.
+
+**Notes:**
+- **Deliberately no `entity_id`.** This view describes the shape of the load, not who caused it —
+  `request_counts_hourly_by_entity` answers the per-user question. Adding `entity_id` here would
+  multiply the row count by the size of the class in every minute, for no stated requirement.
+- `materialized_only = false` matters more here than anywhere: with a one-minute `end_offset`, a
+  materialised-only view is by construction always at least a minute stale, which is most of the
+  resolution the view exists to provide.
+
+---
+
+## request_logs storage lifecycle
+
+**Compression.** `request_logs` has columnstore compression enabled with
+`compress_segmentby = 'model_config_id, source'` and `compress_orderby = 'time DESC'`, and a
+policy compresses chunks older than **7 days** — the same interval the chunks use, so only closed
+chunks are ever compressed. The segment-by columns are exactly what the analytics queries filter
+on, so compressed chunks can be pruned without being decompressed.
+
+Nullable `ADD COLUMN`, `ADD COLUMN … DEFAULT` and `ADD COLUMN … NOT NULL DEFAULT` all work against
+compressed chunks on TimescaleDB 2.27; only `NOT NULL` *without* a default is refused, and loudly.
+The residual cost of compression is I/O — servicing an `ADD COLUMN` rewrites compressed chunks
+across the whole window.
+
+**Retention is not enabled by any migration, deliberately.** `entrypoint.sh` runs
+`flask db upgrade` at container start, so a migration adding a retention policy would begin
+deleting production data automatically on the next deploy. Retention is an explicit operator
+command with a dry run as its default.
 
 ---
 

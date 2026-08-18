@@ -260,3 +260,121 @@ class TestClearOwnStaleGauges:
 
         monkeypatch.setattr(pcm, "mark_process_dead", boom)
         multiproc.clear_own_stale_gauges()  # must not raise
+
+
+def test_reap_marks_each_dead_pid_before_probing_the_next(tmp_path, monkeypatch):
+    """The window between "this pid is dead" and "delete its files" must be empty.
+
+    pids are recycled. If the reaper probes every pid first and only then deletes,
+    a supervisor can respawn a worker onto a pid that was observed dead moments
+    earlier; the new worker constructs its gauges, and the reaper's later
+    mark_process_dead removes the *live* worker's files. It never recreates them
+    — the mmap still refers to the unlinked inode, so the worker writes to a file
+    no MultiProcessCollector glob can see, and its gauges are invisible for the
+    rest of the pod's life.
+
+    Asserting on ordering rather than on the race itself: the race needs a pid
+    collision to reproduce and would be flaky, but the invariant that makes it
+    impossible is exact and cheap to check.
+    """
+    import lumen.blueprints.metrics.middleware as mw
+
+    dead_pids = [_dead_pid() for _ in range(3)]
+    for pid in dead_pids:
+        (tmp_path / f"gauge_livesum_{pid}.db").write_bytes(b"")
+
+    calls = []
+    real_kill = os.kill
+
+    def spy_kill(pid, sig):
+        calls.append(("probe", pid))
+        return real_kill(pid, sig)
+
+    monkeypatch.setattr(mw.os, "kill", spy_kill)
+    monkeypatch.setattr(mw, "mark_process_dead", lambda pid, path: calls.append(("mark", pid)))
+    monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", str(tmp_path))
+
+    mw.reap_dead_workers()
+
+    assert len(calls) == 2 * len(dead_pids), calls
+    for i in range(0, len(calls), 2):
+        probe, mark = calls[i], calls[i + 1]
+        assert probe[0] == "probe" and mark[0] == "mark", calls
+        assert probe[1] == mark[1], (
+            f"pid {probe[1]} was probed but {mark[1]} was marked next; collecting "
+            "the dead pids and marking them in a second pass reopens the "
+            "recycled-pid window this test exists to close"
+        )
+
+
+def _config_with_prometheus(tmp_path):
+    """The suite's own config plus an enabled Prometheus and no multiproc dir.
+
+    Built from the real fixture rather than a minimal dict because create_app
+    exits before it reaches the Prometheus block if config.yaml declares no
+    active models.
+    """
+    import yaml
+    from tests.conftest import TEST_CONFIG
+
+    data = yaml.safe_load(open(TEST_CONFIG))
+    api = dict(data.get("api", {}))
+    api["prometheus"] = {"enabled": True, "token": "t" * 32}
+    data["api"] = api
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(yaml.safe_dump(data))
+    return cfg
+
+
+def test_multiple_workers_without_a_multiproc_dir_warns(tmp_path, monkeypatch, caplog):
+    """The misconfiguration that makes /metrics quietly wrong.
+
+    prometheus_client only enters multiprocess mode when PROMETHEUS_MULTIPROC_DIR
+    is set. Without it each worker keeps a private registry, so a scrape returns
+    whichever worker happened to answer — counters appear to jump backwards at
+    random, which Prometheus reads as a reset. Nothing raises and nothing is
+    logged, so the numbers are simply wrong. The chart README already says
+    wsgiProcesses > 1 requires multiprocDir; nothing enforced it.
+    """
+    import logging
+
+    cfg = _config_with_prometheus(tmp_path)
+    # Config reads CONFIG_YAML into a class attribute at import time, so the
+    # env var is already fixed by the session app fixture; patch the attribute.
+    from config import Config
+    monkeypatch.setattr(Config, "CONFIG_YAML", str(cfg))
+    monkeypatch.setattr(Config, "SQLALCHEMY_DATABASE_URI", f"sqlite:///{tmp_path / 'warn.db'}")
+    monkeypatch.setenv("BACKGROUND_WORKER", "false")
+    monkeypatch.setenv("WEB_CONCURRENCY", "4")
+    monkeypatch.delenv("PROMETHEUS_MULTIPROC_DIR", raising=False)
+
+    from lumen import create_app
+    with caplog.at_level(logging.WARNING):
+        create_app()
+
+    assert any("multiproc_dir" in r.message for r in caplog.records), (
+        "four workers with no shared directory must not be silent"
+    )
+
+
+def test_a_single_worker_without_a_multiproc_dir_is_silent(tmp_path, monkeypatch, caplog):
+    """Production is 1x1, where single-process mode is exactly right.
+
+    A warning every startup for the correct configuration is how warnings stop
+    being read.
+    """
+    import logging
+
+    cfg = _config_with_prometheus(tmp_path)
+    from config import Config
+    monkeypatch.setattr(Config, "CONFIG_YAML", str(cfg))
+    monkeypatch.setattr(Config, "SQLALCHEMY_DATABASE_URI", f"sqlite:///{tmp_path / 'quiet.db'}")
+    monkeypatch.setenv("BACKGROUND_WORKER", "false")
+    monkeypatch.setenv("WEB_CONCURRENCY", "1")
+    monkeypatch.delenv("PROMETHEUS_MULTIPROC_DIR", raising=False)
+
+    from lumen import create_app
+    with caplog.at_level(logging.WARNING):
+        create_app()
+
+    assert not any("multiproc_dir" in r.message for r in caplog.records)

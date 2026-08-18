@@ -3,7 +3,7 @@ from datetime import datetime
 
 from sqlalchemy import select
 
-from lumen.commands import sync_groups_from_yaml, sync_models_from_yaml, sync_projects_from_yaml, sync_user_groups_from_yaml, sync_user_limits_from_yaml
+from lumen.commands import backfill_aggregate_cmd, enable_retention_cmd, sync_groups_from_yaml, sync_models_from_yaml, sync_projects_from_yaml, sync_user_groups_from_yaml, sync_user_limits_from_yaml
 
 
 def test_sync_models_creates_model_config(app):
@@ -820,3 +820,18 @@ def test_sync_user_limits_skips_user_not_in_db(app):
         assert count == []
 
 
+
+
+def test_backfill_aggregate_is_a_clean_noop_on_sqlite(app):
+    """SQLite has no continuous aggregates. Say so and exit 0 — this is not an error."""
+    result = app.test_cli_runner().invoke(backfill_aggregate_cmd, [])
+    assert result.exit_code == 0, result.output
+    assert "requires PostgreSQL/TimescaleDB" in result.output
+    assert "sqlite" in result.output
+
+
+def test_enable_retention_is_a_clean_noop_on_sqlite(app):
+    result = app.test_cli_runner().invoke(enable_retention_cmd, [])
+    assert result.exit_code == 0, result.output
+    assert "requires PostgreSQL/TimescaleDB" in result.output
+    assert "sqlite" in result.output

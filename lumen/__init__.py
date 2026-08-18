@@ -129,6 +129,23 @@ def create_app():
         multiproc_dir = prom_cfg.get("multiproc_dir", "")
         if multiproc_dir:
             os.environ.setdefault("PROMETHEUS_MULTIPROC_DIR", multiproc_dir)
+        else:
+            # Without a shared directory prometheus_client stays in
+            # single-process mode: each worker keeps a private registry and a
+            # scrape returns whichever worker happened to answer it. Counters
+            # then appear to jump backwards at random, which Prometheus reads
+            # as a counter reset -- wrong numbers, no error, nothing logged.
+            # Silent for the 1x1 deployment, where single-process mode is
+            # exactly right.
+            from lumen.services.db_pool import detect_workers
+
+            if detect_workers() > 1:
+                app.logger.warning(
+                    "prometheus is enabled with %d worker processes but "
+                    "api.prometheus.multiproc_dir is not set; /metrics will "
+                    "report only the worker that serves each scrape.",
+                    detect_workers(),
+                )
         # Before importing the middleware: importing it constructs the metric
         # objects, and prometheus_client opens each mmap eagerly at construction.
         # A recycled pid would otherwise inherit a dead worker's gauge values.
@@ -432,9 +449,11 @@ def create_app():
         return render_template("errors/500.html"), HTTPStatus.INTERNAL_SERVER_ERROR
 
     # Register CLI commands
-    from lumen.commands import init_db_cmd, reassign_model_cmd
+    from lumen.commands import backfill_aggregate_cmd, enable_retention_cmd, init_db_cmd, reassign_model_cmd
     app.cli.add_command(init_db_cmd)
     app.cli.add_command(reassign_model_cmd)
+    app.cli.add_command(backfill_aggregate_cmd)
+    app.cli.add_command(enable_retention_cmd)
 
     # Context processor: inject app_name and nav_projects into all templates
     @app.context_processor

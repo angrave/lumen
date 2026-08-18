@@ -78,3 +78,75 @@ def test_rate_limit_rejection_is_counted(
             break
 
     assert ("rate_limit", "api", "") in recorded
+
+
+# ---------------------------------------------------------------------------
+# The chat surface has the same two-kinds-of-429 problem as /v1
+# ---------------------------------------------------------------------------
+
+def _exhaust_chat_budget(app, entity_id, refresh_coins=10):
+    from datetime import timedelta
+    from lumen.extensions import db
+    from lumen.models.entity_balance import EntityBalance
+    from lumen.models.entity_limit import EntityLimit
+    from lumen.timeutils import utcnow
+    with app.app_context():
+        db.session.add(EntityLimit(
+            entity_id=entity_id, max_coins=100,
+            refresh_coins=refresh_coins, starting_coins=100,
+        ))
+        db.session.add(EntityBalance(
+            entity_id=entity_id, coins_left=0,
+            last_refill_at=utcnow() - timedelta(minutes=30),
+        ))
+        db.session.commit()
+
+
+def test_chat_coin_exhaustion_sends_retry_after(app, auth_client, test_user, test_model):
+    """Both 429s reach the chat surface, and only one used to say when to return.
+
+    The limiter's 429 already carries Retry-After, so an exhausted budget without
+    one is indistinguishable from a rate limit that clears in a moment — and the
+    browser is not the only client of this endpoint.
+    """
+    _exhaust_chat_budget(app, test_user["id"])
+
+    resp = auth_client.post("/chat/stream", json={
+        "model": test_model["model_name"],
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+
+    assert resp.status_code == HTTPStatus.TOO_MANY_REQUESTS
+    assert "Retry-After" in resp.headers
+    assert 1 <= int(resp.headers["Retry-After"]) <= 60 * 60
+
+
+def test_chat_coin_exhaustion_keeps_the_flat_error_body(app, auth_client, test_user, test_model):
+    """chat.html renders `data.error` directly (chat.html:710).
+
+    Nesting the body the way /v1 does would put "[object Object]" in the user's
+    chat window, so the header is the only thing that changes here.
+    """
+    _exhaust_chat_budget(app, test_user["id"])
+
+    resp = auth_client.post("/chat/stream", json={
+        "model": test_model["model_name"],
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+
+    assert isinstance(resp.get_json()["error"], str)
+
+
+def test_chat_coin_exhaustion_sends_no_header_when_nothing_refills(
+    app, auth_client, test_user, test_model
+):
+    """A pool with refresh_coins=0 never refills; a header would be a fabrication."""
+    _exhaust_chat_budget(app, test_user["id"], refresh_coins=0)
+
+    resp = auth_client.post("/chat/stream", json={
+        "model": test_model["model_name"],
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+
+    assert resp.status_code == HTTPStatus.TOO_MANY_REQUESTS
+    assert "Retry-After" not in resp.headers

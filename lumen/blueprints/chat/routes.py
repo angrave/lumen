@@ -21,7 +21,7 @@ from lumen.models.message import Message
 from lumen.models.model_config import ModelConfig
 from lumen.models.model_endpoint import ModelEndpoint
 from lumen.services.live_state import get_live_state
-from lumen.services.llm import bulk_model_access_info, check_coin_budget, get_pool_limit, send_message_stream
+from lumen.services.llm import bulk_model_access_info, check_coin_budget, coin_retry_after, get_pool_limit, send_message_stream
 from lumen.services.wsgi_disconnect import client_disconnect_event
 from lumen.timeutils import utcnow
 
@@ -219,6 +219,17 @@ def chat_stream():
         entity_id, model_config.id, source="chat", model_name=model,
     )
     if not ok:
+        if code == HTTPStatus.TOO_MANY_REQUESTS:
+            # The chat surface has the same two-kinds-of-429 problem /v1 has:
+            # the limiter's 429 already carries Retry-After, so without one
+            # here an exhausted budget looks like a rate limit that will clear
+            # in a moment. Only the header is added. The body stays
+            # {"error": "<string>"} because chat.html renders `data.error`
+            # directly (chat.html:710) -- nesting it the way /v1 does would
+            # put "[object Object]" in the user's chat window.
+            retry_after = coin_retry_after(entity_id)
+            if retry_after is not None:
+                return jsonify({"error": msg}), code, {"Retry-After": str(retry_after)}
         return jsonify({"error": msg}), code
 
     store_conversations = db.session.execute(

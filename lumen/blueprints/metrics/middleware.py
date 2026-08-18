@@ -227,17 +227,28 @@ def reap_dead_workers():
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
+            # Mark it here, not in a second pass over `dead`. The gap between
+            # observing a pid as dead and removing its files is a window in
+            # which the supervisor can respawn a worker onto that same pid --
+            # pids are recycled, and a busy pod cycles through them. The new
+            # worker constructs its gauges (creating gauge_livesum_<pid>.db)
+            # and a later mark_process_dead would delete the *live* worker's
+            # files. It never recreates them: the mmap still points at the
+            # unlinked inode, so the worker writes happily to a file no
+            # MultiProcessCollector glob can see, and its queue-depth and
+            # thread gauges are invisible for the rest of the pod's life.
+            # Marking inline shrinks the window from "one listdir's worth of
+            # syscalls" to the width of a single call.
             dead.add(pid)
+            try:
+                mark_process_dead(pid, path)
+            except (FileNotFoundError, OSError):
+                # Another process reaped the same pid first; its files are
+                # gone, which is the outcome we wanted anyway.
+                pass
         except OSError:
             # EPERM means the pid exists but belongs to someone else — alive.
             continue
-    for pid in dead:
-        try:
-            mark_process_dead(pid, path)
-        except (FileNotFoundError, OSError):
-            # Another process reaped the same pid first; its files are gone,
-            # which is the outcome we wanted anyway.
-            pass
 
 
 # Label values must come from a bounded set. A scanner sending PROPFIND, TRACK,
