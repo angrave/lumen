@@ -264,7 +264,7 @@ order* — it decides *how*.** That removes the conditional-scheduling language 
 | G0.3 | **Timescale version + is `timescaledb_toolkit` installed?** `SELECT extname, extversion FROM pg_extension WHERE extname LIKE 'timescale%'`. **Decides**: exact `percentile_agg` p95 vs hand-rolled bucket counts; hierarchical continuous aggregates; and — newly — whether adding a column to a compressed hypertable is restricted, which sets how firmly compression must trail the schema work |
 | G0.4 | **Size and growth of `request_logs`** — `SELECT pg_size_pretty(pg_total_relation_size('request_logs')), count(*), min(time), max(time) FROM request_logs`. **Decides** the retention window and, more urgently, how long the entity-aggregate's **full-history backfill** will run, since it cannot happen inside the migration transaction |
 | G0.5 | **Does a Prometheus/Grafana stack scrape this cluster, at what interval?** **No longer decides ordering.** Still decides whether the ServiceMonitor needs the token work below, and what scrape interval the snapshot refresh should be tuned against |
-| **G0.6** | **Are the backends' `/metrics` reachable and unauthenticated from the Lumen pod, and what backends/versions are they?** **This one still blocks Phase 6, on safety grounds.** Only SGLang is positively detected today; vLLM is a fall-through indistinguishable from OpenAI, Azure, or any OpenAI-compatible proxy. Guessing "not-sglang ⇒ vllm" would send scrapes — possibly carrying the endpoint's API key — to arbitrary third-party hosts |
+| **G0.6** | **Are the backends' `/metrics` reachable, and what engines/versions are they?** **Weakened, not retired, by the `http_sd` design in §10.1.** Under `http_sd` Prometheus scrapes the backends and Lumen never sends the endpoint API key anywhere, so a misidentified backend costs a down-looking target rather than a leaked credential. What still gates: reachability *from Prometheus*, and positively knowing each endpoint's engine — today only SGLang is detected, and vLLM is a fall-through indistinguishable from OpenAI, Azure or any OpenAI-compatible proxy |
 
 **[GATE] G0.6 blocks Phase 6.** The rest are inputs to be written into this document as they arrive;
 they no longer hold work up.
@@ -893,30 +893,130 @@ provisioning task.
 ## 10. Phase 6 — upstream queue depth
 
 **[FACT]** From Lumen's side, "queued behind 40 sequences" and "the model is slow" are the same
-number. Only the backend can tell them apart. **[FACT]** `lumen/services/model_sync.py` already probes SGLang's
-`/get_server_info` at the server root by stripping `/v1`, and already detects the backend type — but
-**discards it**.
+number. Only the backend can tell them apart. **[FACT]** `lumen/services/model_sync.py` already probes
+SGLang's `/get_server_info` at the server root by stripping `/v1`, and already detects the backend
+type — but **discards it**.
 
-- Persist the detected `backend` type and the concurrency capacity (`--max-num-seqs` or the SGLang
-  equivalent) on `model_endpoints`, so depth has a denominator.
-- Background scraper per endpoint, modelled on `lumen/services/health.py` (bounded executor, hard deadline,
-  best-effort), parsing a **configured allowlist** of gauge names per backend type into the Phase 4
-  snapshot. Metric names are a moving target across vLLM versions — configuration, never constants,
-  and an unknown name degrades to "unknown", never to a crash or a silently wrong gauge.
-- Add health-probe **latency** to `lumen/services/health.py`, which currently records only a boolean — a backend
-  whose probe latency has quadrupled is degrading before it flips unhealthy.
-- Optionally also let Prometheus scrape the backends directly (a second ServiceMonitor). Free, and
-  complementary: Grafana gets full resolution, Lumen gets the joinable in-app number.
+### 10.1 Primary mechanism: Lumen tells Prometheus what to scrape (`http_sd`)
 
-**Tests:** allowlist parse against captured fixture payloads from both backend types; unknown metric
-name ⇒ gauge absent and one warning, not an exception; scraper failure ⇒ stale-but-labelled values;
-scraper thread releases its DB session (`tests/unit/test_db_teardown.py`).
+**[DECISION] Adopt Prometheus HTTP service discovery, with Lumen as the discovery source.** This
+supersedes both options the proposal weighed. Credit where due: it came from the project's senior
+developer, unprompted and with no knowledge of this design — which is worth noting, because it
+independently reached the same safety conclusion as this plan's own review (§16 round 3, F9) by a
+much cheaper route.
 
-**[GATE] Phase 6 exit** — saturating a real backend beyond `max_num_seqs` shows a non-zero waiting
-gauge in Lumen that tracks the backend's own within one scrape interval. **[GATE] G0-adjacent:**
-confirm backend `/metrics` is reachable and unauthenticated from the Lumen pod before writing the
-scraper — vLLM's `--api-key` guards `/v1` but historically not `/metrics`, and network policy may
-still block it.
+Lumen already knows every backend: they are rows in `model_endpoints`. So instead of Lumen polling
+the backends, or an operator hand-maintaining scrape config, Lumen publishes a target list and
+Prometheus polls *that*:
+
+```yaml
+- job_name: backends
+  http_sd_configs:
+    - url: https://lumen/metrics/targets
+      refresh_interval: 60s
+      # Lumen's metrics auth is a BEARER token, not basic auth
+      # (lumen/blueprints/metrics/routes.py:_metrics_auth_required).
+      authorization:
+        credentials: <api.prometheus.token>
+  metrics_path: /metrics
+```
+
+returning `Content-Type: application/json`:
+
+```json
+[{"targets": ["spark0:8000"],
+  "labels": {"lumen_model": "ornith-1.0-35b", "engine": "vllm", "host": "spark0"}}]
+```
+
+Add a model to Lumen, and it appears in monitoring on the next poll — no Prometheus reload, no
+restart, no chart change.
+
+**Why this beats what the plan had.** The proposal's Option A (a ServiceMonitor on the model
+Deployments) only ever covered models the chart itself deploys; endpoints configured in `config.yaml`
+that live outside the cluster were structurally uncovered. `http_sd` covers every row in
+`model_endpoints` by construction.
+
+**And it removes the credential risk outright.** §16/F9's objection to Option B was that a Lumen-side
+scraper could send `Authorization: Bearer <endpoint api_key>` to a host that is not a model server.
+Under `http_sd`, **Prometheus** scrapes the backends and Lumen never sends the key anywhere. The
+worst outcome of a misidentified backend becomes a target that reads as down, not a leaked
+credential. This substantially de-risks **G0.6**, though it does not retire it: whether backend
+`/metrics` is reachable *from Prometheus* still has to be true.
+
+**Three things to get right.**
+
+1. **Emit only positively identified engines** — `engine in ("vllm", "sglang")`. Hosted providers
+   (OpenAI, Anthropic, Azure, another Lumen) expose no `/metrics` and would sit in the target list as
+   permanently-down, indistinguishable from a crashed model. This is the same "positive evidence
+   only, never a fall-through" rule F9 arrived at, and it requires the `backend` column below.
+2. **Name the label `lumen_model`, never `model_name`.** vLLM emits its own `model_name` label; on a
+   collision Prometheus renames the scraped one to `exported_model_name`, which silently breaks every
+   join. Keeping both also makes it visible when the served name and Lumen's alias have drifted.
+3. **Emit only backends that have been healthy at least once.** A brand-new endpoint with a typo'd
+   URL otherwise appears as a down target, identical to a backend that crashed.
+   **[DECISION] This needs a new column** — `first_healthy_at` (nullable timestamp, set once by the
+   health checker). Filtering on `last_checked_at IS NOT NULL` is wrong: a misconfigured endpoint is
+   still *checked*, it just always fails. And filtering on `healthy = true` is worse — it would drop
+   a crashed backend out of service discovery and destroy the `up == 0` alert, which is the signal
+   you actually want.
+
+**Route:** `GET /metrics/targets`, behind the existing `_metrics_auth_required`. It exposes internal
+hostnames and ports to anyone holding the metrics token, which is acceptable at that trust level —
+but it must never include `api_key`, and a test should assert that.
+
+### 10.2 Secondary, and only if the in-app surface needs it
+
+**Correction to the proposal's reasoning.** It recommended "Lumen polls the backends" as *primary*,
+on the grounds that Grafana cannot answer "how many distinct users were waiting for model X at 09:05"
+because it does not know who the users are. That argument does not survive contact with the design:
+user identity comes from `request_logs` (§7), and the backend gauges carry no user identity in either
+architecture. The join was never between "backend depth" and "user" — it is between
+`request_logs.started_at` and time.
+
+What Lumen-side polling still genuinely buys is narrower, and worth doing only if these are wanted:
+
+- **`/admin/status` without a Prometheus dependency** — which matters exactly when G0.5 says no
+  Prometheus stack exists (§11).
+- **Historical upstream depth in Lumen's own database**, joinable to `request_logs` in SQL.
+
+If built, it is the background scraper as previously specified: modelled on `lumen/services/health.py`
+(bounded executor, hard deadline, best-effort), parsing a **configured allowlist** of gauge names per
+backend type into the Phase 4 snapshot — names are a moving target across vLLM versions, so
+configuration, never constants, and an unknown name degrades to "unknown" rather than to a crash or a
+silently wrong gauge. Note it re-acquires the credential risk that `http_sd` avoids, so it must not
+send the endpoint API key to a `/metrics` path.
+
+### 10.3 Supporting work, either way
+
+- Persist the detected `backend` type and the concurrency capacity (`--max-num-seqs`, or the SGLang
+  equivalent) on `model_endpoints`, so depth has a denominator. **[FACT]** vLLM's `/metrics` exposes
+  `num_requests_running`/`num_requests_waiting` but **no capacity gauge**, so for the most likely
+  backend the denominator must be operator-configured — with `model_sync` never overwriting a
+  manually set value.
+- Add `first_healthy_at`, set once by the health checker (§10.1 item 3).
+- Add health-probe **latency** to `lumen/services/health.py`, which records only a boolean today. A
+  backend whose probe latency has quadrupled is degrading before it flips unhealthy.
+- The Lumen-self ServiceMonitor added in Phase 1 stays; it is orthogonal. `http_sd` removes the need
+  for a *second* ServiceMonitor on the model Deployments.
+
+### Tests
+
+- `/metrics/targets` requires the token; returns valid `http_sd` JSON; **never contains any
+  `api_key`** (assert against the raw body).
+- Hosted-provider endpoints are excluded; only `vllm`/`sglang` appear.
+- An endpoint that has never been healthy is excluded; one that *was* healthy and is now down is
+  **included** (so `up == 0` still fires).
+- The label is `lumen_model`, and `model_name` appears nowhere in the emitted labels.
+- URL → target derivation strips `/v1` and yields `host:port`, including for a URL with a path prefix.
+- If the Lumen-side scraper is built: allowlist parse against captured fixtures from both engines;
+  unknown metric name ⇒ gauge absent plus one warning, not an exception; scraper thread releases its
+  DB session (`tests/unit/test_db_teardown.py`).
+
+**[GATE] Phase 6 exit** — a model added to Lumen appears as a live Prometheus target within one
+`refresh_interval`, with no Prometheus restart; and saturating a real backend beyond its
+`max_num_seqs` moves `num_requests_waiting` for that target. **[GATE] G0.6 still applies**, now in its
+weaker form: backend `/metrics` must be reachable *from Prometheus*, and the engine of each endpoint
+must be positively known rather than inferred.
 
 ---
 
