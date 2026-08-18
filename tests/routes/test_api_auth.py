@@ -1,5 +1,6 @@
 """Tests for the /v1 API key authentication decorator (api_key_required)."""
 from http import HTTPStatus
+
 import pytest
 
 
@@ -375,6 +376,7 @@ def test_chat_completions_graylist_with_consent_passes_access(
     token, _ = api_key
     with app.app_context():
         from datetime import datetime, timezone
+
         from lumen.extensions import db
         from lumen.models.entity_model_access import EntityModelAccess
         from lumen.models.entity_model_consent import EntityModelConsent
@@ -646,6 +648,7 @@ def test_chat_completions_upstream_4xx_passes_through(
     """A 4xx from the upstream (e.g. context-length exceeded) is the caller's
     mistake: surface the real status and message, not a generic 500 retry."""
     import openai
+
     from lumen.blueprints.api import routes
     token, _ = api_key
     with app.app_context():
@@ -688,6 +691,7 @@ def test_chat_completions_upstream_5xx_is_generic_500(
 ):
     """A genuine upstream/transport failure stays a generic 500 retry message."""
     import openai
+
     from lumen.blueprints.api import routes
     token, _ = api_key
     with app.app_context():
@@ -828,8 +832,9 @@ def test_chat_completions_streaming_records_duration(
     assert "data: [DONE]" in body
 
     with app.app_context():
-        from lumen.extensions import db
         from sqlalchemy import select
+
+        from lumen.extensions import db
         from lumen.models.request_log import RequestLog
         log = db.session.execute(select(RequestLog)).scalar_one()
         assert log.source == "api"
@@ -1018,6 +1023,7 @@ def test_streaming_abort_closes_upstream_before_logging(
 
     with app.app_context():
         from sqlalchemy import select
+
         from lumen.extensions import db
         from lumen.models.request_log import RequestLog
         logs = db.session.execute(
@@ -1055,14 +1061,16 @@ def test_streaming_disconnect_bills_estimated_usage(
     before the terminal chunk, and pay nothing — repeatably.
     """
     import threading
+
+    from sqlalchemy import select
+
     from lumen.blueprints.api import routes
+    from lumen.extensions import db
     from lumen.models.api_key import APIKey
     from lumen.models.entity_balance import EntityBalance
     from lumen.models.entity_limit import EntityLimit
     from lumen.models.entity_model_access import EntityModelAccess
     from lumen.models.request_log import RequestLog
-    from sqlalchemy import select
-    from lumen.extensions import db
 
     token, key_id = api_key
     with app.app_context():
@@ -1196,6 +1204,7 @@ def test_non_streaming_chat_client_is_bounded(
     """connect and read bounded separately; retries allowed — this attempt is
     finished and nothing has been sent to the client yet."""
     import openai
+
     from lumen.blueprints.api import routes
     token, _ = api_key
     _allow_model(app, test_user, test_model)
@@ -1236,6 +1245,7 @@ def test_streaming_chat_client_is_bounded_and_never_retries(
     still be draining upstream — two backend generations for one client request,
     with chunks already sent that cannot be un-sent."""
     import openai
+
     from lumen.blueprints.api import routes
     token, _ = api_key
     _allow_model(app, test_user, test_model)
@@ -1283,7 +1293,9 @@ def test_audio_client_is_bounded(
     fresh_rate_limit,
 ):
     from io import BytesIO
+
     import openai
+
     from lumen.blueprints.api import routes
     token, _ = api_key
     _allow_model(app, test_user, test_model)
@@ -1325,6 +1337,7 @@ def test_api_stream_disconnect_increments_the_abort_counter(
     fresh_rate_limit,
 ):
     import threading
+
     from lumen.blueprints.api import routes
     token, _ = api_key
     _allow_model(app, test_user, test_model)

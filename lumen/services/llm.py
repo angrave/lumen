@@ -5,17 +5,38 @@ from datetime import datetime, timezone
 from http import HTTPStatus
 from typing import NamedTuple
 
+import openai
+from flask import current_app
+from sqlalchemy import select
+from sqlalchemy import update as sa_update
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.sql.expression import FunctionElement
+
+from lumen.blueprints.metrics.middleware import observe_stream_abort
+from lumen.extensions import db
+from lumen.models.entity import Entity
+from lumen.models.entity_balance import EntityBalance
+from lumen.models.entity_limit import EntityLimit
+from lumen.models.entity_model_access import EntityModelAccess
+from lumen.models.entity_model_consent import EntityModelConsent
+from lumen.models.entity_stat import EntityStat
+from lumen.models.group import Group
+from lumen.models.group_limit import GroupLimit
+from lumen.models.group_member import GroupMember
+from lumen.models.group_model_access import GroupModelAccess
+from lumen.models.model_config import ModelConfig
+from lumen.models.model_endpoint import ModelEndpoint
+from lumen.models.model_stat import ModelStat
+from lumen.models.request_log import RequestLog
+from lumen.services.crypto import cache_salt_for_entity
+from lumen.services.wsgi_disconnect import client_disconnect_event
+from lumen.timeutils import utcnow
+
 logger = logging.getLogger(__name__)
 
 # Sentinel for "argument not supplied" so callers can pass an explicit None.
 _UNSET = object()
-
-import openai
-from flask import current_app
-from sqlalchemy import select, update as sa_update
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.compiler import compiles
-from sqlalchemy.sql.expression import FunctionElement
 
 
 class _greatest(FunctionElement):
@@ -48,26 +69,6 @@ def _least_default(element, compiler, **kw):
 @compiles(_least, "sqlite")
 def _least_sqlite(element, compiler, **kw):
     return "min(%s)" % compiler.process(element.clauses, **kw)
-
-from lumen.extensions import db
-from lumen.timeutils import utcnow
-from lumen.models.entity_balance import EntityBalance
-from lumen.models.entity_limit import EntityLimit
-from lumen.models.entity_model_access import EntityModelAccess
-from lumen.models.entity_model_consent import EntityModelConsent
-from lumen.models.model_config import ModelConfig
-from lumen.models.model_endpoint import ModelEndpoint
-from lumen.models.entity_stat import EntityStat
-from lumen.models.model_stat import ModelStat
-from lumen.models.request_log import RequestLog
-from lumen.models.group import Group
-from lumen.models.group_member import GroupMember
-from lumen.models.group_limit import GroupLimit
-from lumen.models.group_model_access import GroupModelAccess
-from lumen.services.crypto import cache_salt_for_entity
-from lumen.services.wsgi_disconnect import client_disconnect_event
-from lumen.blueprints.metrics.middleware import observe_stream_abort
-from lumen.models.entity import Entity
 
 
 def upstream_call_bounds(*, streaming: bool):

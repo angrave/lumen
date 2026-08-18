@@ -1,10 +1,9 @@
 """Additional LLM service tests: groups, endpoints, coin functions, stats."""
-from datetime import datetime
 from http import HTTPStatus
 from unittest.mock import MagicMock, patch
-from sqlalchemy import func, select
 
 import pytest
+from sqlalchemy import func, select
 
 # Named test values — written as expressions so the static analyser
 # does not flag bare 3-digit literals on these definition lines.
@@ -1001,6 +1000,7 @@ def test_chat_stream_retries_stay_zero_even_when_config_allows_them(
 def test_upstream_call_bounds_falls_back_to_defaults(app, monkeypatch):
     """Works standalone if the config keys are ever absent."""
     import openai
+
     from lumen.services.llm import upstream_call_bounds
     with app.app_context():
         for key in ("LLM_CONNECT_TIMEOUT", "LLM_READ_TIMEOUT",
