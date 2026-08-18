@@ -1763,7 +1763,7 @@ effort causes a user-visible regression.
 6. Lifetime totals survive retention because `entity_stats`/`model_stats` are cumulative and written
    synchronously. **Say so in the UI** next to any truncated chart.
 7. Policies live in a dialect-guarded Alembic migration, not in hot-reloaded config. DDL from a config
-   watcher is a bad idea.
+   watcher is a bad idea. **[AMENDED — retention is the exception, see (j)]**
 
 **Tests** (all `@pytest.mark.postgres`): per-entity `/usage` queries return identical results before
 and after being rewritten onto the new aggregate; a **retention-drop simulation** — seed rows older
@@ -1916,6 +1916,28 @@ older than the window, drop the chunks, assert per-user charts still render from
 `entity_stats` totals are unchanged; the heatmap returns 24 distinct hours from the aggregate (the
 guard for (b)); compression round-trip leaves query results identical; the 1-minute aggregate is
 within one bucket of the raw table for a synthetic burst.
+
+**(j) [AMENDMENT] Retention is an operator command, not a migration — the [GATE] is otherwise
+unenforceable by construction.**
+Item 7 above puts the lifecycle policies in an Alembic migration. That is right for compression and
+wrong for retention, and the reason is mechanical rather than stylistic. **[FACT]** `entrypoint.sh:8`
+runs `flask db upgrade` at container start. A migration calling `add_retention_policy` therefore
+takes effect on the next deploy, unattended — which means the `[GATE]` at the end of this section
+("retention is enabled **only after** a dry run on a copy of production demonstrates no per-user
+chart changes") can never actually gate anything: the policy is already live before a human is in a
+position to look. A gate that the deploy path walks straight through is worse than no gate, because
+the document claims a safeguard that does not exist.
+
+Compression stays a migration: it destroys nothing, it is reversible, and 2.27.2 accepts `ADD COLUMN`
+on compressed chunks (§4.1), so it forecloses nothing either.
+
+**[DECISION]** retention is enabled by `flask enable-retention`, which **defaults to `--dry-run`**
+and prints what it would drop — row count, time range, each aggregate's earliest bucket, and whether
+that bucket falls outside the aggregate's `start_offset`. Only `--force` calls
+`add_retention_policy`. It refuses outright while `request_counts_hourly_by_entity` is empty, since
+retention then destroys history that exists in no aggregate — the precise failure (a) is built to
+prevent, arrived at from the other direction. This pairs with the (d) guard on the backfill command:
+the two commands are the only ways to lose history, and each now refuses the losing move by default.
 
 **(i) The rewrite must preserve the SQLite early-return.** All five per-entity endpoints
 short-circuit today on `dialect.name != "postgresql"`, and the rewrite must keep doing so — a
