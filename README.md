@@ -196,10 +196,23 @@ flask enable-retention [--window '13 months'] [--dry-run|--force]
 Retention is a command and not a migration on purpose: `entrypoint.sh` runs `flask db upgrade` at
 container start, so a migration would begin deleting data on the next deploy. The dry run prints the
 window, how many `request_logs` rows are already older than it, and each aggregate's earliest bucket
-against its refresh `start_offset`. The command refuses to enable retention while
-`request_counts_hourly_by_entity` is empty — dropping raw chunks then destroys per-entity history
-that exists in no aggregate. Lifetime totals in `entity_stats`/`model_stats` are cumulative and
-survive retention regardless.
+against its refresh `start_offset` — warning where a `start_offset` is *wider* than the retention
+window, since a scheduled refresh reaching into dropped chunks erases what it recomputes.
+
+The command refuses to enable retention unless `request_counts_hourly_by_entity` **covers all the
+raw history that still exists** — its earliest materialised bucket at or before the oldest surviving
+`request_logs` row, the same test the per-entity charts apply before they will read the aggregate at
+all. "Not empty" is not enough: the aggregate is created `WITH NO DATA` but refreshes its last 30
+days every hour, so ordinary traffic fills that window within an hour of deploy while the history
+retention is about to delete has never been materialised. The refusal prints both timestamps it
+compared and the `flask backfill-aggregate --from YYYY-MM` that fixes it.
+
+`--window` only ever applies to a policy this command creates. If `request_logs` already has a
+retention policy the command changes nothing and says so, including that the window you asked for
+was not applied; changing an existing window needs
+`SELECT remove_retention_policy('request_logs')` first.
+
+Lifetime totals in `entity_stats`/`model_stats` are cumulative and survive retention regardless.
 
 ---
 
