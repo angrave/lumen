@@ -135,14 +135,16 @@ spec:
             - name: http
               containerPort: 5001
               protocol: TCP
+          # Covers `flask db upgrade` as well as uvicorn startup: entrypoint.sh
+          # migrates inline before uvicorn binds. See values.yaml.
           startupProbe:
             httpGet:
               path: /healthz
               port: http
-            initialDelaySeconds: 10
-            periodSeconds: 5
-            failureThreshold: 12
-            timeoutSeconds: 5
+            initialDelaySeconds: {{ .Values.startupProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.startupProbe.periodSeconds }}
+            failureThreshold: {{ .Values.startupProbe.failureThreshold }}
+            timeoutSeconds: {{ .Values.startupProbe.timeoutSeconds }}
           livenessProbe:
             httpGet:
               path: /healthz
