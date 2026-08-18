@@ -259,15 +259,86 @@ order* — it decides *how*.** That removes the conditional-scheduling language 
 |---|---|---|---|
 | # | Still gates what, now that everything ships |
 |---|---|
-| G0.1 | **Production topology** — replicas, `--workers`/`WEB_CONCURRENCY`, `LUMEN_WSGI_WORKERS`. Via `kubectl get deploy -o yaml`, or `GET /metrics/debug`, which already prints workers × replicas and the live `WSGI_*` thread count. **Decides what we test against**: at 1×1 the multi-process paths (dead-PID reaping, `livesum` aggregation, flock election) are never exercised in production, so their only coverage is the test suite — which raises the bar on the Phase 1 tests rather than lowering it |
+| G0.1 | **[INDIRECT EVIDENCE — §4.1]** **Production topology** — replicas, `--workers`/`WEB_CONCURRENCY`, `LUMEN_WSGI_WORKERS`. Via `kubectl get deploy -o yaml`, or `GET /metrics/debug`, which already prints workers × replicas and the live `WSGI_*` thread count. **Decides what we test against**: at 1×1 the multi-process paths (dead-PID reaping, `livesum` aggregation, flock election) are never exercised in production, so their only coverage is the test suite — which raises the bar on the Phase 1 tests rather than lowering it |
 | G0.2 | **Is Redis deployed?** `redis.enabled`, or an external `redis.url` / `rate_limiting.storage_url`. **Decides whether Phase 5 also carries a provisioning task**, and whether its fail-open path is the normal case or the exception |
 | G0.3 | **Timescale version + is `timescaledb_toolkit` installed?** `SELECT extname, extversion FROM pg_extension WHERE extname LIKE 'timescale%'`. **Decides**: exact `percentile_agg` p95 vs hand-rolled bucket counts; hierarchical continuous aggregates; and — newly — whether adding a column to a compressed hypertable is restricted, which sets how firmly compression must trail the schema work |
 | G0.4 | **Size and growth of `request_logs`** — `SELECT pg_size_pretty(pg_total_relation_size('request_logs')), count(*), min(time), max(time) FROM request_logs`. **Decides** the retention window and, more urgently, how long the entity-aggregate's **full-history backfill** will run, since it cannot happen inside the migration transaction |
-| G0.5 | **Does a Prometheus/Grafana stack scrape this cluster, at what interval?** **No longer decides ordering.** Still decides whether the ServiceMonitor needs the token work below, and what scrape interval the snapshot refresh should be tuned against |
+| G0.5 | **[PARTLY ANSWERED — §4.1: yes, `/metrics` is enabled with a token]** **Does a Prometheus/Grafana stack scrape this cluster, at what interval?** **No longer decides ordering.** Still decides whether the ServiceMonitor needs the token work below, and what scrape interval the snapshot refresh should be tuned against |
 | **G0.6** | **Are the backends' `/metrics` reachable, and what engines/versions are they?** **Weakened, not retired, by the `http_sd` design in §10.1.** Under `http_sd` Prometheus scrapes the backends and Lumen never sends the endpoint API key anywhere, so a misidentified backend costs a down-looking target rather than a leaked credential. What still gates: reachability *from Prometheus*, and positively knowing each endpoint's engine — today only SGLang is detected, and vLLM is a fall-through indistinguishable from OpenAI, Azure or any OpenAI-compatible proxy |
 
 **[GATE] G0.6 blocks Phase 6.** The rest are inputs to be written into this document as they arrive;
 they no longer hold work up.
+
+### 4.1 Answers received
+
+**2026-08-18 — production has Prometheus enabled.** Reported from a production config file
+(`lumen.yaml`) whose `api:` block reads:
+
+```yaml
+api:
+  consent: false
+  monitoring:
+    token: <redacted>
+  prometheus:
+    enabled: true
+    token: <redacted>
+```
+
+**What this settles.**
+
+- **G0.5 is half-answered.** `api.prometheus.enabled: true` with a token set means `/metrics` is
+  served and *something* is scraping it — nobody sets a scrape token for an endpoint nobody scrapes.
+  Still open: **what** scrapes it (Prometheus Operator vs. a static `scrape_config`), at what
+  interval, and whether Grafana sits in front. That remainder is what decides the ServiceMonitor
+  token work and the snapshot refresh interval, so G0.5 stays open — but the existence question
+  behind it is answered *yes*.
+- **The HTTP metrics middleware is installed in production.** This is the one that matters most for
+  work already merged. Per §2.3 of the LESSONSLEARNED doc, `make_metrics_middleware` is only wrapped
+  when `api.prometheus.enabled` is true, and the chart default is `false` — so everything captured
+  inside that middleware (`lumen_wsgi_queue_depth`, `lumen_wsgi_queue_wait_seconds`,
+  `lumen_rejections_total`, the HTTP counters and histograms) is live in production, not dark. The
+  design rule that produced this still holds and is not relaxed: **nothing outside Prometheus may
+  depend on the middleware being installed**, because dev, tests and any operator who flips the flag
+  off must keep working.
+- **The T0 bridge is unconditional, and that remains the load-bearing fact.** `asgi.py` wraps the
+  app in `DisconnectAwareWSGIMiddleware` with no flag, and `create_app` registers
+  `_record_queue_wait` / `_stash_url_rule` outside the `if prom_cfg.get("enabled")` block. So
+  `started_at`, `queue_wait`, `send_blocked` and the `disconnect` outcome are populated on the
+  `request_logs` row regardless of this setting. Production having Prometheus on is a bonus, not a
+  precondition.
+
+**What this does *not* settle.**
+
+- **G0.6 is untouched.** It asks about the *model backends'* `/metrics` (vLLM / SGLang
+  `num_requests_waiting`), not Lumen's own. Lumen exporting metrics says nothing about whether
+  Prometheus can reach a backend, nor which engine any endpoint runs. **[GATE] G0.6 still blocks
+  Phase 6.**
+- **`multiproc_dir` is absent from the reported block**, and the chart only renders that key when
+  `api.prometheus.multiprocDir` is non-empty. Two readings, and they differ materially:
+  1. Production runs one WSGI process per pod (`wsgiProcesses: 1`), in which case single-process
+     mode is correct and the Phase 1 multi-process paths are exercised only by the test suite —
+     the G0.1 answer, arrived at sideways.
+  2. Production runs more than one and `multiproc_dir` was never set, in which case **`/metrics` is
+     already wrong today**: each worker keeps its own in-memory registry and a scrape returns
+     whichever worker answered, so counters appear to jump backwards at random.
+  Reading 2 is a live production defect independent of this plan. Distinguish with
+  `GET /metrics/debug`, which prints workers × replicas — one request settles it.
+- **`consent: false`** is unrelated to metrics (it exempts API requests from the graylist
+  model-consent requirement) and is recorded here only because it arrived in the same block.
+
+**Which file is `lumen.yaml`.** The repo has no file by that name; the `api:` block above is
+**schema-identical** in the two candidates, so the name alone cannot decide it. Discriminate by what
+sits beside `api:` at the top level:
+
+- `image:`, `replicaCount:`, `ingress:`, `serviceMonitor:` → it is a **Helm values override**, fed to
+  `helm -f lumen.yaml`. `chart/templates/config-secret.yaml` then renders it into the app's
+  `config.yaml` inside a Secret. Note the case shift on the one key that differs: values use
+  `multiprocDir`, the rendered config uses `multiproc_dir`.
+- `app:`, `llm:`, `models:`, `rate_limiting:` → it is **the app's `config.yaml` itself**, mounted
+  directly and read by `create_app` via `CONFIG_YAML`.
+
+Either way the read site is the same: `lumen/__init__.py:119` for the middleware decision and
+`lumen/blueprints/metrics/routes.py:33` for the endpoint's auth.
 
 ---
 
