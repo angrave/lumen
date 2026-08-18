@@ -377,7 +377,7 @@ def _complete_and_bill(model_name: str, messages: list, **kwargs):
     db.session.remove()  # return connection to pool before the LLM call
 
     try:
-        t0 = _time.time()
+        t0 = _time.monotonic()
         # Non-streaming, so the read timeout bounds the wait for the *entire*
         # response body rather than the gap between chunks — a generation that
         # legitimately runs longer than LLM_READ_TIMEOUT is cut off here.
@@ -386,7 +386,7 @@ def _complete_and_bill(model_name: str, messages: list, **kwargs):
         with openai.OpenAI(api_key=ep_api_key, base_url=ep_url,
                            timeout=timeout, max_retries=max_retries) as client:
             response = client.chat.completions.create(model=remote_model, messages=messages, **kwargs)
-        duration = _time.time() - t0
+        duration = _time.monotonic() - t0
     except Exception as exc:
         return None, _err(*_classify_upstream_error(
             exc, f"upstream LLM error (endpoint={ep_id} {ep_url} model={remote_model})"))
@@ -471,7 +471,7 @@ def _do_chat(model_name: str, messages: list, stream: bool, **kwargs):
         phase = "upstream"
         usage = None
         content_deltas = 0
-        t0 = _time.time()
+        t0 = _time.monotonic()
 
         def _abort():
             """Bill and log what this stream consumed before the client went away.
@@ -484,7 +484,7 @@ def _do_chat(model_name: str, messages: list, stream: bool, **kwargs):
                 usage, messages, content_deltas, mc_in_cost, mc_out_cost)
             record_stream_abort(
                 app, billed=billed, entity_id=entity_id, model_config_id=mc_id,
-                source="api", endpoint_id=ep_id, started_at=t0,
+                source="api", endpoint_id=ep_id, stream_t0=t0,
                 input_tokens=input_tokens, output_tokens=output_tokens, cost=cost,
                 effective=effective,
                 record_extra=lambda: _record_api_key_usage(ak_id, input_tokens, output_tokens, cost),
@@ -532,7 +532,7 @@ def _do_chat(model_name: str, messages: list, stream: bool, **kwargs):
                         content_deltas += 1
                     yield f"data: {json.dumps(chunk.model_dump())}\n\n"
                 if not aborted:
-                    duration = _time.time() - t0
+                    duration = _time.monotonic() - t0
                     if usage is not None:
                         cost = round(
                             usage.prompt_tokens * mc_in_cost / 1_000_000
@@ -650,7 +650,7 @@ def _do_audio(kind: str):
     db.session.remove()
 
     try:
-        t0 = _time.time()
+        t0 = _time.monotonic()
         # Non-streaming: the read timeout bounds the whole transcription, and
         # the write timeout the upload of the audio file. A long recording can
         # legitimately exceed LLM_READ_TIMEOUT — raise it if that bites.
@@ -658,7 +658,7 @@ def _do_audio(kind: str):
                            timeout=timeout, max_retries=max_retries) as client:
             create = getattr(client.audio, kind).create
             response = create(model=remote_model, file=(file_name, file_data, file_type), **extra)
-        duration = _time.time() - t0
+        duration = _time.monotonic() - t0
     except Exception as exc:
         return _err(*_classify_upstream_error(
             exc, f"upstream audio error (endpoint={ep_id} {ep_url} model={remote_model})"))

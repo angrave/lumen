@@ -8,11 +8,16 @@ from flask.globals import _cv_app
 
 # Use the default registry (no registry= kwarg) so prometheus_client's multiprocess
 # mode is automatically engaged when PROMETHEUS_MULTIPROC_DIR is set.
-from prometheus_client import Counter, Histogram
+from prometheus_client import Counter, Gauge, Histogram
 from prometheus_client.multiprocess import mark_process_dead
 
 from lumen.extensions import db
 from lumen.services.ctx_probe import describe_push, record_context_anomaly
+from lumen.services.wsgi_disconnect import (
+    configured_threads_total,
+    current_queue_depth,
+    current_threads_busy,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +66,100 @@ _stream_aborts = Counter(
     "Streaming LLM responses that ended before the client had the whole reply",
     ["source", "reason"],
 )
+
+# The WSGI thread pool's queue, sampled once per request rather than exposed by
+# a custom Collector. Both halves of that choice are forced by how /metrics is
+# actually served under PROMETHEUS_MULTIPROC_DIR (see routes.py): the scrape
+# discards the default registry and builds a fresh one holding nothing but a
+# MultiProcessCollector, which reads the mmap files and only the mmap files. A
+# Collector registered here would therefore be invisible in exactly the
+# deployment these numbers exist for — and even registered on the scrape's own
+# registry it could report only the *scraping* process's counters, one worker's
+# share of a number that is supposed to describe the fleet.
+#
+# So the value has to reach a per-process mmap file, which means .set() on a
+# Gauge, which means the process must be running code in order to write one. The
+# only code every request runs is this middleware, so it samples the accessors
+# there. ``livesum`` is the mode that makes the merge a fleet total and drops a
+# dead worker's last value; see the invariant note above. Cost is three mmap
+# writes per request, against a request that is about to do a DB round trip.
+#
+# The honest limits of sampling, since a process only writes while it is serving
+# a request:
+#   * An idle worker's file keeps whatever its last request saw. Depth settles at
+#     0 on its own — the last request of a burst is by definition the last one
+#     out of the queue, so it samples an empty queue — but threads_busy settles
+#     at 1, because the responder counts the sampling request itself as running.
+#     A fleet at rest therefore reads one busy thread per worker that has served
+#     anything, and that floor is real, not a leak.
+#   * Sampling "busy minus me" would remove the floor at the price of
+#     under-reporting saturation by one per process during exactly the burst
+#     these gauges exist to show. The floor is the better error.
+_wsgi_queue_depth = Gauge(
+    "lumen_wsgi_queue_depth",
+    "Requests submitted to the WSGI thread pool that have not started running",
+    multiprocess_mode="livesum",
+)
+_wsgi_threads_busy = Gauge(
+    "lumen_wsgi_threads_busy",
+    "Requests currently executing on a WSGI worker thread",
+    multiprocess_mode="livesum",
+)
+_wsgi_threads_total = Gauge(
+    "lumen_wsgi_threads_total",
+    "WSGI worker threads the pool was configured with",
+    multiprocess_mode="livesum",
+)
+_wsgi_queue_wait = Histogram(
+    "lumen_wsgi_queue_wait_seconds",
+    "Seconds a request waited for a WSGI worker thread before it began running",
+    # No labels: this measures the pool, not the endpoint — a request queues
+    # behind whatever else the pool is holding, not behind its own route.
+    buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+             10.0, 30.0, 60.0),
+)
+_rejections = Counter(
+    "lumen_rejections_total",
+    "Requests refused before any generation was attempted",
+    ["reason", "source", "model"],
+)
+_db_pool_wait = Histogram(
+    "lumen_db_pool_wait_seconds",
+    "Seconds a caller waited to check a connection out of the SQLAlchemy pool",
+    # lumen_db_pool_connections already reports how full the pool is; it cannot
+    # distinguish "full" from "full AND requests are queued behind it", which is
+    # the difference between a pool that is sized right and one that is not.
+    buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+             10.0, 30.0, 60.0),
+)
+
+
+def _sample_wsgi_pool_gauges() -> None:
+    """Write this process's live WSGI-pool counters into its own mmap files."""
+    _wsgi_queue_depth.set(current_queue_depth())
+    _wsgi_threads_busy.set(current_threads_busy())
+    _wsgi_threads_total.set(configured_threads_total())
+
+
+def observe_rejection(reason: str, source: str, model: str = "") -> None:
+    """Count one request refused before any generation was attempted.
+
+    ``reason`` is one of ``rate_limit``, ``coin_budget``, ``no_access``,
+    ``needs_consent``, ``no_healthy_endpoint``, ``queue_shed``. ``source`` is the
+    request source as recorded in ``request_logs`` ("chat" or "api").
+
+    ``model`` is legitimately EMPTY for ``rate_limit`` (and for ``queue_shed``):
+    the limiter runs before the request body has been parsed, so at that point
+    nothing in the process knows which model was asked for. Reporting "" says
+    that honestly rather than inventing a value that would make the per-model
+    breakdown quietly wrong.
+    """
+    _rejections.labels(reason=reason, source=source, model=model).inc()
+
+
+def observe_pool_wait(seconds: float) -> None:
+    """Record one wait for a connection from the SQLAlchemy pool."""
+    _db_pool_wait.observe(seconds)
 
 
 def observe_stream_abort(source: str, reason: str) -> None:
@@ -231,6 +330,11 @@ def make_metrics_middleware(wsgi_app):
         method = environ.get("REQUEST_METHOD", "")
         label_method = _label_method(method)
         status_holder = ["500"]
+        # Sampled on the way IN, not in the finally below: /metrics is itself a
+        # request through this middleware, so sampling first is what lets the
+        # scraping worker report its own depth as of the scrape rather than as
+        # of whatever it last served.
+        _sample_wsgi_pool_gauges()
 
         def _start_response(status, headers, exc_info=None):
             status_holder[0] = status.split(" ", 1)[0]
@@ -312,6 +416,13 @@ def make_metrics_middleware(wsgi_app):
                 path_template=_label_path(environ),
                 status=status_holder[0],
             ).inc()
+            # Written by the before_request hook in create_app from the mark the
+            # ASGI bridge left in environ. Absent under the Flask test client and
+            # the Werkzeug dev server, where no thread pool queued anything —
+            # observing 0 there would report a queue that does not exist.
+            queue_wait = environ.get("lumen.queue_wait")
+            if queue_wait is not None:
+                _wsgi_queue_wait.observe(queue_wait)
 
     return middleware
 

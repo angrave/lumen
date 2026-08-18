@@ -652,7 +652,7 @@ def record_aborted_request(entity_id, model_config_id, source, endpoint_id=None,
         db.session.rollback()
 
 
-def record_stream_abort(app, *, billed, entity_id, model_config_id, source, endpoint_id, started_at,
+def record_stream_abort(app, *, billed, entity_id, model_config_id, source, endpoint_id, stream_t0,
                         input_tokens=0, output_tokens=0, cost=0.0, effective=_UNSET, record_extra=None,
                         reason="disconnect"):
     """Abort accounting for a streaming generator that ends before billing.
@@ -684,7 +684,7 @@ def record_stream_abort(app, *, billed, entity_id, model_config_id, source, endp
         with app.app_context():
             record_aborted_request(
                 entity_id, model_config_id, source,
-                endpoint_id=endpoint_id, duration=time.time() - started_at,
+                endpoint_id=endpoint_id, duration=time.monotonic() - stream_t0,
                 input_tokens=input_tokens, output_tokens=output_tokens, cost=cost,
                 effective=effective, record_extra=record_extra,
             )
@@ -750,7 +750,7 @@ def _send_message_stream(app, messages, model, entity_id, source, effective, dis
         # context has exited, where current_app does not exist.
         timeout, max_retries = upstream_call_bounds(streaming=True)
 
-    t0 = time.time()
+    t0 = time.monotonic()
     t_first = None
     parts = []
     usage = None
@@ -770,7 +770,7 @@ def _send_message_stream(app, messages, model, entity_id, source, effective, dis
             usage, messages, len(parts), mc_in_cost, mc_out_cost)
         record_stream_abort(
             app, billed=billed, entity_id=entity_id, model_config_id=mc_id,
-            source=source, endpoint_id=ep_id, started_at=t0,
+            source=source, endpoint_id=ep_id, stream_t0=t0,
             input_tokens=input_tokens, output_tokens=output_tokens, cost=cost,
             effective=effective,
         )
@@ -817,7 +817,7 @@ def _send_message_stream(app, messages, model, entity_id, source, effective, dis
                     if delta.content:
                         text = delta.content
                         if t_first is None:
-                            t_first = time.time() - t0
+                            t_first = time.monotonic() - t0
                         parts.append(text)
                         yield text, None, None
 
@@ -830,7 +830,7 @@ def _send_message_stream(app, messages, model, entity_id, source, effective, dis
             _abort()
             return
 
-        duration = time.time() - t0
+        duration = time.monotonic() - t0
         reply = "".join(parts)
         input_tokens = usage.prompt_tokens if usage else 0
         output_tokens = usage.completion_tokens if usage else 0

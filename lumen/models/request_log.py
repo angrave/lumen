@@ -74,3 +74,63 @@ class RequestLog(db.Model):
         nullable=False,
         comment="Client disconnected before the stream completed; token counts may be estimated",
     )
+    # --- Request timing -----------------------------------------------------
+    #
+    # `time` above is the COMPLETION timestamp (stamped after billing), and
+    # `duration` starts only after preflight. Neither can be walked backwards to
+    # the moment the request arrived: preflight and the billing commit are both
+    # unmeasured, and both are largest exactly during a burst, when the pool is
+    # contended. So arrival is stored outright rather than derived.
+    #
+    # started_at is TIMESTAMPTZ, deliberately unlike every other timestamp
+    # column in the codebase (which are naive UTC per CLAUDE.md). It exists to
+    # be compared and subtracted against `time` on the same row, and mixing
+    # naive with aware in that arithmetic is a Postgres footgun. It must be
+    # written with datetime.now(timezone.utc), NOT timeutils.utcnow(), which
+    # returns naive and would be silently reinterpreted against the session
+    # TimeZone.
+    started_at: Mapped[Optional[datetime]] = mapped_column(
+        db.DateTime(timezone=True),
+        nullable=True,
+        comment="UTC instant the request arrived at the ASGI bridge (T0). TIMESTAMPTZ to match `time` for same-row arithmetic; null for requests that did not pass through the bridge (dev server, test client) or predate this column",
+    )
+    queue_wait: Mapped[Optional[float]] = mapped_column(
+        db.Float,
+        nullable=True,
+        server_default="0",
+        comment="Seconds spent waiting for a WSGI worker thread (T1-T0). The queue Lumen itself owns, and the number that distinguishes 'we are under-provisioned' from 'the model is slow'",
+    )
+    preflight: Mapped[Optional[float]] = mapped_column(
+        db.Float,
+        nullable=True,
+        server_default="0",
+        comment="Seconds from worker pickup to the upstream call (T2-T1): auth, model lookup, coin budget, endpoint selection, DB pool checkout. NOTE: composition differs by path - on the audio path it is dominated by multipart upload parsing, and on the chat stream it spans two preflights",
+    )
+    ttft: Mapped[Optional[float]] = mapped_column(
+        db.Float,
+        nullable=True,
+        server_default="0",
+        comment="Seconds to the first upstream chunk of ANY kind, including reasoning deltas",
+    )
+    ttft_visible: Mapped[Optional[float]] = mapped_column(
+        db.Float,
+        nullable=True,
+        server_default="0",
+        comment="Seconds to the first visible content delta. On a reasoning model this trails ttft by the whole thinking phase, which is why both are stored: it separates 'the model was queued' from 'the model was thinking'",
+    )
+    send_blocked: Mapped[Optional[float]] = mapped_column(
+        db.Float,
+        nullable=True,
+        server_default="0",
+        comment="Seconds blocked handing response chunks to the server. A large share means a slow client, not a slow backend - duration conflates the two. 0 on non-streaming paths, where billing completes before the body is handed over and the value is unknowable",
+    )
+    # Only values the code can actually write. `billing_error` and
+    # `upstream_error` are deliberately absent: the row is created inside
+    # update_stats, which only flushes, so the commit that fails is the same one
+    # that would have persisted the row recording the failure. Add a value only
+    # together with the code that writes it.
+    outcome: Mapped[Optional[str]] = mapped_column(
+        db.String(16),
+        nullable=True,
+        comment="How the request ended: ok | disconnect. Null means the row predates this column - not 'unknown outcome'",
+    )

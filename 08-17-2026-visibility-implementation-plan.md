@@ -506,11 +506,24 @@ argument — the queue is per-process, and per-process queues sum.
    `lumen/services/config_watcher.py` for the pattern), mirrored into `chart/values.yaml` and
    `values.schema.json` per CLAUDE.md §5, documented as "must match whatever fronts Lumen". Do not
    derive it from `gateway.timeout`.
-7. **DB pool checkout-wait histogram.** `pool_tracker` already hooks SQLAlchemy's `checkout`/`checkin`
-   events, so the wait is a subtraction away. Today the pool is observable only as a *depth*, so
-   "the pool is full" and "the pool is full **and requests are queued behind it**" look identical.
-   This lands here rather than later because §13a.1's write-spike measurement depends on it — that
-   section referenced it as though it already existed.
+7. **DB pool checkout-wait histogram** — `lumen_db_pool_wait_seconds`. Today the pool is observable
+   only as a *depth*, so "the pool is full" and "the pool is full **and requests are queued behind
+   it**" look identical. §13a.1's write-spike measurement depends on this and referenced it as though
+   it already existed.
+
+   **[FACT] An earlier draft said `lumen/services/pool_tracker.py` "already hooks `checkout`/`checkin`,
+   so the wait is a subtraction away". That is wrong.** Verified against SQLAlchemy 2.0.52: the
+   complete `PoolEvents` set is `checkin, checkout, close, close_detached, connect, detach,
+   first_connect, invalidate, reset, soft_invalidate` — **there is no pre-checkout event**.
+   `checkout` fires *after* the connection has been acquired, so time blocked inside
+   `QueuePool._do_get` is not the difference between any two event timestamps; it is invisible to the
+   event API entirely.
+
+   **Corrected approach:** time the acquisition itself by subclassing the pool and wrapping
+   `_do_get`. That is a larger change than "a subtraction away", it touches a semi-private
+   SQLAlchemy method, and it therefore needs a test that fails loudly if that signature moves. Size
+   it accordingly. The metric and an `observe_pool_wait()` helper already exist in
+   `lumen/blueprints/metrics/middleware.py`, awaiting a call site.
 8. **Load-test harness:** split TTFT from total elapsed in `loadtesting/locustfile.py`, and add a
    step load shape (0 → N in seconds). A ramp does not reproduce a class start.
 

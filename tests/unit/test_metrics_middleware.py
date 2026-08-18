@@ -557,3 +557,256 @@ def test_queue_wait_is_absent_when_the_bridge_did_not_mark_the_request(app):
     environ = EnvironBuilder(path="/healthz").get_environ()
     app.wsgi_app(environ, lambda *a: None)
     assert "lumen.queue_wait" not in environ
+
+
+# ---------------------------------------------------------------------------
+# lumen_wsgi_queue_wait_seconds — the histogram fed from that environ key.
+# ---------------------------------------------------------------------------
+
+def _queue_wait_sample(suffix):
+    """A sample of the unlabelled queue-wait histogram, 0.0 before any observation."""
+    from prometheus_client import REGISTRY
+
+    return REGISTRY.get_sample_value(f"lumen_wsgi_queue_wait_seconds_{suffix}") or 0.0
+
+
+def test_queue_wait_is_observed_when_the_environ_key_is_present():
+    import pytest
+
+    from lumen.blueprints.metrics.middleware import make_metrics_middleware
+
+    def queued_app(environ, start_response):
+        environ["lumen.queue_wait"] = 0.75  # what the before_request hook writes
+        start_response("200 OK", [])
+        return [b"ok"]
+
+    before_count = _queue_wait_sample("count")
+    before_sum = _queue_wait_sample("sum")
+    _drive(make_metrics_middleware(queued_app), _fake_environ("/v1/models", "POST"))
+
+    assert _queue_wait_sample("count") - before_count == 1
+    assert _queue_wait_sample("sum") - before_sum == pytest.approx(0.75)
+
+
+def test_queue_wait_is_not_observed_when_the_environ_key_is_absent():
+    """Under the Flask test client and the Werkzeug dev server nothing queued.
+
+    Observing 0.0 there would fill the histogram with a queue that does not
+    exist and drag every percentile towards zero.
+    """
+    from lumen.blueprints.metrics.middleware import make_metrics_middleware
+
+    before = _queue_wait_sample("count")
+    _drive(make_metrics_middleware(_null_app), _fake_environ("/v1/models", "POST"))
+    assert _queue_wait_sample("count") == before
+
+
+# ---------------------------------------------------------------------------
+# lumen_wsgi_queue_depth / _threads_busy / _threads_total — the claim made in
+# the comment beside them is that they are per-process live values that SUM
+# across live workers and lose a dead worker's contribution. Proving that needs
+# real processes: prometheus_client binds its value class at import time from
+# PROMETHEUS_MULTIPROC_DIR, so a fork of this test process has the
+# single-process class already bound (same reason as
+# tests/unit/test_metrics_multiprocess.py).
+# ---------------------------------------------------------------------------
+
+# Sets the bridge's counters, then drives one request through the middleware —
+# so what is asserted below is the whole chain (accessor -> gauge -> mmap file
+# -> merged scrape), not just a .set() call.
+_GAUGE_CHILD = """
+import os, sys
+
+from lumen.services import wsgi_disconnect as wd
+
+wd._queued, wd._running, wd._threads_total = (int(a) for a in sys.argv[1:4])
+
+# Imported only after the counters are set and with PROMETHEUS_MULTIPROC_DIR
+# already in the environment: importing this module constructs the gauges, and
+# prometheus_client opens each mmap eagerly at construction.
+from lumen.blueprints.metrics import middleware as mw
+
+
+def app(environ, start_response):
+    start_response("200 OK", [])
+    return [b""]
+
+
+body = mw.make_metrics_middleware(app)(
+    {"PATH_INFO": "/", "REQUEST_METHOD": "GET"}, lambda *a: None
+)
+list(body)
+body.close()
+print(os.getpid())
+"""
+
+
+def _run_gauge_child(multiproc_dir, queued, running, threads):
+    """Run one request in a separate process; return its (now dead) pid."""
+    import os
+    import subprocess
+    import sys
+
+    env = {**os.environ, "PROMETHEUS_MULTIPROC_DIR": str(multiproc_dir)}
+    result = subprocess.run(
+        [sys.executable, "-c", _GAUGE_CHILD, str(queued), str(running), str(threads)],
+        env=env, capture_output=True, text=True, check=True,
+    )
+    return int(result.stdout.strip())
+
+
+def _merged(multiproc_dir):
+    from prometheus_client import CollectorRegistry
+    from prometheus_client.multiprocess import MultiProcessCollector
+
+    registry = CollectorRegistry()
+    MultiProcessCollector(registry, path=str(multiproc_dir))
+    return registry
+
+
+def _series(registry, name):
+    return [s for m in registry.collect() if m.name == name for s in m.samples]
+
+
+def test_wsgi_pool_gauges_are_one_fleet_number_not_one_series_per_process(tmp_path):
+    """livesum, not the library default: two workers must merge into one sample.
+
+    With the default mode ("all") each process keeps its own series tagged with
+    its pid, so a dashboard panel showing "queue depth" would show four lines at
+    four processes and no total — the failure the file's invariant comment
+    exists to prevent.
+    """
+    _run_gauge_child(tmp_path, 3, 7, 10)
+    _run_gauge_child(tmp_path, 2, 5, 10)
+
+    registry = _merged(tmp_path)
+    for name in ("lumen_wsgi_queue_depth", "lumen_wsgi_threads_busy",
+                 "lumen_wsgi_threads_total"):
+        samples = _series(registry, name)
+        assert len(samples) == 1, f"{name} exposed {len(samples)} series, not a fleet total"
+        assert samples[0].labels == {}, f"{name} is labelled per process: {samples[0].labels}"
+
+    assert registry.get_sample_value("lumen_wsgi_queue_depth") == 5.0
+    assert registry.get_sample_value("lumen_wsgi_threads_busy") == 12.0
+    # Fleet capacity, which is what the depth has to be read against: two
+    # processes of ten threads is twenty threads, not ten.
+    assert registry.get_sample_value("lumen_wsgi_threads_total") == 20.0
+
+
+def test_a_dead_worker_stops_contributing_to_the_pool_gauges(tmp_path):
+    """A gauge is a claim about now, and a dead worker's queue is not queued."""
+    from prometheus_client.multiprocess import mark_process_dead
+
+    pid_a = _run_gauge_child(tmp_path, 3, 7, 10)
+    pid_b = _run_gauge_child(tmp_path, 2, 5, 10)
+    assert pid_a != pid_b
+    assert _merged(tmp_path).get_sample_value("lumen_wsgi_queue_depth") == 5.0
+
+    mark_process_dead(pid_a, str(tmp_path))
+
+    registry = _merged(tmp_path)
+    assert registry.get_sample_value("lumen_wsgi_queue_depth") == 2.0
+    assert registry.get_sample_value("lumen_wsgi_threads_busy") == 5.0
+    assert registry.get_sample_value("lumen_wsgi_threads_total") == 10.0
+    assert registry.get_sample_value("lumen_http_requests_total", {
+        "method": "GET", "path_template": "<unmatched>", "status": "200",
+    }) == 2.0, "the dead worker's counter is real history and must still be summed"
+
+
+def test_pool_gauges_are_sampled_from_the_bridge_accessors(monkeypatch):
+    """Single-process half of the same claim: the gauge tracks the accessor.
+
+    The multiprocess merge above cannot run in this interpreter, so the two
+    halves are tested separately — this one proves the value is read live from
+    ``wsgi_disconnect`` on every request rather than captured once at import.
+    """
+    from prometheus_client import REGISTRY
+
+    from lumen.blueprints.metrics import middleware as mw
+    from lumen.services import wsgi_disconnect as wd
+
+    monkeypatch.setattr(wd, "_queued", 4)
+    monkeypatch.setattr(wd, "_running", 6)
+    monkeypatch.setattr(wd, "_threads_total", 10)
+    _drive(mw.make_metrics_middleware(_null_app), _fake_environ("/"))
+
+    assert REGISTRY.get_sample_value("lumen_wsgi_queue_depth") == 4.0
+    assert REGISTRY.get_sample_value("lumen_wsgi_threads_busy") == 6.0
+    assert REGISTRY.get_sample_value("lumen_wsgi_threads_total") == 10.0
+
+    monkeypatch.setattr(wd, "_queued", 0)
+    _drive(mw.make_metrics_middleware(_null_app), _fake_environ("/"))
+    assert REGISTRY.get_sample_value("lumen_wsgi_queue_depth") == 0.0
+
+
+# ---------------------------------------------------------------------------
+# observe_rejection / lumen_rejections_total
+# ---------------------------------------------------------------------------
+
+def _rejection_count(reason, source, model):
+    from prometheus_client import REGISTRY
+
+    return REGISTRY.get_sample_value(
+        "lumen_rejections_total",
+        {"reason": reason, "source": source, "model": model},
+    ) or 0.0
+
+
+def test_observe_rejection_labels_each_reason_separately():
+    """The whole point is telling the refusals apart: 'too many requests' and
+    'out of coins' are different failures with different remedies."""
+    from lumen.blueprints.metrics.middleware import observe_rejection
+
+    reasons = ("coin_budget", "no_access", "needs_consent", "no_healthy_endpoint")
+    before = {r: _rejection_count(r, "api", "gpt-4o") for r in reasons}
+    for reason in reasons:
+        observe_rejection(reason, "api", "gpt-4o")
+    observe_rejection("coin_budget", "api", "gpt-4o")
+
+    assert _rejection_count("coin_budget", "api", "gpt-4o") == before["coin_budget"] + 2
+    for reason in reasons[1:]:
+        assert _rejection_count(reason, "api", "gpt-4o") == before[reason] + 1
+    # A different source is a different series, not the same counter.
+    assert _rejection_count("no_access", "chat", "gpt-4o") == 0.0
+
+
+def test_observe_rejection_defaults_the_model_to_empty():
+    """rate_limit and queue_shed happen before the body is parsed, so no model
+    is known; the label is empty on purpose rather than invented."""
+    from prometheus_client import REGISTRY, generate_latest
+
+    from lumen.blueprints.metrics.middleware import observe_rejection
+
+    before_rate = _rejection_count("rate_limit", "api", "")
+    before_shed = _rejection_count("queue_shed", "api", "")
+    observe_rejection("rate_limit", "api")          # model omitted entirely
+    observe_rejection("queue_shed", "api", "")      # model explicitly empty
+
+    assert _rejection_count("rate_limit", "api", "") == before_rate + 1
+    assert _rejection_count("queue_shed", "api", "") == before_shed + 1
+    scrape = generate_latest(REGISTRY).decode()
+    assert "# TYPE lumen_rejections_total counter" in scrape
+    assert 'lumen_rejections_total{model="",reason="rate_limit",source="api"}' in scrape
+
+
+# ---------------------------------------------------------------------------
+# observe_pool_wait / lumen_db_pool_wait_seconds
+# ---------------------------------------------------------------------------
+
+def test_observe_pool_wait_records_the_checkout_wait():
+    """lumen_db_pool_connections shows the pool is full; only this shows whether
+    anything is queued behind it."""
+    import pytest
+    from prometheus_client import REGISTRY
+
+    from lumen.blueprints.metrics.middleware import observe_pool_wait
+
+    def sample(suffix):
+        return REGISTRY.get_sample_value(f"lumen_db_pool_wait_seconds_{suffix}") or 0.0
+
+    before_count, before_sum = sample("count"), sample("sum")
+    observe_pool_wait(0.25)
+    observe_pool_wait(1.5)
+
+    assert sample("count") - before_count == 2
+    assert sample("sum") - before_sum == pytest.approx(1.75)

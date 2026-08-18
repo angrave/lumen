@@ -2,6 +2,8 @@
 from http import HTTPStatus
 from unittest.mock import MagicMock, patch
 
+import time
+
 import pytest
 from sqlalchemy import func, select
 
@@ -714,6 +716,79 @@ def test_stream_client_disconnect_bills_estimated_usage(app, test_user, test_mod
         assert db.session.scalar(select(func.count()).select_from(ModelStat)) == 1
 
 
+# ---------------------------------------------------------------------------
+# One clock: every span is measured with time.monotonic()
+#
+# Mixing monotonic with the wall clock does not raise — it writes a duration of
+# roughly ±1.76e9 seconds (the Unix epoch, ~55 years). These bounds fail loudly
+# in both directions. See tests/unit/test_single_clock.py for the static guard.
+# ---------------------------------------------------------------------------
+
+_MAX_PLAUSIBLE_SPAN = 60 * 60  # seconds; a real test stream takes milliseconds
+
+
+def test_completed_stream_records_a_plausible_duration(app, test_user, test_model_endpoint):
+    entity_id = test_user["id"]
+    chunks = [
+        _Chunk(content="hello"),
+        _Chunk(usage=_Usage(prompt_tokens=10, completion_tokens=5)),
+    ]
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.entity_limit import EntityLimit
+        from lumen.models.request_log import RequestLog
+        from lumen.services.llm import send_message_stream
+        db.session.add(EntityLimit(entity_id=entity_id, max_coins=-2, refresh_coins=0, starting_coins=0))
+        db.session.commit()
+        with patch("lumen.services.llm.openai.OpenAI", _mock_openai(chunks)):
+            _, _, result = _drain(send_message_stream([], "test-model", entity_id=entity_id))
+        assert 0 <= result["duration"] < _MAX_PLAUSIBLE_SPAN
+        log = db.session.execute(select(RequestLog).filter_by(entity_id=entity_id)).scalar_one()
+        assert 0 <= log.duration < _MAX_PLAUSIBLE_SPAN
+
+
+def test_aborted_stream_records_a_plausible_duration(app, test_user, test_model_endpoint):
+    """The record_stream_abort path computes its duration from the caller's t0.
+
+    It lives in a different function from the three that measure their own
+    spans, which is how it gets missed: convert the assignments without it and
+    every abandoned request is logged as having taken 55 years.
+    """
+    entity_id = test_user["id"]
+    chunks = [_Chunk(content="partial"), _Chunk(content=" more")]
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.entity_limit import EntityLimit
+        from lumen.models.request_log import RequestLog
+        from lumen.services.llm import send_message_stream
+        db.session.add(EntityLimit(entity_id=entity_id, max_coins=-2, refresh_coins=0, starting_coins=0))
+        db.session.commit()
+        with patch("lumen.services.llm.openai.OpenAI", _mock_openai(chunks)):
+            gen = send_message_stream([{"role": "user", "content": "hi"}], "test-model", entity_id=entity_id)
+            assert next(gen) == ("partial", None, None)  # mid-stream
+            gen.close()  # client disconnect -> GeneratorExit -> record_stream_abort
+        log = db.session.execute(select(RequestLog).filter_by(entity_id=entity_id)).scalar_one()
+        assert log.aborted is True
+        assert 0 <= log.duration < _MAX_PLAUSIBLE_SPAN
+
+
+def test_time_to_first_token_is_a_plausible_span(app, test_model_endpoint):
+    chunks = [
+        _Chunk(content="first"),
+        _Chunk(content=" second"),
+        _Chunk(usage=_Usage(prompt_tokens=10, completion_tokens=5)),
+    ]
+    with app.app_context():
+        from lumen.services.llm import send_message_stream
+        with patch("lumen.services.llm.openai.OpenAI", _mock_openai(chunks)):
+            _, _, result = _drain(send_message_stream([], "test-model"))
+    ttft = result["time_to_first_token"]
+    assert 0 <= ttft < _MAX_PLAUSIBLE_SPAN
+    # It is a prefix of the whole stream, so it cannot exceed the duration —
+    # which it also would if the two were read from different clocks.
+    assert ttft <= result["duration"]
+
+
 def test_disconnect_flag_aborts_stream_without_generator_exit(app, test_user, test_model_endpoint):
     """The flag alone must end the stream — nothing closes the generator.
 
@@ -897,9 +972,14 @@ def test_record_stream_abort_writes_row_without_ambient_context(app, test_user, 
     from lumen.services.llm import record_stream_abort
     entity_id = test_user["id"]
 
+    # A realistic monotonic origin, not 0.0: stream_t0 is now a time.monotonic()
+    # value, so passing 0.0 would record "seconds since boot" as the duration --
+    # a number that satisfies `> 0` while meaning nothing, which is precisely the
+    # mixed-clock bug this conversion exists to prevent.
+    started = time.monotonic()
     record_stream_abort(
         app, billed=False, entity_id=entity_id, model_config_id=test_model["id"],
-        source="api", endpoint_id=test_model_endpoint["id"], started_at=0.0,
+        source="api", endpoint_id=test_model_endpoint["id"], stream_t0=started,
     )
 
     rows = _abort_rows(app, entity_id)
@@ -909,7 +989,9 @@ def test_record_stream_abort_writes_row_without_ambient_context(app, test_user, 
     assert rows[0].output_tokens == 0
     assert rows[0].source == "api"
     assert rows[0].model_endpoint_id == test_model_endpoint["id"]
-    assert rows[0].duration > 0  # measured from started_at
+    # Bounded on both sides: a mixed-clock regression lands at ~1.76e9 (wall
+    # epoch) or at seconds-since-boot, and both blow this ceiling.
+    assert 0 <= rows[0].duration < 60, f"implausible duration {rows[0].duration}"
     assert rows[0].aborted is True
 
 
@@ -918,7 +1000,7 @@ def test_record_stream_abort_skips_when_already_billed(app, test_user, test_mode
     from lumen.services.llm import record_stream_abort
     record_stream_abort(
         app, billed=True, entity_id=test_user["id"], model_config_id=test_model["id"],
-        source="chat", endpoint_id=None, started_at=0.0,
+        source="chat", endpoint_id=None, stream_t0=time.monotonic(),
     )
     assert _abort_rows(app, test_user["id"]) == []
 
@@ -928,7 +1010,7 @@ def test_record_stream_abort_skips_anonymous_stream(app, test_user, test_model):
     from lumen.services.llm import record_stream_abort
     record_stream_abort(
         app, billed=False, entity_id=None, model_config_id=test_model["id"],
-        source="chat", endpoint_id=None, started_at=0.0,
+        source="chat", endpoint_id=None, stream_t0=time.monotonic(),
     )
     assert _abort_rows(app, test_user["id"]) == []
 
@@ -939,7 +1021,7 @@ def test_record_stream_abort_never_raises_into_a_closing_generator(app, test_use
     with patch.object(llm, "record_aborted_request", side_effect=RuntimeError("boom")):
         llm.record_stream_abort(
             app, billed=False, entity_id=test_user["id"], model_config_id=test_model["id"],
-            source="chat", endpoint_id=None, started_at=0.0,
+            source="chat", endpoint_id=None, stream_t0=time.monotonic(),
         )
     assert _abort_rows(app, test_user["id"]) == []
 
@@ -1048,7 +1130,7 @@ def test_stream_abort_increments_the_disconnect_counter(app, test_user, test_mod
     before = _abort_count("chat", "disconnect")
     record_stream_abort(
         app, billed=False, entity_id=test_user["id"], model_config_id=test_model["id"],
-        source="chat", endpoint_id=test_model_endpoint["id"], started_at=0.0,
+        source="chat", endpoint_id=test_model_endpoint["id"], stream_t0=time.monotonic(),
     )
     assert _abort_count("chat", "disconnect") == before + 1
 
@@ -1059,7 +1141,7 @@ def test_stream_abort_counts_anonymous_streams_too(app, test_model):
     before = _abort_count("chat", "disconnect")
     record_stream_abort(
         app, billed=False, entity_id=None, model_config_id=test_model["id"],
-        source="chat", endpoint_id=None, started_at=0.0,
+        source="chat", endpoint_id=None, stream_t0=time.monotonic(),
     )
     assert _abort_count("chat", "disconnect") == before + 1
 
@@ -1070,7 +1152,7 @@ def test_completed_stream_is_not_counted_as_an_abort(app, test_user, test_model)
     before = _abort_count("chat", "disconnect")
     record_stream_abort(
         app, billed=True, entity_id=test_user["id"], model_config_id=test_model["id"],
-        source="chat", endpoint_id=None, started_at=0.0,
+        source="chat", endpoint_id=None, stream_t0=time.monotonic(),
     )
     assert _abort_count("chat", "disconnect") == before
 

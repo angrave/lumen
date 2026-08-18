@@ -582,10 +582,23 @@ Append-only log of every proxied request. On PostgreSQL this table is converted 
 | `cost` | Numeric(12,6) | NO | Cost in USD for this request |
 | `duration` | Float | NO | Total proxy response time in seconds |
 | `aborted` | Boolean | NO | True if the client disconnected before the stream completed; token counts may be estimated |
+| `started_at` | DateTime (with timezone) | YES | UTC instant the request arrived at the ASGI bridge (T0) |
+| `queue_wait` | Float | YES | Seconds spent waiting for a WSGI worker thread (T1−T0) |
+| `preflight` | Float | YES | Seconds from worker pickup to the upstream call (T2−T1) |
+| `ttft` | Float | YES | Seconds to the first upstream chunk of any kind, including reasoning deltas |
+| `ttft_visible` | Float | YES | Seconds to the first visible content delta |
+| `send_blocked` | Float | YES | Seconds blocked handing response chunks to the server |
+| `outcome` | String(16) | YES | How the request ended: `'ok'` or `'disconnect'` |
 
 **Notes:**
 - Foreign keys use `SET NULL` on delete (not cascade) to preserve historical log data when entities, models, or endpoints are removed.
 - `time` is indexed but not unique; concurrent workers may insert rows with the same timestamp without collision.
+- **Timing columns measure the user's wait, which `duration` does not.** `duration` starts *after* preflight (model lookup, access checks, coin budget, endpoint selection, pool checkout) and ends before the billing commit, while `time` is stamped *after* that commit. So neither can be walked backwards to the moment the request arrived. Together the new columns partition the request: `started_at` + `queue_wait` + `preflight` + `ttft_visible` is when the user first sees anything.
+- **`started_at` is stored, not derived.** The obvious reconstruction, `time − duration − queue_wait`, silently assumes preflight and the billing commit take zero time. Both grow under load, so the error is largest during exactly the burst the column exists to explain.
+- **`started_at` is the second `TIMESTAMPTZ` in the schema** (with `time`), deliberately unlike the naive-UTC convention everywhere else. It exists to be subtracted from `time` on the same row, and mixing naive with aware in that arithmetic misbehaves on PostgreSQL. Write it with `datetime.now(timezone.utc)`, never `timeutils.utcnow()`.
+- **NULL means "not measured", not "zero".** Rows written before this migration, and requests that never passed through the ASGI bridge (dev server, Flask test client), have NULL timing. They were not backfilled: nothing recorded an arrival time for them, and inventing one would produce a column that looks authoritative and is wrong for every historical row.
+- **`outcome` carries only values the code can actually write.** There is deliberately no `billing_error` or `upstream_error`: the row is created inside `update_stats`, which only flushes, so a failing commit rolls back the very row that would have recorded the failure. Enum values are added together with the code that writes them.
+- `ttft` and `ttft_visible` are both stored because on a reasoning model they differ by the whole thinking phase — which is what separates "the model was queued" from "the model was thinking".
 - `aborted` replaces the earlier "`cost` = 0 identifies an abandoned stream" convention: aborted streams are now billed for what they consumed, so their cost is usually non-zero. Rows written before the column was added are all `false` and were not backfilled — a completed request can also cost 0 (zero-priced model, audio model with no `audio_cost_per_hour`, missing upstream usage, or a cost that rounds to 0 at `Numeric(12,6)`), so the old convention could not be applied retroactively without false positives.
 
 ---
