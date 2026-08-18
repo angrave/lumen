@@ -47,12 +47,13 @@ LOCK_PATH_ENV = "LUMEN_HEALTH_LOCK"
 DEFAULT_LOCK_PATH = "/tmp/lumen-health.lock"
 
 #: A holder that has not refreshed its heartbeat (the lock file's mtime) for
-#: this long is presumed wedged rather than working, and another process takes
-#: the pass over. Nothing in a pass is preemptible — probes are serial and
-#: legitimately run _PROBE_TIMEOUT × N, abandoned probe threads cannot be
-#: killed, and a blocked commit() cannot be interrupted — so there is
-#: deliberately no watchdog that releases the flock out from under a live
-#: holder; that would admit a second concurrent pass against the same backends.
+#: this long is presumed wedged rather than working, and is reported loudly —
+#: but not displaced; see :func:`_elected_to_probe`. Nothing in a pass is
+#: preemptible — probes are serial and legitimately run _PROBE_TIMEOUT × N,
+#: abandoned probe threads cannot be killed, and a blocked commit() cannot be
+#: interrupted — so there is deliberately no watchdog that releases the flock
+#: out from under a live holder; that would admit a second concurrent pass
+#: against the same backends.
 _HEARTBEAT_STALE_AFTER = 3 * _CHECK_INTERVAL
 
 
@@ -71,7 +72,13 @@ def _acquire(path: str):
     try:
         # O_CREAT|O_RDWR, never "w": "w" truncates *before* the flock attempt,
         # so every non-holder's failed attempt would wipe the holder's file.
-        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+        #
+        # O_NOFOLLOW because the default path is under /tmp. Inside a container
+        # that is private and this is theatre, but Lumen also runs outside one,
+        # and there a symlink planted at the path would point this open() —
+        # and the utime() heartbeat — at a file of someone else's choosing.
+        # Refusing to follow it costs nothing and removes the question.
+        fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o644)
     except OSError as e:
         logger.warning("health check: cannot open lock file %s (%r); running unelected", path, e)
         return None, False

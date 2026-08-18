@@ -471,3 +471,47 @@ def test_lock_is_released_after_a_pass(lock_path):
         assert health.run_health_pass() == 1
         assert health.run_health_pass() == 1
     assert passes == [1, 1]
+
+
+def test_lock_file_is_not_followed_through_a_symlink(tmp_path, monkeypatch):
+    """A symlink planted at the lock path must not redirect the open or the heartbeat.
+
+    The default path lives under /tmp. In a container that is private and this
+    is theatre; outside one it is not, and the heartbeat is a utime() on
+    whatever the fd points at.
+    """
+    from lumen.services import health
+
+    target = tmp_path / "someone-elses-file"
+    target.write_text("do not touch")
+    link = tmp_path / "health.lock"
+    link.symlink_to(target)
+    monkeypatch.setenv(health.LOCK_PATH_ENV, str(link))
+
+    fd, acquired = health._acquire(str(link))
+    try:
+        assert fd is None, "open() must refuse to follow the symlink"
+        assert acquired is False
+    finally:
+        if fd is not None:
+            os.close(fd)
+    assert target.read_text() == "do not touch"
+
+
+def test_unopenable_lock_still_runs_the_pass(tmp_path, monkeypatch):
+    """A lock we cannot open degrades to probing, never to silence.
+
+    Losing health checks entirely because of a lock-file problem would be a
+    worse failure than the duplicated probing the election exists to remove.
+    """
+    from lumen.services import health
+
+    unopenable = tmp_path / "nodir" / "health.lock"  # parent does not exist
+    monkeypatch.setenv(health.LOCK_PATH_ENV, str(unopenable))
+
+    passes = []
+    with patch.object(
+        health, "check_all_endpoints", side_effect=lambda heartbeat=None: passes.append(1) or 1
+    ):
+        assert health.run_health_pass() == 1
+    assert passes == [1]
