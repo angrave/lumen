@@ -1,8 +1,8 @@
 """Tests for the profile blueprint routes."""
-from http import HTTPStatus
 import json
-import pytest
+from http import HTTPStatus
 
+import pytest
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -216,8 +216,8 @@ def _make_graylist_model(app, entity_id, model_name="graylist-model"):
     """Create a needs_ack model the given entity is allowed to access."""
     with app.app_context():
         from lumen.extensions import db
-        from lumen.models.model_config import ModelConfig
         from lumen.models.entity_model_access import EntityModelAccess
+        from lumen.models.model_config import ModelConfig
         mc = ModelConfig(
             model_name=model_name,
             input_cost_per_million=1.0,
@@ -303,10 +303,11 @@ def test_profile_page_shows_inactive_model(app, auth_client):
 def test_profile_page_with_coin_pool(app, auth_client, test_user):
     """Profile page renders correctly when entity has a token limit (coin pool)."""
     with app.app_context():
-        from lumen.extensions import db
-        from lumen.models.entity_limit import EntityLimit
-        from lumen.models.entity_balance import EntityBalance
         from datetime import datetime, timezone
+
+        from lumen.extensions import db
+        from lumen.models.entity_balance import EntityBalance
+        from lumen.models.entity_limit import EntityLimit
         db.session.add(EntityLimit(
             entity_id=test_user["id"],
             max_coins=100,
@@ -331,10 +332,11 @@ def test_profile_page_with_coin_pool(app, auth_client, test_user):
 def test_profile_page_shows_model_with_past_usage(app, auth_client, test_user):
     """A model that is now inactive but has ModelStat rows still appears."""
     with app.app_context():
+        from datetime import datetime, timezone
+
         from lumen.extensions import db
         from lumen.models.model_config import ModelConfig
         from lumen.models.model_stat import ModelStat
-        from datetime import datetime, timezone
         mc = ModelConfig(
             model_name="retired-model",
             input_cost_per_million=1.0,
@@ -566,6 +568,7 @@ def _make_conversation(app, entity_id, title="Chat"):
 def _conversation_and_message_counts(app, entity_id):
     with app.app_context():
         from sqlalchemy import func, select
+
         from lumen.extensions import db
         from lumen.models.conversation import Conversation
         from lumen.models.message import Message
@@ -603,6 +606,7 @@ def test_purge_conversations_deletes_all_own(app, auth_client, test_user):
     # The lifetime conversation counter is a usage stat and survives the purge.
     with app.app_context():
         from sqlalchemy import select
+
         from lumen.extensions import db
         from lumen.models.entity_stat import EntityStat
         assert db.session.scalar(
