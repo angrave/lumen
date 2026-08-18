@@ -259,9 +259,9 @@ order* — it decides *how*.** That removes the conditional-scheduling language 
 |---|---|---|---|
 | # | Still gates what, now that everything ships |
 |---|---|
-| G0.1 | **[INDIRECT EVIDENCE — §4.1]** **Production topology** — replicas, `--workers`/`WEB_CONCURRENCY`, `LUMEN_WSGI_WORKERS`. Via `kubectl get deploy -o yaml`, or `GET /metrics/debug`, which already prints workers × replicas and the live `WSGI_*` thread count. **Decides what we test against**: at 1×1 the multi-process paths (dead-PID reaping, `livesum` aggregation, flock election) are never exercised in production, so their only coverage is the test suite — which raises the bar on the Phase 1 tests rather than lowering it |
+| G0.1 | **[ANSWERED — §4.1: 1 process x 1 replica]** **Production topology** — replicas, `--workers`/`WEB_CONCURRENCY`, `LUMEN_WSGI_WORKERS`. Via `kubectl get deploy -o yaml`, or `GET /metrics/debug`, which already prints workers × replicas and the live `WSGI_*` thread count. **Decides what we test against**: at 1×1 the multi-process paths (dead-PID reaping, `livesum` aggregation, flock election) are never exercised in production, so their only coverage is the test suite — which raises the bar on the Phase 1 tests rather than lowering it |
 | G0.2 | **Is Redis deployed?** `redis.enabled`, or an external `redis.url` / `rate_limiting.storage_url`. **Decides whether Phase 5 also carries a provisioning task**, and whether its fail-open path is the normal case or the exception |
-| G0.3 | **Timescale version + is `timescaledb_toolkit` installed?** `SELECT extname, extversion FROM pg_extension WHERE extname LIKE 'timescale%'`. **Decides**: exact `percentile_agg` p95 vs hand-rolled bucket counts; hierarchical continuous aggregates; and — newly — whether adding a column to a compressed hypertable is restricted, which sets how firmly compression must trail the schema work |
+| G0.3 | **[VERSION ANSWERED — §4.1: 2.27.2 / pg17; toolkit still open]** **Timescale version + is `timescaledb_toolkit` installed?** `SELECT extname, extversion FROM pg_extension WHERE extname LIKE 'timescale%'`. **Decides**: exact `percentile_agg` p95 vs hand-rolled bucket counts; hierarchical continuous aggregates; and — newly — whether adding a column to a compressed hypertable is restricted, which sets how firmly compression must trail the schema work |
 | G0.4 | **Size and growth of `request_logs`** — `SELECT pg_size_pretty(pg_total_relation_size('request_logs')), count(*), min(time), max(time) FROM request_logs`. **Decides** the retention window and, more urgently, how long the entity-aggregate's **full-history backfill** will run, since it cannot happen inside the migration transaction |
 | G0.5 | **[PARTLY ANSWERED — §4.1: yes, `/metrics` is enabled with a token]** **Does a Prometheus/Grafana stack scrape this cluster, at what interval?** **No longer decides ordering.** Still decides whether the ServiceMonitor needs the token work below, and what scrape interval the snapshot refresh should be tuned against |
 | **G0.6** | **Are the backends' `/metrics` reachable, and what engines/versions are they?** **Weakened, not retired, by the `http_sd` design in §10.1.** Under `http_sd` Prometheus scrapes the backends and Lumen never sends the endpoint API key anywhere, so a misidentified backend costs a down-looking target rather than a leaked credential. What still gates: reachability *from Prometheus*, and positively knowing each endpoint's engine — today only SGLang is detected, and vLLM is a fall-through indistinguishable from OpenAI, Azure or any OpenAI-compatible proxy |
@@ -339,6 +339,58 @@ sits beside `api:` at the top level:
 
 Either way the read site is the same: `lumen/__init__.py:119` for the middleware decision and
 `lumen/blueprints/metrics/routes.py:33` for the endpoint's auth.
+
+**2026-08-18 — G0.1 answered, G0.3 half-answered.** From `GET /metrics/debug` on production
+(`v1.25.0`) and the production compose image:
+
+```
+worker processes: 1 (WEB_CONCURRENCY=unset)  replicas: 1 (LUMEN_REPLICAS=unset)
+wsgi thread pool: 64 per process (LUMEN_WSGI_WORKERS=auto), 58 spawned
+engine options: pool_size=60 max_overflow=20 pool_timeout=10 pool_recycle=1800
+postgres max_connections: 100
+pool budget: (pool_size+max_overflow) x workers x replicas = 80 of 100
+QueuePool: size=60 checked_in=49 checked_out=1 overflow=-10 max_overflow=20
+postgres image: timescale/timescaledb:2.27.2-pg17
+```
+
+- **[ANSWERED] G0.1 — production is 1 × 1.** The absent `multiproc_dir` is therefore *correct*,
+  and reading 2 above (a silently broken `/metrics`) is ruled out. The consequence stands as the
+  table row wrote it: the Phase 1 multi-process paths — dead-PID reaping, `livesum` aggregation,
+  flock election — are **never exercised in production**, so the test suite is their only coverage.
+  That raises the bar on those tests; it does not license deleting them, because `wsgiProcesses`
+  is a one-line change away and the chart now supports it.
+- **[ANSWERED] G0.3 (version half) — Timescale 2.27.2 on PG17.** This is comfortably past 2.13,
+  **which is the release that flipped `timescaledb.materialized_only` to default `true`**. The §8
+  warning about a continuous aggregate hiding the last hour of every user's `/usage` is therefore
+  a live defect-in-waiting on this exact deployment, not a version-dependent maybe. The
+  `materialized_only = false` decision in §8(b) is confirmed as required.
+- **[OPEN] G0.3 (toolkit half).** `timescale/timescaledb` is the community image; the toolkit ships
+  in `timescale/timescaledb-ha`. So `percentile_agg` is **probably absent** and §8(f) takes the
+  hand-rolled fixed-bucket path. Confirm before writing the aggregate — one query settles it:
+  `SELECT extname, extversion FROM pg_extension WHERE extname LIKE 'timescale%';`
+
+**[FINDING — pre-existing, outside this plan's scope] The connection budget does not survive a
+rolling deploy.** One pod holds **50 open connections at idle** (`pool_size + overflow = 60 + (-10)`;
+SQLAlchemy's `_overflow` starts at `-pool_size`), and `QueuePool` never shrinks below what it has
+opened. `max_connections` is 100, of which `superuser_reserved_connections` (default 3) is not
+available to the app. During any rolling update the draining pod and the starting pod are both up,
+so the steady-state floor alone is 2 × 50 = 100 > 97 usable, and the *ceiling* is 2 × 80 = 160.
+The failure mode is `FATAL: sorry, too many connections` on the new pod during deploys. Not caused
+by this work and not fixed by it — but this plan adds a background refresher that also draws from
+that pool, so it is recorded here rather than left implicit. Mitigations are all one-liners
+(`maxSurge: 0` or the `Recreate` strategy, a smaller `pool_size`, or a larger `max_connections`);
+picking one is the operator's call.
+
+**[FINDING — this is what the plan is for] The WSGI thread pool has a 58-of-64 high-water mark.**
+a2wsgi runs `ThreadPoolExecutor(max_workers=64, thread_name_prefix="WSGI")`, and CPython's executor
+spawns a thread **only when no idle thread is available** and never reaps one. So "58 spawned" is a
+monotonic high-water mark: at some point since this pod started, 58 requests were simultaneously
+in flight. Six more and requests begin sitting in the executor's unbounded work queue — which is
+exactly what `lumen_wsgi_queue_depth` and `lumen_wsgi_queue_wait_seconds` (Phase 1, and **live in
+production** per the Prometheus answer above) were added to measure. Note the pool is sized by
+`resolve_wsgi_workers`'s `auto` path, which clamps `pool_size + max_overflow = 80` down to
+`MAX_AUTO_WSGI_WORKERS = 64` — so the thread ceiling, not the DB pool, is the binding constraint,
+and `queue_wait` rather than `preflight` is where a class-start burst will show up first.
 
 ---
 
