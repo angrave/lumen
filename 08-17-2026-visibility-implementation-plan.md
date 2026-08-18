@@ -836,6 +836,215 @@ as database pressure.
    sequential scans of a growing hypertable at the worst possible moment. Copy the existing pattern,
    or read the snapshot.
 
+### Implementation contract — decisions this plan makes so nobody has to stop and ask
+
+Seven places where §8 as written reads as buildable but leaves a design decision to the implementer.
+They are decided here. The module is `lumen/services/metrics_snapshot.py`; the seam is
+`lumen/services/live_state.py`.
+
+**(a) The refresher runs in EVERY process and is NEVER flock-elected.**
+**[FACT]** Phase 1 item 7 has just turned `lumen/services/health.py` into a single-runner election
+(`lumen/services/health.py:111-167`), and §8 item 1 says "the same pattern as `lumen/services/health.py`".
+Copying that pattern here is a **fleet-breaking bug**: the election's non-holders `return 0` and do
+no work (`lumen/services/health.py:239-242`), so N−1 workers would hold an empty snapshot forever.
+Prometheus scrapes land on whichever worker the socket gives them, so `lumen_model_requests_total`
+would alternate between the real cumulative value and absent — and a counter that disappears and
+reappears lower is read as a **reset**, so `rate()` invents a spike on every recovery. The result is
+sawtooth garbage on the exact series the operator uses to judge a burst.
+
+**[DECISION] The general rule, stated so it is not re-litigated per daemon: elect only work whose
+result lands in the DB.** Health probing qualifies — the holder writes `ModelEndpoint.healthy` and
+every non-holder reads the same row back (`lumen/services/health.py:222-230`). Snapshot refresh does
+not: its result is an in-memory object that only the refreshing process can see. **Never elect
+in-memory state.** Put that sentence in the module docstring next to a pointer at `health.py`, or
+the next reader will "unify the two daemons".
+
+**Corollary — start it outside the `_run_background` guard.** **[FACT]** `lumen/__init__.py:549-555`
+starts `start_health_checker` / `start_coin_refiller` / `start_config_watcher` only when
+`BACKGROUND_WORKER != "false"`, which is the switch an operator is told to use to keep extra workers
+from duplicating shared work. That switch is correct for shared work and wrong for per-process state:
+setting it would silently give those workers an empty snapshot — the same failure as (a) by a
+different route. `start_snapshot_refresher(app)` is called unconditionally.
+
+**(b) One `app.app_context()` per pass, entered inside the loop and exited BEFORE the sleep.**
+CLAUDE.md §5's absolute rule is phrased around `yield`, so a `while True:` daemon reads as exempt —
+and hoisting the context out of the loop ("why push it 1440 times a day?") is the natural
+optimisation that reproduces the 1.22.0 idle-in-transaction leak, one leaked connection per process,
+held across a 60 s sleep. The rule's actual content is *no session and no Flask context may outlive
+the work that needs it*; a sleep is a `yield` in every way that matters. `lumen/services/health.py:248-255`
+already has the correct shape (`with app.app_context():` inside the loop, `time.sleep` outside it)
+but only incidentally, with no comment saying why. **[DECISION]** Copy that shape, and this time
+write the comment. Also copy the `try/except Exception: logger.exception(...)` wrapper at
+`lumen/services/health.py:253-254`: an unhandled exception kills the thread and the snapshot then
+ages forever with nothing logged after the first traceback.
+
+**How the test proves it — assert during the sleep, not after the pass.** A test that checks
+`pool.checked_out == 0` after a refresh completes passes under the hoisted-context bug too, because
+the session is idle-but-checked-out only between passes. Give the module a `_sleep = time.sleep`
+indirection, patch it, and from inside the patched sleep — i.e. on the refresher thread, while it is
+"parked" — assert **both**:
+- `db.engine.pool.checkedout() == 0`, and
+- no app context is bound on that thread (`flask.globals.app_ctx` unbound), which catches the variant
+  that pushes the context outside the loop but happens to have released the session.
+
+Add a static guard in the shape of `tests/unit/test_no_stream_with_context.py`: in
+`lumen/services/metrics_snapshot.py`, `app.app_context()` may appear only inside the loop body, and
+`_sleep` may not appear inside a `with app.app_context():` block.
+
+**(c) The snapshot is one frozen dataclass, and every future field declares its query cost.**
+
+```python
+@dataclass(frozen=True)
+class MetricsSnapshot:
+    primed: bool                                    # False until the first successful pass; see (e)
+    captured_at: float                              # time.monotonic(), the only input to the age gauge
+    captured_wall: datetime                         # naive UTC via lumen.timeutils.utcnow(), for display only
+    model_usage: dict[tuple[str, str], ModelUsage]  # (model_name, source) -> requests, input, output, cost
+    endpoint_health: tuple[tuple[str, str, bool], ...]   # (model_name, endpoint_url, healthy)
+    users_active: int
+    users_total: int
+```
+
+That is exactly the three statements `LumenDBCollector.collect()` runs today —
+`lumen/blueprints/metrics/routes.py:67-78`, `:121-124`, `:135-140` — and nothing more. `collect()`
+becomes a pure read of this object.
+
+**[DECISION] Field-addition rule.** Phases 7 and 8 both want to add fields. Each addition states, in
+the PR: (i) the exact statement it adds, (ii) whether that statement is index-backed, (iii) that it
+rides the **same pass** — *no per-model loop*, ever, because an N+1 across models turns a bounded
+3-statement pass into an unbounded one. A pass is capped at **5 statements**. Anything that reads
+`request_logs` requires Phase 3 item 4's composite index `(model_config_id, time DESC)` and must say
+so.
+
+**Worked example, which also settles §8 item 3.** The models-page counts
+(`lumen/blueprints/models_page/routes.py:49-60`, two uncached `COUNT(*)` per page view) become a
+snapshot field, not a second 30 s cache — a second cache is a third source of truth for one number.
+Both counts come from **one** statement: `GROUP BY model_config_id` over
+`request_logs WHERE time >= now() - 24h`, with a `FILTER (WHERE time >= now() - 1h)` for the hour
+bucket. One index-backed statement for all models, satisfying the rule.
+
+**[DECISION] Refresh interval, chosen against the scrape interval — because per-process refresh can
+*increase* total DB load.** Today the cost is 3 statements per **scrape per pod** (one worker serves
+each scrape). After this change it is 3 statements per **process** per interval, i.e.
+`processes × replicas × 3 / interval`. The rule:
+
+> `refresh_interval ≥ processes × scrape_interval`, floor 30 s, default **60 s**, with ±10% jitter so
+> the N workers of a pod do not align their passes into one burst against the pool.
+
+At 4 workers and a 30 s scrape the rule says 120 s; take the 60 s default only with eyes open that it
+is 2× today's statement rate. **That trade is still right**, and the reason is not "it is only 3
+statements": the pass is bounded, off the request path, and never blocks a scrape, whereas today's
+queries take a pooled connection *during* the burst and can block up to `pool_timeout` — §8 item 1's
+whole premise. Staleness bound is `refresh_interval + scrape_interval`; it must be shorter than the
+shortest window anyone alerts on.
+
+**[DECISION] No lazy refresh-on-read.** `/metrics` never triggers a pass, not even when the snapshot
+is stale. A refresh-if-stale branch puts the DB back on the scrape path on exactly the scrape that
+follows a slow period — the failure this phase exists to remove.
+
+**(d) The refresher starts even when `api.prometheus.enabled` is false.**
+**[FACT]** `/metrics` 404s when the flag is off (`lumen/blueprints/metrics/routes.py:33`) and the
+chart default is off, but `LumenDBCollector` is registered unconditionally today
+(`lumen/__init__.py:110-114`), Phase 7a's `/admin/status` reads this same snapshot, and §8 item 3's
+model-page counts do too. **[DECISION] Always start it.** The snapshot is the application's own cache
+of its own state; gating it on a metrics flag would make an admin page and a user-facing page change
+behaviour when an operator turns on Prometheus — the identical mistake Phase 2 item 1 already
+rejected for T0/T1 capture (`lumen/__init__.py:128-139`, chart default `enabled: false`). Cost when
+Prometheus is off: 3 statements per minute per process.
+
+**(e) Cold start is a synchronous prime, and an unprimed snapshot emits NO `lumen_model_*` series.**
+Without a prime, the first `refresh_interval` after every rolling restart has an empty snapshot, and
+a fleet mid-restart mixes primed and unprimed workers — gaps, and the same counter-reset artefact as
+(a). **[DECISION]** Run one pass synchronously in `create_app` before starting the thread, inside the
+app context that already exists at `lumen/__init__.py:511`, wrapped in the same `try/except` +
+`WARNING` shape as the `sync_*_from_yaml` calls there (a database that has not been migrated yet must
+not stop the app from booting).
+
+**[DECISION] If the prime fails, `collect()` yields the pool gauges and the age gauge and **nothing
+else**.** Emitting zeros is strictly worse than emitting nothing: absent → present is an ordinary new
+series to Prometheus, whereas present(1e6) → present(0) → present(1e6) is two resets and a fabricated
+rate spike. `lumen_metrics_snapshot_age_seconds` is still emitted while unprimed (measured from
+process start), because that gauge is precisely the signal an operator alerts on for this state.
+
+**(f) The `admit`/`release` contract.** §8 item 2's signature is not sufficient — `release` cannot
+find the right entry without a handle, and a handle is what makes Phase 5's multiplicity fix possible.
+
+```python
+@dataclass(frozen=True)
+class LiveTicket:
+    model_key: str
+    entity_id: int
+    request_id: str     # uuid4().hex
+    deadline: float     # unix seconds; see below
+
+admit(model_key: str, entity_id: int) -> LiveTicket
+release(ticket: LiveTicket) -> None
+snapshot() -> dict[str, ModelLive]   # inflight, unique_users
+topology() -> dict
+```
+
+- **`admit` is called in the VIEW**, while the request context is live, *after* every rejection path
+  (rate limit, coin budget, access, consent, no healthy endpoint) and after Phase 2 item 6's budget
+  check — a rejected request must never appear in flight. Concretely, alongside the existing
+  capture-into-the-closure lines: `lumen/blueprints/chat/routes.py:246-247` and
+  `lumen/blueprints/api/routes.py:457-465`. The ticket is captured into the generator's closure,
+  exactly as `client_disconnect_event()` already is (`lumen/services/wsgi_disconnect.py:538-553`,
+  and per Phase 3 contract (c)).
+- **`release` is called in the generator**, in a `finally:` wrapping the whole body of `generate()`
+  (`lumen/blueprints/chat/routes.py:249`, `lumen/blueprints/api/routes.py:465`). On the two
+  non-streaming paths (API non-stream, audio) it is a `try/finally` in the view around the upstream
+  call.
+- **`release` must never touch `db.session` or `current_app`.** It runs context-free. Both backends
+  satisfy this (a dict under a lock; a Redis client). Anything a future implementation needs from
+  config is read at `admit` time and carried on the ticket.
+
+**[DECISION] The `finally` is the fast path, not the correctness argument — the deadline is.**
+**[FACT]** the codebase already documents that a disconnected client's response generator **may never
+be closed** under uvicorn + a2wsgi, so `GeneratorExit` and therefore `finally` may never run:
+`send_message_stream`'s docstring at `lumen/services/llm.py:819-823` ("GeneratorExit alone is not enough … that handler never fires in
+production") and the comment at `lumen/blueprints/chat/routes.py:281`. An abandoned generator that
+never releases would inflate the count permanently. Therefore **every ticket carries a deadline** —
+`time.time() + api.request_budget_seconds + 60` (Phase 2 item 6's new key; fall back to 660 s until
+it lands) — and **both** backends exclude expired tickets from every number they report.
+`LocalLiveState` is not exempt: without the deadline its dict leaks forever on exactly the disconnect
+path this plan is about. Prune on every `admit()` and every `snapshot()`.
+
+**[DECISION] "Live" means admitted → request completion, NOT admitted → first token.** This is the
+choice that moves the headline number by ~10× during a long generation, so it is made here rather
+than discovered in review:
+1. It is the number Phase 9 needs. A generating request holds a backend sequence slot; a cap on
+   "still waiting for the first token" caps nothing.
+2. It keeps the per-request Redis budget at **two** commands (§14). Splitting the lifetime at first
+   token needs a third state transition and therefore a third command, on the token path's edge.
+3. The *waiting* question already has better answers: retrospectively from Phase 3's
+   `started_at` + `ttft_visible`, live-and-aggregate from `lumen_llm_ttft_seconds`, and — for the
+   only place a user sees it — from Phase 6's upstream queue depth, which is the backend's own
+   running/queued count and is the *actual* queue position. Lumen's own in-flight count never was.
+
+**Consequences that must be applied, not just noted:**
+- **The UI label matches the meaning.** §11's tile reads *"12 requests in flight, 9 distinct users
+  (this process — 1 of 4 processes × 2 replicas)"*. It must **not** say "waiting".
+- **§11's chat "waiting for the model (N ahead of you)" is sourced from Phase 6**, not from
+  `LiveState`. §11 already hedges it with "if the backend reports a queue"; this makes that binding
+  explicit, and it means 7a's live tiles ship without that string.
+
+**(g) `lumen_metrics_snapshot_age_seconds` is emitted from `LumenDBCollector`, not as a
+`prometheus_client` Gauge.** **[FACT]** under `PROMETHEUS_MULTIPROC_DIR` a `Gauge` must declare a
+`multiprocess_mode` (Phase 1 item 4), and every available mode is wrong here: `livesum` reports 4× the
+age at 4 workers (a 30 s-old snapshot alerts as 120 s), `livemax` reports the worst worker's age but
+detached from the values in the payload, `mostrecent` reports whichever worker wrote last.
+**[DECISION]** Yield it as a `GaugeMetricFamily` from `collect()`, computed as
+`time.monotonic() - snapshot.captured_at` on the process serving the scrape. That is *consistent*
+because it then describes **the same snapshot whose sample values are in the same response** — an age
+that does not belong to the payload it annotates is worse than no age at all. It is also already the
+established convention in that collector: `lumen_db_pool_connections`
+(`lumen/blueprints/metrics/routes.py:150-168`) is likewise per-serving-process and deliberately not
+multiproc-aggregated. **[FACT, worth stating once]** that does mean only one worker's pool is ever
+reported; that is pre-existing and out of scope here, but do not "fix" it by moving these gauges into
+multiproc files — the same aggregation problem applies.
+
+---
+
 ### Tests
 
 | Test | File | Asserts |
@@ -882,6 +1091,97 @@ provisioning task.
    `auth.existingSecret` password-less URL, and `auth.password` landing in plaintext in the rendered
    config Secret. Add the `rate_limiting.storage_url` omission from `RESTART_REQUIRED` in
    `lumen/services/config_watcher.py`.
+
+### Implementation contract — decisions this plan makes so nobody has to stop and ask
+
+**(a) The data structure in §9 item 1 (and in §3's summary) is wrong twice. Replace it.**
+
+**[FACT] Redis sets have no per-member TTL.** Expiry in Redis is per **key**; `SADD` members live and
+die with the key. §9 item 4's "members expire above `gateway.timeout`" is not implementable on a SET,
+and the only thing that *is* implementable — `EXPIRE` on the whole key — is worse than the leak it
+was meant to fix: at 600 s it deletes the live members of a busy model, silently zeroing the count
+during precisely a long burst.
+
+**[FACT] `SREM` under-counts the double-submitting student.** With member = `entity_id`, a user with
+three concurrent requests is one member, and the **first** completion `SREM`s them while two are
+still in flight. A class-start burst is full of exactly this user — the one who hits send twice and
+reloads the tab. The design under-reports the population it exists to measure.
+
+**[DECISION] One sorted set per model.** Key `lumen:live:{model_key}`, member
+`"{entity_id}:{request_id}"`, score = the ticket's deadline as unix seconds (Phase 4 contract (f)).
+
+| operation | commands | when |
+|---|---|---|
+| `admit` | `ZADD key {deadline} {member}` | 1 command, in the view |
+| `release` | `ZREM key {member}` | 1 command, in the generator's `finally` |
+| prune | `ZREMRANGEBYSCORE key -inf {now}` | in `snapshot()` only — see below |
+| inflight | `ZCOUNT key {now} +inf` | `snapshot()` |
+| unique users | `ZRANGEBYSCORE key {now} +inf` then dedupe the `entity_id` prefix in Python | `snapshot()` |
+
+Why this shape:
+- **Multiplicity is correct by construction** — three concurrent requests from one user are three
+  members with one shared prefix, so `inflight` is 3 and `unique_users` is 1, and releasing one
+  removes exactly one.
+- **Expiry is by score, not by TTL**, so a SIGKILLed process's orphans stop being *counted* the
+  instant their deadline passes (every read is bounded by `{now}`), independently of when they are
+  physically removed. That is §9 item 4's self-healing, actually implemented.
+- **No key `EXPIRE` is needed at all**: Redis deletes a sorted set automatically when its last member
+  is removed, so an idle model leaves nothing behind.
+- **[DECISION] Derive in-flight; do not keep a separate `INCR`/`DECR` counter** (§9 item 1 offers
+  both). A plain counter has nowhere to store a deadline, so a SIGKILL inflates it permanently — the
+  one failure mode §3's TTL bullet exists to prevent — and it would be a third command per request.
+
+**(b) The cost of the unique-user count is O(members), not O(1). Say it out loud, because it changes
+two budgets.** There is no Redis primitive for "count distinct prefixes in a sorted set", so
+`unique_users` requires transferring the live members and deduping in Python: O(N) in commands' worth
+of bytes and in client CPU, N = live members for that model.
+
+- **Per-request budget survives intact, but only because prune moved to the reader.** `admit` = 1
+  command, `release` = 1 command — **exactly 2, as §14 requires, literally**. Do **not** pipeline
+  `ZREMRANGEBYSCORE` into `admit`: that is the obvious tidy-up and it silently makes the budget 3.
+- **Snapshot cost, with Phase 4's per-process refresh, is `processes × replicas × models × members`
+  per interval.** At 300 concurrent requests over 10 models that is ~3000 short members moved per
+  pass per process — tens of kilobytes, single-digit milliseconds. Acceptable. It is also why
+  **[DECISION] `snapshot()` is the only caller permitted to read members; no request path may issue
+  `ZRANGEBYSCORE`.**
+- **[DECISION] One round trip per pass, not one per model.** Pipeline every model's
+  prune + `ZCOUNT` + `ZRANGEBYSCORE` into a single pipeline, or a 10-model deployment pays 30 round
+  trips a minute per process for no reason.
+- **The escape hatch, documented but not built:** if live members ever exceed ~10⁴ on one model,
+  switch `unique_users` to a per-model HASH of `entity_id → refcount` (`HINCRBY` ±1, `HLEN` for an
+  O(1) unique count) and accept a third command per request. Do not do this speculatively — it
+  reintroduces the orphan problem the scores solve, since a HASH field cannot carry a deadline.
+
+**(c) `LocalLiveState` needs the same multiplicity fix, and the same deadline.** A `set[entity_id]`
+has the identical `SREM` bug in-process, and a bare `dict[entity_id, count]` cannot expire orphans
+because there is nowhere to hold a deadline. **[DECISION]** `dict[model_key, dict[request_id, tuple[entity_id, deadline]]]`
+under one lock: `inflight = len(inner)`, `unique_users = len({entity_id for ...})`, expired entries
+excluded from both and pruned on `admit()` and `snapshot()`. This is deliberately the same triple the
+sorted set holds, which is what makes a single parametrised suite runnable against both backends and
+what guarantees the fallback does not change the *meaning* of a number when Redis drops out — only
+its scope, which `topology()` reports.
+
+**(d) Fail-open, stated precisely enough to be symmetric.** An `admit` whose Redis call raises or
+times out still **returns a usable `LiveTicket`** and records it in the local fallback state;
+`release(ticket)` on a failing Redis is a no-op plus `lumen_live_state_errors_total{op="release"}`.
+Never return a ticket that `release` cannot accept — an asymmetric fail-open turns a Redis blip into
+a permanent count inflation, which is the bug wearing the costume of the fix.
+
+**Key namespace:** the URL comes from rate limiting (`lumen/__init__.py:168-171`,
+`RATELIMIT_STORAGE_URI`) per §9 item 2, so two Lumen deployments pointed at one Redis with the same
+db index will merge their counts. Fixed prefix `lumen:live:`; document the caveat next to the chart
+note in §9 item 5 rather than inventing a config key for it.
+
+**(e) Which of §9's existing tests are wrong under the corrected structure.**
+
+| §9 test as written | verdict | replacement |
+|---|---|---|
+| Fleet-wide unique users — "`SCARD` is the **union**, not the sum" | **Only passes in the broken design.** There is no `SCARD` any more, and the member count *is* the in-flight count, not the unique-user count | Two processes admit overlapping entity sets **and one entity admits three concurrent requests**; assert `snapshot()[model].unique_users == len(union of entity ids)` **and** `inflight == total tickets`. Releasing one of the three leaves `unique_users` unchanged — that assertion is the entire point of the phase's redesign |
+| TTL set — "every key written carries a TTL > `gateway.timeout`" | **Wrong, and inverted.** No key carries a TTL; a correct implementation would fail this test, and an implementation that passed it would have reintroduced whole-key expiry that drops live members | Every member's score is ≥ `now + api.request_budget_seconds`; a member whose score has passed is excluded from `inflight` and `unique_users` **before any prune runs**, and is physically gone after the next `snapshot()` |
+| Bounded call count — "≤ 2 Redis commands per request" | **Survives, but only because prune is the reader's job.** Keep it | Keep, extend over the abort/disconnect path, and add the counterpart: `snapshot()` issues **zero** commands per request and **one round trip** per pass |
+| Reconciliation — "an orphaned member is removed and the correction is logged" | Keep, restate | Simulate a killed process holding three tickets: **before** the deadline they still count (honest — nothing can know yet); **after** it they are excluded and removed on the next pass. Log **once per pass with a count**, not once per member — 300 orphans after a pod kill would otherwise emit 300 lines into the incident |
+| Both fail-open tests, and the timeout test | Unchanged | Add: an `admit` that fails against Redis returns a usable ticket, and `release(ticket)` on it does not raise |
+| — | **New** | One parametrised suite in `tests/unit/test_live_state.py` run against **both** `LocalLiveState` and `RedisLiveState`, asserting identical numbers for the same admit/release/expire sequence — including multiplicity and deadline. Without it the two implementations drift and the fallback silently changes the number's meaning |
 
 ### Tests
 
@@ -1345,6 +1645,14 @@ of which these change the design rather than the prose:
   columns; and several smaller unmade decisions.
 
 **[DECISION] Phases 4–8 do not start until each has an implementation contract in the shape of §7's.**
-Phase 4's must at minimum settle: the refresher runs per-process and unelected; the snapshot's schema
-and each field's query cost; `admit`/`release` call sites and the meaning of "waiting"; one
-`app_context()` per pass, exited before the sleep.
+**Phases 4 and 5 now have one** (§8 and §9). Phase 4's settles: the refresher runs per-process and
+unelected *and outside the `BACKGROUND_WORKER` guard*; one `app_context()` per pass, exited before the
+sleep; a frozen `MetricsSnapshot` dataclass with a field-addition rule and a refresh interval derived
+from the scrape interval; a synchronous prime at startup; the `admit`/`release` contract including a
+`LiveTicket` carrying a deadline, with "live" defined as admitted→completion; and the age gauge
+emitted from the collector rather than as a multiprocess Gauge. Phase 5's replaces the unimplementable
+SET-with-per-member-TTL design with a sorted set scored by deadline, states the honest O(members) cost
+of the unique-user count, and lists which existing tests the correction invalidates.
+
+**Phases 6, 7 and 8 still have none**, and §10's `http_sd` rewrite has not been through a contract
+pass either.

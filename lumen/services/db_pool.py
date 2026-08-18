@@ -18,6 +18,8 @@ import re
 from sqlalchemy import create_engine, text
 from sqlalchemy.pool import NullPool
 
+from lumen.services.pool_tracker import TimingQueuePool
+
 logger = logging.getLogger(__name__)
 
 # Fraction of the server's max_connections handed to persistent pool connections,
@@ -126,9 +128,16 @@ def query_max_connections(uri: str) -> int:
 
 def _passthrough_options(db_cfg: dict) -> dict:
     """Engine options without auto-sizing: any explicit pool settings the admin
-    configured plus the always-on pre-ping. Used for SQLite and as the fallback
-    when ``max_connections`` cannot be determined."""
-    opts = {"pool_pre_ping": True}
+    configured plus the always-on pre-ping.
+
+    Reached only on the Postgres fallback where ``max_connections`` could not be
+    queried — SQLite returns ``{}`` from ``build_engine_options`` before getting
+    here — so the timing pool class belongs on this path too. That fallback
+    means the database was unreachable at startup, which is exactly when
+    checkout waits are worth seeing; omitting the instrumentation here would
+    blind the metric to the degraded case it exists to describe.
+    """
+    opts = {"pool_pre_ping": True, "poolclass": TimingQueuePool}
     for key in ("pool_size", "max_overflow", *_PASSTHROUGH_KEYS):
         if key in db_cfg:
             opts[key] = db_cfg[key]
@@ -205,6 +214,12 @@ def build_engine_options(uri: str, db_cfg: dict, *, workers: int, replicas: int)
         "pool_size": pool_size,
         "max_overflow": max_overflow,
         "pool_pre_ping": True,
+        # QueuePool is what SQLAlchemy would pick for Postgres anyway; the
+        # subclass only times how long each checkout blocks (lumen_db_pool_wait_
+        # seconds), which no pool event can report. Not set on the
+        # max_connections-unavailable fallback above, which deliberately leaves
+        # every pool setting to SQLAlchemy's defaults.
+        "poolclass": TimingQueuePool,
     }
     for key in _PASSTHROUGH_KEYS:
         if key in db_cfg:
