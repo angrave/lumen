@@ -635,3 +635,265 @@ def test_chat_stream_without_the_bridge_records_nulls(
     assert log.ttft is not None
     assert log.ttft_visible is not None
     assert log.outcome == "ok"
+
+
+# ---------------------------------------------------------------------------
+# Live state (in-flight accounting)
+#
+# admit() belongs in the view, after every rejection path; release() in the
+# generator's finally, which runs context-free — no db.session, no current_app.
+# Every exit path must leave the in-flight count at zero.
+# ---------------------------------------------------------------------------
+
+class _RecordingLiveState:
+    """Wraps a real LocalLiveState and counts the two call sites.
+
+    Wrapping rather than subclassing keeps this tied to the seam's public
+    interface (admit/release/snapshot) and nothing else.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.admits = 0
+        self.releases = 0
+
+    def admit(self, model_key, entity_id):
+        self.admits += 1
+        return self._inner.admit(model_key, entity_id)
+
+    def release(self, ticket):
+        self.releases += 1
+        self._inner.release(ticket)
+
+    @property
+    def inflight(self):
+        return sum(m.inflight for m in self._inner.snapshot().values())
+
+
+def _recording_live_state(monkeypatch, *modules):
+    """Give the named route modules a fresh, counted live state for one test."""
+    from lumen.services.live_state import LocalLiveState
+    state = _RecordingLiveState(LocalLiveState())
+    for module in modules:
+        monkeypatch.setattr(module, "get_live_state", lambda state=state: state)
+    return state
+
+
+_FINAL_RESULT = {
+    "reply": "Hello",
+    "model": "test-model",
+    "input_tokens": 1,
+    "output_tokens": 1,
+    "thinking": None,
+    "thinking_tokens": None,
+    "cost": 0.0,
+    "duration": 0.1,
+    "time_to_first_token": 0.05,
+    "output_speed": 10.0,
+}
+
+
+def _post_stream(auth_client, test_model):
+    return auth_client.post("/chat/stream", json={
+        "messages": [{"role": "user", "content": "hi"}],
+        "model": test_model["model_name"],
+    })
+
+
+def test_chat_stream_admits_once_and_releases_once(
+    app, auth_client, test_user, test_model, monkeypatch,
+):
+    """One admit in the view, one release in the generator, zero left over —
+    and the request counts as live until it completes, not until the first
+    token."""
+    from lumen.blueprints.chat import routes as chat_routes
+    with app.app_context():
+        _grant_unlimited_pool(app, test_user["id"])
+    state = _recording_live_state(monkeypatch, chat_routes)
+
+    def fake_stream(messages, model, entity_id=None, source="chat", effective=None):
+        yield "Hello", None, None
+        yield None, None, dict(_FINAL_RESULT)
+
+    monkeypatch.setattr(chat_routes, "send_message_stream", fake_stream)
+
+    resp = _post_stream(auth_client, test_model)
+    assert resp.status_code == HTTPStatus.OK
+    assert resp.is_streamed
+    events = iter(resp.response)
+    try:
+        next(events)  # suspended mid-stream: still in flight
+        assert state.admits == 1
+        assert state.inflight == 1
+        for _ in events:
+            pass
+    finally:
+        resp.close()
+
+    assert state.releases == 1
+    assert state.inflight == 0
+
+
+def test_chat_stream_releases_when_the_generator_raises(
+    app, auth_client, test_user, test_model, monkeypatch,
+):
+    """A KeyError inside the billing block still leaves the count at zero."""
+    from lumen.blueprints.chat import routes as chat_routes
+    with app.app_context():
+        _grant_unlimited_pool(app, test_user["id"])
+    state = _recording_live_state(monkeypatch, chat_routes)
+
+    def fake_stream(messages, model, entity_id=None, source="chat", effective=None):
+        yield "Hello", None, None
+        yield None, None, {"model": "test-model"}  # no "reply" → KeyError
+
+    monkeypatch.setattr(chat_routes, "send_message_stream", fake_stream)
+
+    resp = _post_stream(auth_client, test_model)
+    body = b"".join(resp.response)
+    resp.close()
+    assert b'"error"' in body
+    assert state.admits == 1
+    assert state.releases == 1
+    assert state.inflight == 0
+
+
+def test_chat_stream_releases_when_upstream_fails(
+    app, auth_client, test_user, test_model, monkeypatch,
+):
+    """An upstream failure raised out of send_message_stream releases too."""
+    from lumen.blueprints.chat import routes as chat_routes
+    with app.app_context():
+        _grant_unlimited_pool(app, test_user["id"])
+    state = _recording_live_state(monkeypatch, chat_routes)
+
+    def fake_stream(messages, model, entity_id=None, source="chat", effective=None):
+        raise RuntimeError("upstream is down")
+        yield  # pragma: no cover - makes this a generator function
+
+    monkeypatch.setattr(chat_routes, "send_message_stream", fake_stream)
+
+    resp = _post_stream(auth_client, test_model)
+    b"".join(resp.response)
+    resp.close()
+    assert state.admits == 1
+    assert state.inflight == 0
+
+
+def test_chat_stream_releases_on_client_disconnect(
+    app, auth_client, test_user, test_model, monkeypatch,
+):
+    """The client vanishes mid-stream: the generator returns early and the
+    ticket goes with it."""
+    import threading
+    from lumen.blueprints.chat import routes as chat_routes
+    with app.app_context():
+        _grant_unlimited_pool(app, test_user["id"])
+    state = _recording_live_state(monkeypatch, chat_routes)
+    disconnected = threading.Event()
+
+    def fake_stream(messages, model, entity_id=None, source="chat", effective=None):
+        yield "Hello", None, None
+        disconnected.set()
+        yield " world", None, None
+
+    monkeypatch.setattr(chat_routes, "send_message_stream", fake_stream)
+    monkeypatch.setattr(chat_routes, "client_disconnect_event", lambda: disconnected)
+
+    resp = _post_stream(auth_client, test_model)
+    b"".join(resp.response)
+    resp.close()
+    assert state.admits == 1
+    assert state.releases == 1
+    assert state.inflight == 0
+
+
+def test_chat_stream_releases_when_the_body_is_abandoned(
+    app, auth_client, test_user, test_model, monkeypatch,
+):
+    """Closing the response mid-stream (GeneratorExit) releases the ticket."""
+    from lumen.blueprints.chat import routes as chat_routes
+    with app.app_context():
+        _grant_unlimited_pool(app, test_user["id"])
+    state = _recording_live_state(monkeypatch, chat_routes)
+
+    def fake_stream(messages, model, entity_id=None, source="chat", effective=None):
+        yield "Hello", None, None
+        yield " world", None, None
+        yield None, None, dict(_FINAL_RESULT)
+
+    monkeypatch.setattr(chat_routes, "send_message_stream", fake_stream)
+
+    resp = _post_stream(auth_client, test_model)
+    events = iter(resp.response)
+    next(events)
+    assert state.inflight == 1
+    resp.close()  # client goes away with events still pending
+    assert state.releases == 1
+    assert state.inflight == 0
+
+
+def test_rejected_chat_stream_is_never_admitted(
+    app, auth_client, test_user, test_model, monkeypatch,
+):
+    """A blocked model is refused before admit, so it never counts as live."""
+    from lumen.blueprints.chat import routes as chat_routes
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.entity_model_access import EntityModelAccess
+        _grant_unlimited_pool(app, test_user["id"])
+        db.session.add(EntityModelAccess(
+            entity_id=test_user["id"],
+            model_config_id=test_model["id"],
+            access_type="blocked",
+        ))
+        db.session.commit()
+    state = _recording_live_state(monkeypatch, chat_routes)
+
+    resp = _post_stream(auth_client, test_model)
+    assert resp.status_code == HTTPStatus.FORBIDDEN
+    assert state.admits == 0
+    assert state.inflight == 0
+
+
+def test_unknown_model_is_never_admitted(app, auth_client, test_user, monkeypatch):
+    from lumen.blueprints.chat import routes as chat_routes
+    with app.app_context():
+        _grant_unlimited_pool(app, test_user["id"])
+    state = _recording_live_state(monkeypatch, chat_routes)
+
+    resp = auth_client.post("/chat/stream", json={
+        "messages": [{"role": "user", "content": "hi"}],
+        "model": "no-such-model",
+    })
+    assert resp.status_code == HTTPStatus.BAD_REQUEST
+    assert state.admits == 0
+    assert state.inflight == 0
+
+
+def test_releasing_a_finished_stream_twice_leaves_the_count_intact(
+    app, auth_client, test_user, test_model, monkeypatch,
+):
+    """close() after the generator has already run its finally must not
+    decrement anything else."""
+    from lumen.blueprints.chat import routes as chat_routes
+    with app.app_context():
+        _grant_unlimited_pool(app, test_user["id"])
+    state = _recording_live_state(monkeypatch, chat_routes)
+    bystander = state.admit(test_model["model_name"], 4242)
+
+    def fake_stream(messages, model, entity_id=None, source="chat", effective=None):
+        yield "Hello", None, None
+        yield None, None, dict(_FINAL_RESULT)
+
+    monkeypatch.setattr(chat_routes, "send_message_stream", fake_stream)
+
+    resp = _post_stream(auth_client, test_model)
+    b"".join(resp.response)
+    resp.close()          # first release ran at StopIteration
+    resp.close()          # and again — harmless
+    assert state.inflight == 1, "the double release took another request's ticket"
+
+    state.release(bystander)
+    state.release(bystander)
+    assert state.inflight == 0

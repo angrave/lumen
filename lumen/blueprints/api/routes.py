@@ -22,6 +22,7 @@ from lumen.models.model_endpoint import ModelEndpoint
 from lumen.models.request_log import RequestLog
 from lumen.services.cost import calculate_audio_cost
 from lumen.services.crypto import cache_salt_for_entity, hash_api_key
+from lumen.services.live_state import get_live_state
 from lumen.services.llm import (
     bulk_model_access_info,
     capture_request_timing,
@@ -401,40 +402,50 @@ def _complete_and_bill(model_name: str, messages: list, **kwargs):
     # context is current.
     timing = capture_request_timing()
     db.session.remove()  # return connection to pool before the LLM call
+    # Admitted only now: _preflight owns every rejection (unknown model, coin
+    # budget, access, no healthy endpoint) and a refused request must never
+    # appear in flight. There is no generator on this path, so the request
+    # finishes when this function returns — hence the finally around all of
+    # it, billing included, and not around the upstream call alone.
+    live_state = get_live_state()
+    ticket = live_state.admit(model_name, entity_id)
 
     try:
-        t0 = _time.monotonic()
-        # Non-streaming, so the read timeout bounds the wait for the *entire*
-        # response body rather than the gap between chunks — a generation that
-        # legitimately runs longer than LLM_READ_TIMEOUT is cut off here.
-        # Retries are allowed (unlike the streaming path): this attempt is
-        # finished and nothing has been sent to the client yet.
-        with openai.OpenAI(api_key=ep_api_key, base_url=ep_url,
-                           timeout=timeout, max_retries=max_retries) as client:
-            response = client.chat.completions.create(model=remote_model, messages=messages, **kwargs)
-        duration = _time.monotonic() - t0
-    except Exception as exc:
-        return None, _err(*_classify_upstream_error(
-            exc, f"upstream LLM error (endpoint={ep_id} {ep_url} model={remote_model})"))
+        try:
+            t0 = _time.monotonic()
+            # Non-streaming, so the read timeout bounds the wait for the *entire*
+            # response body rather than the gap between chunks — a generation that
+            # legitimately runs longer than LLM_READ_TIMEOUT is cut off here.
+            # Retries are allowed (unlike the streaming path): this attempt is
+            # finished and nothing has been sent to the client yet.
+            with openai.OpenAI(api_key=ep_api_key, base_url=ep_url,
+                               timeout=timeout, max_retries=max_retries) as client:
+                response = client.chat.completions.create(model=remote_model, messages=messages, **kwargs)
+            duration = _time.monotonic() - t0
+        except Exception as exc:
+            return None, _err(*_classify_upstream_error(
+                exc, f"upstream LLM error (endpoint={ep_id} {ep_url} model={remote_model})"))
 
-    usage = response.usage
-    if usage is None:
-        logger.warning("Upstream did not return usage data (model=%s, entity_id=%s)", model_name, entity_id)
-        usage_prompt, usage_completion = 0, 0
-    else:
-        usage_prompt, usage_completion = usage.prompt_tokens, usage.completion_tokens
+        usage = response.usage
+        if usage is None:
+            logger.warning("Upstream did not return usage data (model=%s, entity_id=%s)", model_name, entity_id)
+            usage_prompt, usage_completion = 0, 0
+        else:
+            usage_prompt, usage_completion = usage.prompt_tokens, usage.completion_tokens
 
-    cost = round(usage_prompt * mc_in_cost / 1_000_000 + usage_completion * mc_out_cost / 1_000_000, 6)
-    subtract_coins(entity_id, mc_id, cost, effective=effective)
-    update_stats(entity_id, mc_id, "api", usage_prompt, usage_completion, cost,
-                 endpoint_id=ep_id, duration=duration,
-                 timing=timing, upstream_t0=t0,
-                 # Non-streaming: the whole body arrives in one piece, so the
-                 # first chunk is the response and both marks are the duration.
-                 ttft=duration, ttft_visible=duration, outcome="ok")
-    _record_api_key_usage(ak_id, usage_prompt, usage_completion, cost)
-    db.session.commit()
-    return response, None
+        cost = round(usage_prompt * mc_in_cost / 1_000_000 + usage_completion * mc_out_cost / 1_000_000, 6)
+        subtract_coins(entity_id, mc_id, cost, effective=effective)
+        update_stats(entity_id, mc_id, "api", usage_prompt, usage_completion, cost,
+                     endpoint_id=ep_id, duration=duration,
+                     timing=timing, upstream_t0=t0,
+                     # Non-streaming: the whole body arrives in one piece, so the
+                     # first chunk is the response and both marks are the duration.
+                     ttft=duration, ttft_visible=duration, outcome="ok")
+        _record_api_key_usage(ak_id, usage_prompt, usage_completion, cost)
+        db.session.commit()
+        return response, None
+    finally:
+        live_state.release(ticket)
 
 
 def _merge_leading_system_messages(messages):
@@ -496,6 +507,14 @@ def _do_chat(model_name: str, messages: list, stream: bool, **kwargs):
     # Likewise read here, not in generate(): the client is constructed inside
     # the generator, which runs context-free with no current_app to read from.
     timeout, max_retries = upstream_call_bounds(streaming=True)
+    # Admitted last, once _preflight has passed: a refused request must never
+    # appear in flight. The ticket rides in the closure like the disconnect
+    # Event, and generate()'s finally releases it. Nothing between here and the
+    # Response below can raise, so an admitted request always reaches the
+    # generator. The backend is resolved here too — picking one reads config,
+    # which the context-free generator cannot do.
+    live_state = get_live_state()
+    ticket = live_state.admit(model_name, entity_id)
 
     def generate():
         billed = False
@@ -637,6 +656,12 @@ def _do_chat(model_name: str, messages: list, stream: bool, **kwargs):
             # yields pending forever.
             yield f"data: {json.dumps({'error': {'message': msg, 'type': err_type}})}\n\n"
             yield "data: [DONE]\n\n"
+        finally:
+            # Best effort, not the correctness argument: an abandoned generator
+            # is never closed, so this may never run. The ticket's deadline is
+            # what bounds the count. Context-free — no db.session, no
+            # current_app.
+            live_state.release(ticket)
 
     return Response(generate(), content_type="text/event-stream")
 
@@ -695,53 +720,61 @@ def _do_audio(kind: str):
     # Read while the request context is current, like the paths above.
     timing = capture_request_timing()
     db.session.remove()
+    # Admitted only now, for the same reason as the completions path above:
+    # _preflight owns every rejection. Not a generator either, so the finally
+    # runs when the request itself finishes.
+    live_state = get_live_state()
+    ticket = live_state.admit(model_name, entity_id)
 
     try:
-        t0 = _time.monotonic()
-        # Non-streaming: the read timeout bounds the whole transcription, and
-        # the write timeout the upload of the audio file. A long recording can
-        # legitimately exceed LLM_READ_TIMEOUT — raise it if that bites.
-        with openai.OpenAI(api_key=ep_api_key, base_url=ep_url,
-                           timeout=timeout, max_retries=max_retries) as client:
-            create = getattr(client.audio, kind).create
-            response = create(model=remote_model, file=(file_name, file_data, file_type), **extra)
-        duration = _time.monotonic() - t0
-    except Exception as exc:
-        return _err(*_classify_upstream_error(
-            exc, f"upstream audio error (endpoint={ep_id} {ep_url} model={remote_model})"))
+        try:
+            t0 = _time.monotonic()
+            # Non-streaming: the read timeout bounds the whole transcription, and
+            # the write timeout the upload of the audio file. A long recording can
+            # legitimately exceed LLM_READ_TIMEOUT — raise it if that bites.
+            with openai.OpenAI(api_key=ep_api_key, base_url=ep_url,
+                               timeout=timeout, max_retries=max_retries) as client:
+                create = getattr(client.audio, kind).create
+                response = create(model=remote_model, file=(file_name, file_data, file_type), **extra)
+            duration = _time.monotonic() - t0
+        except Exception as exc:
+            return _err(*_classify_upstream_error(
+                exc, f"upstream audio error (endpoint={ep_id} {ep_url} model={remote_model})"))
 
-    # response is a pydantic model for json/verbose_json, or a plain string for
-    # text/srt/vtt response formats (which carry no usage object).
-    payload = response.model_dump() if hasattr(response, "model_dump") else {"text": str(response)}
-    usage = payload.get("usage") if isinstance(payload, dict) else None
+        # response is a pydantic model for json/verbose_json, or a plain string for
+        # text/srt/vtt response formats (which carry no usage object).
+        payload = response.model_dump() if hasattr(response, "model_dump") else {"text": str(response)}
+        usage = payload.get("usage") if isinstance(payload, dict) else None
 
-    in_tok, out_tok, seconds, cost = 0, 0, 0, 0.0
-    if isinstance(usage, dict) and usage.get("type") == "duration":
-        seconds = int(usage.get("seconds") or 0)
-        cost = calculate_audio_cost(seconds, mc_audio_per_hour)
-        if mc_audio_per_hour == 0:
-            logger.warning(
-                "Audio model has no audio_cost_per_hour set (model=%s, entity_id=%s) — billed as zero cost.",
-                model_name, entity_id,
-            )
-    elif isinstance(usage, dict) and (usage.get("type") == "tokens" or "prompt_tokens" in usage):
-        in_tok = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
-        out_tok = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
-        cost = round(in_tok * mc_in_cost / 1_000_000 + out_tok * mc_out_cost / 1_000_000, 6)
-    else:
-        logger.warning("Upstream did not return usage data (model=%s, entity_id=%s)", model_name, entity_id)
+        in_tok, out_tok, seconds, cost = 0, 0, 0, 0.0
+        if isinstance(usage, dict) and usage.get("type") == "duration":
+            seconds = int(usage.get("seconds") or 0)
+            cost = calculate_audio_cost(seconds, mc_audio_per_hour)
+            if mc_audio_per_hour == 0:
+                logger.warning(
+                    "Audio model has no audio_cost_per_hour set (model=%s, entity_id=%s) — billed as zero cost.",
+                    model_name, entity_id,
+                )
+        elif isinstance(usage, dict) and (usage.get("type") == "tokens" or "prompt_tokens" in usage):
+            in_tok = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+            out_tok = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+            cost = round(in_tok * mc_in_cost / 1_000_000 + out_tok * mc_out_cost / 1_000_000, 6)
+        else:
+            logger.warning("Upstream did not return usage data (model=%s, entity_id=%s)", model_name, entity_id)
 
-    subtract_coins(entity_id, mc_id, cost, effective=effective)
-    update_stats(entity_id, mc_id, "api", in_tok, out_tok, cost,
-                 endpoint_id=ep_id, duration=duration, audio_seconds=seconds,
-                 timing=timing, upstream_t0=t0,
-                 # Non-streaming: the transcription arrives in one piece, so the
-                 # first chunk is the response and both marks are the duration.
-                 ttft=duration, ttft_visible=duration, outcome="ok")
-    _record_api_key_usage(ak_id, in_tok, out_tok, cost, audio_seconds=seconds)
-    db.session.commit()
+        subtract_coins(entity_id, mc_id, cost, effective=effective)
+        update_stats(entity_id, mc_id, "api", in_tok, out_tok, cost,
+                     endpoint_id=ep_id, duration=duration, audio_seconds=seconds,
+                     timing=timing, upstream_t0=t0,
+                     # Non-streaming: the transcription arrives in one piece, so the
+                     # first chunk is the response and both marks are the duration.
+                     ttft=duration, ttft_visible=duration, outcome="ok")
+        _record_api_key_usage(ak_id, in_tok, out_tok, cost, audio_seconds=seconds)
+        db.session.commit()
 
-    return jsonify(payload)
+        return jsonify(payload)
+    finally:
+        live_state.release(ticket)
 
 
 @api_bp.route("/audio/transcriptions", methods=["POST"])

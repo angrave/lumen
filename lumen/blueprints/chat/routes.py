@@ -20,6 +20,7 @@ from lumen.models.entity_stat import EntityStat
 from lumen.models.message import Message
 from lumen.models.model_config import ModelConfig
 from lumen.models.model_endpoint import ModelEndpoint
+from lumen.services.live_state import get_live_state
 from lumen.services.llm import bulk_model_access_info, check_coin_budget, get_pool_limit, send_message_stream
 from lumen.services.wsgi_disconnect import client_disconnect_event
 from lumen.timeutils import utcnow
@@ -247,6 +248,14 @@ def chat_stream():
     app = current_app._get_current_object()
     disconnected = client_disconnect_event()
     llm_stream = send_message_stream(messages, model, entity_id=entity_id, source="chat", effective=effective)
+    # Admitted last, once every rejection above has passed: a refused request
+    # must never appear in flight. The ticket rides in the closure like the
+    # disconnect Event, and generate()'s finally releases it. Nothing between
+    # here and the Response below can raise, so an admitted request always
+    # reaches the generator. The backend is resolved here too — picking one
+    # reads config, which the context-free generator cannot do.
+    live_state = get_live_state()
+    ticket = live_state.admit(model, entity_id)
 
     def generate():
         try:
@@ -339,6 +348,12 @@ def chat_stream():
             # context exited; there is no ambient session here to clean up.
             logger.exception("chat_stream error (model=%s, entity=%s)", model, entity_id)
             yield f"data: {json.dumps({'error': 'An error occurred. Please try again.'})}\n\n"
+        finally:
+            # Best effort, not the correctness argument: an abandoned generator
+            # is never closed, so this may never run. The ticket's deadline is
+            # what bounds the count. Context-free — no db.session, no
+            # current_app.
+            live_state.release(ticket)
 
     resp = Response(generate(), content_type="text/event-stream")
     resp.headers["X-Accel-Buffering"] = "no"

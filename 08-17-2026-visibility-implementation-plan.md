@@ -1378,14 +1378,59 @@ set by an admin. Where the backend does report it, `model_sync` may fill it **on
 never replacing a value a human set. A NULL denominator renders as "unknown", never as a guess —
 saturation displayed against an invented capacity is worse than no saturation figure.
 
-**(f) The Lumen-side scraper (§10.2) is not built until something needs it.**
-It exists in the plan for two reasons: `/admin/status` without Prometheus, and upstream depth stored
-in Lumen's own DB. Neither is required by Phase 7a. **[DECISION]** defer it; if it is built later, it
-must not send the endpoint API key to a `/metrics` path, which is the risk `http_sd` removes.
+**(f) The Lumen-side scraper (§10.2) is REQUIRED if the chat queue indicator is wanted.**
+An earlier draft deferred it as optional, which silently contradicted §11's contract. **[FACT]**
+under `http_sd`, **Prometheus** scrapes the backends, and Lumen has no Prometheus query client
+anywhere in the tree — the codebase only ever *exposes* metrics. So `num_requests_waiting` lives in
+Prometheus and never enters Lumen's process. §11(d) names it as the only honest source for "N ahead
+of you", so with the scraper deferred that feature is unbuildable and the "elapsed time only"
+fallback becomes permanent by accident.
 
-**Tests.** Token required; valid `http_sd` JSON shape; no API key in the body; hosted providers and
-`unknown` backends excluded; an endpoint that was healthy and is now down is still **included**; the
-label is `lumen_model`; URL → target strips `/v1` and yields `host:port` including for a path prefix.
+**[DECISION]** Pick one deliberately, and record which:
+- **Build the scraper** (§10.2) as part of Phase 6 — it is the prerequisite for the chat indicator
+  and for `/admin/status` working without Prometheus. It must not send the endpoint API key to a
+  `/metrics` path, which is the risk `http_sd` otherwise removes.
+- **Or drop "N ahead of you"** from §11 and from this phase's stated benefits, leaving chat with the
+  elapsed-time indicator permanently.
+
+What is not acceptable is leaving the two sections contradicting each other, or putting a Prometheus
+HTTP query on the chat request path — which this plan forbids elsewhere for exactly this reason.
+
+**(g) Emit `__scheme__` and `__metrics_path__`, not a bare `host:port`.**
+Endpoint URLs are arbitrary base URLs, and `_sglang_root` strips only a trailing `/v1`, leaving any
+path prefix in place. For `https://spark0:8000/gateway/v1`, a bare `host:port` target under a job
+with `metrics_path: /metrics` makes Prometheus scrape **`http://spark0:8000/metrics`** — wrong scheme
+and wrong path — and the target reads permanently down, which §10(a) identifies as the worst
+available outcome. Derive the port explicitly with a scheme default, and emit both meta-labels per
+target. IPv6 literals need bracketing.
+
+**(h) Exclude models that are not servable.** `ModelConfig.active` and `.disabled` already gate
+routing (`lumen/services/llm.py:307-318`). An operator who disables a model and shuts its backend
+down otherwise gets a permanently-down target — the same failure (d) exists to prevent, reached by
+another route. Filter on `active AND NOT disabled`.
+
+**(i) Who writes these columns, and what survives a URL edit.** **[FACT]** the only backend-detection
+code path runs from the admin config editor against unsaved JSON and never touches `model_endpoints`
+rows; endpoint rows are reconciled from YAML **keyed by URL**, so changing a URL is a delete + insert
+that carries across only `api_key` and `model_name`. Left alone, `backend` stays `unknown` forever
+(so discovery is empty and Phase 6 monitors nothing), and fixing a port typo silently resets
+`max_concurrency` and `first_healthy_at`.
+**[DECISION]** the detection probe runs in the **health checker** pass, which already writes
+`ModelEndpoint` rows and is already elected; `max_concurrency` is a `config.yaml` endpoint field
+synced through the reconciler (with the `chart/values.yaml` + `values.schema.json` updates CLAUDE.md
+requires), not a DB-only field with no UI to set it; and the reconciler must carry `backend`,
+`first_healthy_at` and `max_concurrency` across a URL change.
+**[DECISION]** allow an explicit per-endpoint `backend:` in `config.yaml` that **wins over
+detection**, and surface `unknown` with its reason on the admin models page. Otherwise a vLLM behind
+an auth-all ingress, or started with `--disable-log-stats`, sits unmonitored and nothing says why.
+**[OPEN]** whether `first_healthy_at` is backfilled for existing endpoints at migration time —
+without it, every currently-working backend is invisible to discovery until its next probe.
+
+**Tests.** Token required; valid `http_sd` JSON shape; no API key in the body; hosted providers,
+`unknown` backends and disabled/inactive models excluded; an endpoint that was healthy and is now
+down is still **included**; the label is `lumen_model`; and target derivation yields the correct
+`__scheme__`/`__metrics_path__`/port triple for an **https, path-prefixed** URL, not merely
+`host:port`.
 
 
 ---
@@ -1440,10 +1485,19 @@ and the percentile decision from G0.3. Building 7b early means charting raw `req
 `period=all` p95 over per-user rows is a full-history scan **per page load**, on the one page most
 likely to be open during an incident, reintroducing exactly the burst-time scans Phase 4 removed.
 
-**(b) 7a issues zero SQL. This is a hard constraint, not an aspiration.**
-Every tile reads the Phase 4 snapshot and `LiveState`. §14 already asserts it for `/metrics`; the same
-`before_cursor_execute` counter guards `/admin/api/status`. The page auto-refreshes on a timer, so a
-single query here becomes a query every 5 seconds per open admin tab, during the incident.
+**(b) 7a issues zero SQL BEYOND the `admin_required` identity lookup.**
+An earlier draft said "zero SQL", full stop. That is **unsatisfiable by construction**: **[FACT]**
+`admin_required` (`lumen/decorators.py`) does `db.session.get(Entity, session["entity_id"])` on every
+call, and a fresh session per request makes that a real SELECT. The `/metrics` precedent does not
+carry over — `_metrics_auth_required` is a bearer-token comparison with no DB access at all. A test
+asserting zero would fail on the first commit, and the cheapest way to green it is to weaken the
+assertion or drop the decorator: one erases the invariant, the other opens an admin endpoint.
+
+**[DECISION]** the constraint is **no data query**: exactly one statement per request, and it targets
+`entities`. The `before_cursor_execute` test asserts the count *and* the statement's target table, so
+a data query added later cannot hide behind the auth lookup. §14's invariant row carries the same
+wording. The page auto-refreshes on a timer, so one data query here becomes a query every few seconds
+per open admin tab, during the incident.
 
 **(c) Every live number renders with the topology it was computed from.**
 Use `LiveState.topology()`. A tile reading "12 users waiting" that is silently per-process at 4
@@ -1464,8 +1518,13 @@ the behaviour the indicator exists to prevent.
 **[FACT]** `lumen/blueprints/models_page/routes.py` shows a model owning a list of endpoints. Depth
 summed across endpoints tells a student "40 ahead" when they are behind 10 on the endpoint they will
 actually land on — and which endpoint that is cannot be known before dispatch (round-robin selects
-later). **[DECISION]** display the **maximum** across an endpoint set, labelled "busiest endpoint",
-never the sum.
+later). **[DECISION]** display the **maximum across the *healthy* subset**, worded to the student as an
+upper bound ("at most N ahead"), never the sum. Two corrections an earlier draft missed:
+`get_next_endpoint` round-robins over **healthy endpoints only**, so an unhealthy-but-loaded endpoint
+must not enter the max; and round-robin makes the landing endpoint roughly uniform, not worst-case,
+so a bare "40 ahead" shown to a student who lands on the idle endpoint and waits five seconds teaches
+exactly the same "this number is a lie" lesson that (d) is written to avoid. The upper-bound wording
+is what keeps it honest in both directions.
 
 **(f) The chat indicator is client-side elapsed time.**
 Server-emitted heartbeat frames would interact with proxy buffering and with the context-free
@@ -1490,7 +1549,8 @@ an orphaned older copy of `usage.html`. **[DECISION]** delete the orphan in the 
 (`themes/{default,illinois,uic,uis}/templates/theme/header.html`). Factor them into a shared partial
 in the same change — four copies is how the next page gets added to three of them.
 
-**Tests:** `@admin_required` on page and JSON endpoint; `/admin/api/status` executes zero SQL;
+**Tests:** `@admin_required` on page and JSON endpoint; `/admin/api/status` issues exactly one
+statement and it targets `entities` (see (b) — a bare "zero SQL" cannot hold behind an auth lookup);
 the topology label renders when `LocalLiveState` is active; `tests/ui/test_accessibility.py` covers the
 new page; screenshots in `docs/img/` re-captured and `docs/admin/` updated (CLAUDE.md).
 
@@ -1554,8 +1614,27 @@ just a wrong chart. Daily is the cheaper and therefore tempting choice, so this 
 left to judgement.
 
 **[DECISION]** `request_counts_hourly_by_entity`, `time_bucket('1 hour', time)`, grouped by
-`bucket, entity_id, model_config_id, source`, aggregating the same measures as the existing hourly
-aggregate. Cardinality is bounded by *active* user-hours, not users × models × hours: a student uses
+`bucket, entity_id, model_config_id, source`.
+
+**Enumerate the columns; "the same measures as the existing aggregate" loses the ones this project
+added.** **[FACT]** the existing aggregate selects only `COUNT(*)`, `SUM(input_tokens)`,
+`SUM(output_tokens)`, `SUM(cost)` — it does not even carry `duration`. §11 promises per-user median
+and p95 TTFT and abort share, and once retention drops raw chunks those are **unrecoverable** unless
+the aggregate carries them. So it must also carry `SUM(duration)`, an abort count
+(`COUNT(*) FILTER (WHERE outcome = 'disconnect')`), and the TTFT measure chosen by (f) —
+`percentile_agg(ttft_visible)` if the toolkit is present, fixed-bucket counts if not.
+
+**And specify the refresh properties, or the rewrite loses the last hour of everyone's data.**
+`timescaledb.materialized_only` defaults to **true** on recent Timescale, so a non-real-time
+aggregate returns nothing newer than the last materialisation — and the existing policy's
+`end_offset => 1 hour, schedule_interval => 1 hour` would put that up to two hours behind. The raw
+queries being replaced are exact to the millisecond. A student who runs 40 requests in a 9 a.m. lab
+and opens `/usage` at 09:50 would see **zero** — a bigger and far more frequent complaint than the
+truncation this phase exists to prevent, because it hits every active user every day.
+**[DECISION]** set `materialized_only = false` (real-time aggregation, so recent rows come from raw),
+or an `end_offset` under a minute with a matching `schedule_interval`; G0.3's version answer decides
+which is available. **The equality test in (a) step 2 must include data inside the current bucket** —
+run against historical rows only, it passes while certifying the regression. Cardinality is bounded by *active* user-hours, not users × models × hours: a student uses
 one or two models in an hour, so a 300-student class produces a few hundred rows per hour, not tens of
 thousands. **Verify against G0.4 before enabling retention.**
 
@@ -1568,22 +1647,52 @@ per-user "All Time" stays empty until a full refresh runs.
 
 **[DECISION]** the migration creates the aggregate `WITH NO DATA` and adds the policy; the
 full-history refresh is a separate `flask` CLI command, run deliberately by an operator, with its
-expected runtime estimated from G0.4 first. **Do not** put an unbounded materialisation on the deploy
+expected runtime estimated from G0.4 first. The command must open its own **AUTOCOMMIT** connection
+(a `flask` command using `db.session` fails with "cannot run inside a transaction block") and should
+refresh **month by month** rather than one `CALL ... (NULL, NULL)`, which over 13 months of a
+production hypertable is a single long transaction with unbounded memory.
+
+**The backfill must run BEFORE the code that reads the aggregate is deployed.** **[FACT]**
+`entrypoint.sh:8` runs `flask db upgrade` at container start, so the migration lands automatically —
+and a policy-created aggregate holds only its `start_offset` window. Deploying the query rewrite in
+the same release therefore guarantees that every user's All Time, Month and Week charts read
+near-empty from the moment of deploy until a human remembers a CLI command nothing gates on. That is
+the *identical* user report this phase's ordering exists to prevent, and it is certain rather than
+conditional. **[DECISION]** the ordering in (a) is: create aggregate → **run the backfill and verify
+row counts** → deploy the rewrite. If they must ship together, the rewritten queries fall back to raw
+whenever the aggregate's earliest bucket is later than the requested window start, and the fallback
+is deleted once the backfill is confirmed. **Do not** put an unbounded materialisation on the deploy
 path — on a production-sized hypertable it can run for hours while `flask db upgrade` blocks container
 start (`entrypoint.sh:8`).
 
-**(d) `start_offset` and retention must agree, or step 4 appears broken.**
-A refresh policy whose `start_offset` reaches into chunks that retention has dropped errors out.
+**(d) `start_offset` and retention must agree — and getting it wrong ERASES data silently.**
+An earlier draft said a refresh reaching into dropped chunks "errors out". It does not: refreshing a
+window whose raw chunks are gone recomputes that window as **empty and deletes the materialised
+rows**. There is no error for an operator to notice; the users simply lose history.
+
+Two guards follow, and the second matters more:
 **[DECISION]** set `start_offset` to a finite window comfortably inside the retention window, and
-state both numbers next to each other in the migration so the relationship is visible when either is
-changed.
+state both numbers adjacent in the migration so the relationship is visible when either changes.
+**[DECISION]** the (c) backfill CLI must **refuse** to refresh any window starting before the
+retention boundary, unless given an explicit `--force`, and must print the row count it is about to
+affect. Without that guard the CLI is a foot-gun: it is documented, it looks idempotent, and an
+operator running it a year after retention is enabled would erase every user's pre-retention history
+in one call — strictly worse than the truncation this whole phase is built to avoid.
 
 **(e) Compression is a one-way door for `request_logs` schema changes.**
 Adding a column to a hypertable with compressed chunks is restricted and version-dependent; the
 practical consequence is a decompress/recompress migration over the whole retention window.
-**[DECISION]** compression lands **after all planned `request_logs` column additions** — which
-includes anything Phase 9 would want, such as a rejection or queue-position column. **G0.3's version
-answer decides this, not just the percentile question**; record it against this decision explicitly.
+An earlier draft made compression wait for "anything Phase 9 would want", which blocks a
+non-negotiable step of Phase 8 on a phase §13 explicitly declares out of scope — leaving the engineer
+to stop, add speculative columns (CLAUDE.md §2 forbids), or ignore the contract.
+
+**[DECISION] Bind it to G0.3, with both branches stated:**
+- **If the deployed Timescale supports `ADD COLUMN` on compressed hypertables** (roughly 2.10+, for
+  nullable columns): compression proceeds now, and any later phase adds nullable columns freely.
+- **If it does not:** compression waits until the `request_logs` schema is settled, and that delay is
+  a stated cost of running the older version — not a dependency on an undesigned phase.
+
+Record the answer against this decision when G0.3 returns.
 
 **(f) Percentiles: exact if the toolkit is present, hand-rolled buckets if not.**
 Continuous aggregates hold `COUNT`/`SUM`/`MAX`, which gives means and worst cases but not p95. If
@@ -1596,6 +1705,16 @@ Chosen because this is an academic deployment where term-over-term comparison is
 analysis, and the storage cost of being generous is small. **Revisit against G0.4** — every storage
 figure in this plan is an estimate until that query is run.
 
+**(g2) The entity aggregate needs its own retention decision, and G0.4 must measure it.**
+`add_retention_policy` on the hypertable does **not** apply to its continuous aggregates. Left
+unstated, per-user hourly rows accumulate forever — which is what makes "All Time" work, but it also
+makes the stated 13-month policy false for precisely the most identity-bearing data in the system,
+with the data-protection implication that per-user rows outlive the raw rows they came from.
+**[DECISION]** state it explicitly — indefinite retention for the aggregate, or its own longer window
+— and **include the aggregate in G0.4's size query**, which currently measures `request_logs` only.
+The figure justifying "the storage cost of being generous is trivial" is otherwise measuring the
+wrong table.
+
 **(h) Lifetime totals survive retention, and the UI should say so.**
 `entity_stats` and `model_stats` are cumulative all-time counters written synchronously with every
 request, so dropping raw chunks loses no one's lifetime usage or cost. Say this next to any chart that
@@ -1607,6 +1726,10 @@ older than the window, drop the chunks, assert per-user charts still render from
 `entity_stats` totals are unchanged; the heatmap returns 24 distinct hours from the aggregate (the
 guard for (b)); compression round-trip leaves query results identical; the 1-minute aggregate is
 within one bucket of the raw table for a synthetic burst.
+
+**(i) The rewrite must preserve the SQLite early-return.** All five per-entity endpoints
+short-circuit today on `dialect.name != "postgresql"`, and the rewrite must keep doing so — a
+continuous aggregate does not exist on SQLite, and the development and test paths run there.
 
 **[GATE]** retention is enabled only after a dry run on a copy of production shows no per-user chart
 changes. If anything changes, the phase stops.
@@ -1674,7 +1797,7 @@ production. These join them.
 | **No Redis on the critical path.** Every failure mode of Redis leaves proxying unaffected | `tests/unit/test_live_state.py` — raising and sleeping fake clients |
 | **Every `Gauge` declares `multiprocess_mode`** | static scan over `lumen/`, same shape as `tests/unit/test_no_stream_with_context.py` |
 | **Every live counter returns to zero** after any exit path | `tests/unit/test_live_state.py`, `tests/unit/test_wsgi_queue_metrics.py`, parametrised over normal / raise / disconnect / stall / timeout |
-| **`/metrics` and `/admin/api/status` execute zero SQL** | `tests/routes/test_metrics_routes.py`, `tests/routes/test_admin_routes.py` — `before_cursor_execute` listener |
+| **`/metrics` executes zero SQL; `/admin/api/status` executes exactly one statement, the `admin_required` identity lookup against `entities`** (a bare "zero" is unsatisfiable — see §11's contract) | `tests/routes/test_metrics_routes.py`, `tests/routes/test_admin_routes.py` — `before_cursor_execute` listener |
 | **No DB session and no Flask context spans a `yield`** (existing CLAUDE.md rule; the snapshot refresher and the backend scraper are both new generators-adjacent daemons) | `tests/unit/test_no_stream_with_context.py` (existing), `tests/unit/test_db_teardown.py` extended to the new threads |
 | **`time.monotonic()` for durations, wall clock only for stored timestamps** | review checklist; the existing LLM path uses `time.time()` throughout, which is NTP-step-sensitive — a wart worth not replicating |
 | **No user identity in any Prometheus label** | static scan of label names against a denylist (`entity`, `user`, `email`, `api_key`) |

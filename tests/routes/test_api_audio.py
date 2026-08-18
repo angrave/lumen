@@ -578,3 +578,282 @@ def test_a_broken_counter_never_turns_a_503_into_a_500(
         _grant_finite_pool(app, test_user["id"])
 
     assert _transcribe(client, token).status_code == HTTPStatus.SERVICE_UNAVAILABLE
+
+
+# ---------------------------------------------------------------------------
+# Live state (in-flight accounting) for the three /v1 paths
+#
+# admit() belongs in the view, after _preflight has passed every rejection;
+# release() in the streaming generator's finally, and in a finally around the
+# whole request on the two non-streaming paths. Every exit path must leave the
+# in-flight count at zero.
+# ---------------------------------------------------------------------------
+
+from tests.routes.test_api_auth import (  # noqa: E402 - grouped with the section it serves
+    _allow_model,
+    _capturing_openai,
+    _chat_post,
+    _fake_openai,
+    _NonStreamResponse,
+    _UsageChunk,
+)
+from tests.routes.test_chat_routes import _recording_live_state  # noqa: E402
+
+
+class _FakeAudio:
+    """Upstream transcription response with a billable duration."""
+
+    def model_dump(self):
+        return {"text": "hi", "usage": {"type": "duration", "seconds": 10}}
+
+
+def _live_state(monkeypatch):
+    from lumen.blueprints.api import routes
+    return _recording_live_state(monkeypatch, routes)
+
+
+# ── /v1/chat/completions, streaming ───────────────────────────────────────────
+
+def test_api_stream_admits_once_and_releases_once(
+    app, client, monkeypatch, test_user, test_model, test_model_endpoint, api_key,
+    fresh_rate_limit,
+):
+    from lumen.blueprints.api import routes
+    token, _ = api_key
+    _allow_model(app, test_user, test_model)
+    state = _live_state(monkeypatch)
+    _fake_openai(monkeypatch, routes, [_UsageChunk()])
+
+    resp = _chat_post(client, token, test_model["model_name"], True)
+    assert resp.status_code == HTTPStatus.OK
+    assert resp.is_streamed
+    events = iter(resp.response)
+    try:
+        next(events)  # suspended mid-stream: still in flight
+        assert state.admits == 1
+        assert state.inflight == 1
+        for _ in events:
+            pass
+    finally:
+        resp.close()
+
+    assert state.releases == 1
+    assert state.inflight == 0
+
+
+def test_api_stream_releases_on_client_disconnect(
+    app, client, monkeypatch, test_user, test_model, test_model_endpoint, api_key,
+    fresh_rate_limit,
+):
+    import threading
+    from lumen.blueprints.api import routes
+    token, _ = api_key
+    _allow_model(app, test_user, test_model)
+    state = _live_state(monkeypatch)
+    disconnected = threading.Event()
+
+    def chunks():
+        yield _UsageChunk()
+        disconnected.set()  # client vanishes mid-stream
+        yield _UsageChunk()
+
+    _fake_openai(monkeypatch, routes, chunks())
+    monkeypatch.setattr(routes, "client_disconnect_event", lambda: disconnected)
+
+    resp = _chat_post(client, token, test_model["model_name"], True)
+    b"".join(resp.response)
+    resp.close()
+    assert state.admits == 1
+    assert state.releases == 1
+    assert state.inflight == 0
+
+
+def test_api_stream_releases_when_the_body_is_abandoned(
+    app, client, monkeypatch, test_user, test_model, test_model_endpoint, api_key,
+    fresh_rate_limit,
+):
+    """Closing the response mid-stream (GeneratorExit) releases the ticket."""
+    from lumen.blueprints.api import routes
+    token, _ = api_key
+    _allow_model(app, test_user, test_model)
+    state = _live_state(monkeypatch)
+    _fake_openai(monkeypatch, routes, [_UsageChunk(), _UsageChunk(), _UsageChunk()])
+
+    resp = _chat_post(client, token, test_model["model_name"], True)
+    events = iter(resp.response)
+    next(events)
+    assert state.inflight == 1
+    resp.close()
+    assert state.releases == 1
+    assert state.inflight == 0
+
+
+def test_api_stream_releases_when_upstream_fails(
+    app, client, monkeypatch, test_user, test_model, test_model_endpoint, api_key,
+    fresh_rate_limit,
+):
+    from lumen.blueprints.api import routes
+
+    def boom(**kwargs):
+        raise RuntimeError("upstream is down")
+
+    token, _ = api_key
+    _allow_model(app, test_user, test_model)
+    state = _live_state(monkeypatch)
+    _capturing_openai(monkeypatch, routes, boom)
+
+    resp = _chat_post(client, token, test_model["model_name"], True)
+    body = b"".join(resp.response)
+    resp.close()
+    assert b'"error"' in body
+    assert state.admits == 1
+    assert state.releases == 1
+    assert state.inflight == 0
+
+
+# ── /v1/chat/completions, non-streaming ───────────────────────────────────────
+
+def test_api_non_stream_admits_once_and_releases_once(
+    app, client, monkeypatch, test_user, test_model, test_model_endpoint, api_key,
+    fresh_rate_limit,
+):
+    """No generator here, so the request is live for the upstream call and the
+    billing that follows it."""
+    from lumen.blueprints.api import routes
+    token, _ = api_key
+    _allow_model(app, test_user, test_model)
+    state = _live_state(monkeypatch)
+    observed = []
+
+    def create(**kwargs):
+        observed.append(state.inflight)
+        return _NonStreamResponse()
+
+    _capturing_openai(monkeypatch, routes, create)
+
+    resp = _chat_post(client, token, test_model["model_name"], False)
+    assert resp.status_code == HTTPStatus.OK
+    assert observed == [1], "the request was not in flight during the upstream call"
+    assert (state.admits, state.releases) == (1, 1)
+    assert state.inflight == 0
+
+
+def test_api_non_stream_releases_when_upstream_fails(
+    app, client, monkeypatch, test_user, test_model, test_model_endpoint, api_key,
+    fresh_rate_limit,
+):
+    from lumen.blueprints.api import routes
+
+    def boom(**kwargs):
+        raise RuntimeError("upstream is down")
+
+    token, _ = api_key
+    _allow_model(app, test_user, test_model)
+    state = _live_state(monkeypatch)
+    _capturing_openai(monkeypatch, routes, boom)
+
+    resp = _chat_post(client, token, test_model["model_name"], False)
+    assert resp.status_code >= HTTPStatus.BAD_REQUEST
+    assert (state.admits, state.releases) == (1, 1)
+    assert state.inflight == 0
+
+
+def test_api_non_stream_releases_when_billing_raises(
+    app, client, monkeypatch, test_user, test_model, test_model_endpoint, api_key,
+    fresh_rate_limit,
+):
+    """The finally covers the billing too, so a failure there still releases."""
+    from lumen.blueprints.api import routes
+
+    def boom(*a, **kw):
+        raise RuntimeError("billing blew up")
+
+    token, _ = api_key
+    _allow_model(app, test_user, test_model)
+    state = _live_state(monkeypatch)
+    _capturing_openai(monkeypatch, routes, lambda **kwargs: _NonStreamResponse())
+    monkeypatch.setattr(routes, "update_stats", boom)
+
+    with pytest.raises(RuntimeError):
+        _chat_post(client, token, test_model["model_name"], False)
+    assert (state.admits, state.releases) == (1, 1)
+    assert state.inflight == 0
+
+
+def test_rejected_api_request_is_never_admitted(
+    app, client, monkeypatch, test_user, test_model, test_model_endpoint, api_key,
+    fresh_rate_limit,
+):
+    """An exhausted coin budget is refused inside _preflight, before admit."""
+    token, _ = api_key
+    with app.app_context():
+        _exhaust_budget(app, test_user["id"], refresh_coins=10)
+    state = _live_state(monkeypatch)
+
+    resp = _chat_post(client, token, test_model["model_name"], False)
+    assert resp.status_code == HTTPStatus.TOO_MANY_REQUESTS
+    assert state.admits == 0
+    assert state.inflight == 0
+
+
+# ── /v1/audio/transcriptions ──────────────────────────────────────────────────
+
+def test_audio_admits_once_and_releases_once(
+    app, client, monkeypatch, test_user, test_model, test_model_endpoint, api_key,
+    fresh_rate_limit,
+):
+    from lumen.blueprints.api import routes
+    token, _ = api_key
+    with app.app_context():
+        _grant_finite_pool(app, test_user["id"])
+        _set_audio_rate(app, test_model["id"], 0.6)
+    state = _live_state(monkeypatch)
+    observed = []
+
+    def create(**kwargs):
+        observed.append(state.inflight)
+        return _FakeAudio()
+
+    _capturing_openai(monkeypatch, routes, create)
+
+    resp = _transcribe(client, token)
+    assert resp.status_code == HTTPStatus.OK
+    assert observed == [1], "the request was not in flight during the upstream call"
+    assert (state.admits, state.releases) == (1, 1)
+    assert state.inflight == 0
+
+
+def test_audio_releases_when_upstream_fails(
+    app, client, monkeypatch, test_user, test_model, test_model_endpoint, api_key,
+    fresh_rate_limit,
+):
+    from lumen.blueprints.api import routes
+
+    def boom(**kwargs):
+        raise RuntimeError("upstream is down")
+
+    token, _ = api_key
+    with app.app_context():
+        _grant_finite_pool(app, test_user["id"])
+    state = _live_state(monkeypatch)
+    _capturing_openai(monkeypatch, routes, boom)
+
+    resp = _transcribe(client, token)
+    assert resp.status_code >= HTTPStatus.BAD_REQUEST
+    assert (state.admits, state.releases) == (1, 1)
+    assert state.inflight == 0
+
+
+def test_rejected_audio_request_is_never_admitted(
+    app, client, monkeypatch, test_user, test_model, test_model_endpoint, api_key,
+    fresh_rate_limit,
+):
+    token, _ = api_key
+    with app.app_context():
+        _exhaust_budget(app, test_user["id"], refresh_coins=10)
+    state = _live_state(monkeypatch)
+
+    resp = _transcribe(client, token)
+    assert resp.status_code == HTTPStatus.TOO_MANY_REQUESTS
+    assert state.admits == 0
+    assert state.inflight == 0

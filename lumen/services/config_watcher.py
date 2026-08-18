@@ -194,6 +194,12 @@ RESTART_REQUIRED = [
     ("oauth2",),
     ("api", "prometheus", "enabled"),
     ("api", "prometheus", "multiproc_dir"),
+    # Read once at startup: the limiter's storage is configured on the extension,
+    # and get_live_state() resolves its backend from the same URL on first use.
+    # Documented as restart-required since it was introduced, but absent from
+    # this list, so the config editor offered a hot reload that silently did
+    # nothing -- the process kept the old storage while the UI said it had changed.
+    ("rate_limiting", "storage_url"),
 ]
 _RESTART_REQUIRED = RESTART_REQUIRED
 
