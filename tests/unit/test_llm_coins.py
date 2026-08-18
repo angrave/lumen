@@ -104,7 +104,7 @@ def test_subtract_coins_uses_passed_effective_without_reresolving(app, test_user
         from lumen.models.entity_balance import EntityBalance
         from lumen.models.entity_limit import EntityLimit
         from lumen.services import llm as llm_mod
-        from lumen.services.llm import subtract_coins, PoolLimit
+        from lumen.services.llm import PoolLimit, subtract_coins
         db.session.add(EntityLimit(entity_id=entity_id, max_coins=100, refresh_coins=0, starting_coins=100))
         db.session.add(EntityBalance(entity_id=entity_id, coins_left=100))
         db.session.commit()
@@ -131,6 +131,7 @@ def test_get_model_access_needs_ack_with_consent(app, test_user, test_model):
     entity_id, model_id = test_user["id"], test_model["id"]
     with app.app_context():
         from datetime import datetime, timezone
+
         from lumen.extensions import db
         from lumen.models.entity_model_consent import EntityModelConsent
         from lumen.models.model_config import ModelConfig
@@ -145,6 +146,7 @@ def test_has_model_consent_true(app, test_user, test_model):
     entity_id, model_id = test_user["id"], test_model["id"]
     with app.app_context():
         from datetime import datetime, timezone
+
         from lumen.extensions import db
         from lumen.models.entity_model_consent import EntityModelConsent
         from lumen.services.llm import has_model_consent
@@ -164,11 +166,12 @@ def test_subtract_coins_creates_balance_on_first_use(app, test_user, test_model)
     """subtract_coins creates an EntityBalance row on first use and deducts from starting_coins."""
     entity_id, model_id = test_user["id"], test_model["id"]
     with app.app_context():
+        from sqlalchemy import select
+
         from lumen.extensions import db
         from lumen.models.entity_balance import EntityBalance
         from lumen.models.entity_limit import EntityLimit
         from lumen.services.llm import subtract_coins
-        from sqlalchemy import select
         db.session.add(EntityLimit(entity_id=entity_id, max_coins=100, refresh_coins=0, starting_coins=100))
         db.session.commit()
         # No EntityBalance row — subtract_coins creates one from starting_coins and deducts
@@ -188,6 +191,7 @@ def test_subtract_coins_skips_insert_when_balance_exists(app, test_user, test_mo
     entity_id, model_id = test_user["id"], test_model["id"]
     with app.app_context():
         from sqlalchemy import event
+
         from lumen.extensions import db
         from lumen.models.entity_balance import EntityBalance
         from lumen.models.entity_limit import EntityLimit
@@ -228,6 +232,7 @@ def _recorder(monkeypatch):
 
 def _exhaust(app, entity_id, refresh_coins=10, refilled_minutes_ago=30):
     from datetime import timedelta
+
     from lumen.extensions import db
     from lumen.models.entity_balance import EntityBalance
     from lumen.models.entity_limit import EntityLimit
@@ -245,6 +250,7 @@ def _exhaust(app, entity_id, refresh_coins=10, refilled_minutes_ago=30):
 def test_coin_budget_rejection_is_counted(app, test_user, test_model, monkeypatch):
     """An exhausted budget is a rejection with a known model, unlike the limiter's."""
     from http import HTTPStatus
+
     from lumen.services.llm import check_coin_budget
     entity_id, model_id = test_user["id"], test_model["id"]
     with app.app_context():
@@ -261,6 +267,7 @@ def test_coin_budget_rejection_is_counted(app, test_user, test_model, monkeypatc
 def test_coin_budget_counting_never_breaks_the_rejection(app, test_user, test_model, monkeypatch):
     """A broken counter must not turn a clean 429 into a 500."""
     from http import HTTPStatus
+
     from lumen.services.llm import check_coin_budget
     entity_id, model_id = test_user["id"], test_model["id"]
     with app.app_context():
@@ -303,11 +310,13 @@ def test_coin_retry_after_tracks_the_next_refill(app, test_user, test_model):
         half_way = coin_retry_after(entity_id)
     assert 29 * 60 <= half_way <= 30 * 60
 
+    from datetime import timedelta
+
+    from sqlalchemy import select
+
     from lumen.extensions import db
     from lumen.models.entity_balance import EntityBalance
-    from datetime import timedelta
     from lumen.timeutils import utcnow
-    from sqlalchemy import select
     with app.app_context():
         bal = db.session.execute(select(EntityBalance).filter_by(entity_id=entity_id)).scalar_one()
         bal.last_refill_at = utcnow() - timedelta(minutes=10)
@@ -346,6 +355,7 @@ def test_no_healthy_endpoint_is_counted_on_the_chat_path(app, test_user, test_mo
     is the selection itself; counting anywhere else would miss it entirely.
     """
     import pytest
+
     from lumen.services.llm import send_message_stream
     entity_id = test_user["id"]
     with app.app_context():
@@ -363,6 +373,7 @@ def test_no_healthy_endpoint_is_counted_on_the_chat_path(app, test_user, test_mo
 def test_no_healthy_endpoint_counting_never_breaks_the_error(app, test_user, test_model, monkeypatch):
     """A broken counter must leave the RuntimeError exactly as it was."""
     import pytest
+
     from lumen.services.llm import send_message_stream
 
     def boom(*a, **kw):

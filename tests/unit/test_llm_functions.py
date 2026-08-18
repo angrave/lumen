@@ -1291,6 +1291,7 @@ def test_unmeasured_timing_columns_store_sql_null(app, test_user, test_model):
     """
     with app.app_context():
         from sqlalchemy import text
+
         from lumen.extensions import db
         from lumen.models.request_log import RequestLog
         log = RequestLog(

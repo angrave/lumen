@@ -373,6 +373,7 @@ def test_chart_generated_app_keys_do_not_warn(app, caplog, restore_config):
     if an operator deletes it to silence the warning.
     """
     import logging
+
     from lumen.services.config_watcher import KNOWN_APP_KEYS, apply_hot_config
 
     keys = _chart_app_keys()

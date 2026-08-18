@@ -13,7 +13,6 @@ from flask.cli import with_appcontext
 from sqlalchemy import delete, select, text, update
 from sqlalchemy.exc import DBAPIError
 
-from .extensions import db
 from lumen.models.entity import Entity
 from lumen.models.entity_balance import EntityBalance
 from lumen.models.entity_limit import EntityLimit
@@ -25,6 +24,8 @@ from lumen.models.group_model_access import GroupModelAccess
 from lumen.models.model_config import ModelConfig
 from lumen.models.model_endpoint import ModelEndpoint
 from lumen.timeutils import utcnow
+
+from .extensions import db
 
 # Maps config-input access vocabulary (new + legacy) to the stored value.
 # Acknowledgement (graylist) is a model-level property now, so legacy 'graylist'
@@ -513,7 +514,7 @@ def sync_projects_from_yaml(yaml_data):
                     config_managed=True,
                 ))
         else:
-            db.session.execute(delete(EntityLimit).where(EntityLimit.entity_id == entity.id, EntityLimit.config_managed == True))
+            db.session.execute(delete(EntityLimit).where(EntityLimit.entity_id == entity.id, EntityLimit.config_managed == True))  # noqa: E712 — SQL comparison, not a truth check
 
         # Sync model_access
         access_cfg = cfg.get("model_access", {})

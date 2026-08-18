@@ -6,9 +6,7 @@ an exhausted coin budget) and they need opposite reactions from the caller.
 """
 from http import HTTPStatus
 
-import pytest
-
-from tests.routes.test_api_auth import (  # noqa: F401 - fixtures are used by name
+from tests.routes.test_api_auth import (
     _allow_model,
     _capturing_openai,
     _chat_post,
@@ -16,6 +14,9 @@ from tests.routes.test_api_auth import (  # noqa: F401 - fixtures are used by na
     api_key,
     fresh_rate_limit,
 )
+
+# Re-exported so pytest resolves the fixtures by name in this module's tests.
+__all__ = ["api_key", "fresh_rate_limit"]
 
 # ---------------------------------------------------------------------------
 # Rate-limit response shape
@@ -86,6 +87,7 @@ def test_rate_limit_rejection_is_counted(
 
 def _exhaust_chat_budget(app, entity_id, refresh_coins=10):
     from datetime import timedelta
+
     from lumen.extensions import db
     from lumen.models.entity_balance import EntityBalance
     from lumen.models.entity_limit import EntityLimit

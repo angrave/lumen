@@ -135,6 +135,7 @@ def test_needs_ack_allows_chat_with_consent(app, ids):
     entity_id, model_id = ids
     with app.app_context():
         from datetime import datetime, timezone
+
         from lumen.extensions import db
         from lumen.models.entity_model_access import EntityModelAccess
         from lumen.models.entity_model_consent import EntityModelConsent
@@ -335,6 +336,7 @@ def _recorder(monkeypatch):
 
 def test_blocked_model_is_counted_as_no_access(app, ids, test_model, monkeypatch):
     from http import HTTPStatus
+
     from lumen.extensions import db
     from lumen.models.entity_model_access import EntityModelAccess
     from lumen.services.llm import check_coin_budget
@@ -360,6 +362,7 @@ def test_unacknowledged_model_is_counted_as_needs_consent(app, ids, test_model, 
     "no access" is not. A taxonomy that merged them would hide a support queue.
     """
     from http import HTTPStatus
+
     from lumen.services.llm import check_coin_budget
     entity_id, model_id = ids
     with app.app_context():
@@ -396,6 +399,7 @@ def test_consent_exempt_caller_on_a_blocked_model_is_no_access(app, ids, test_mo
 def test_access_counting_never_breaks_the_rejection(app, ids, test_model, monkeypatch):
     """A broken counter must not turn a clean 403 into a 500."""
     from http import HTTPStatus
+
     from lumen.services.llm import check_coin_budget
     entity_id, model_id = ids
 

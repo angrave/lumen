@@ -525,6 +525,7 @@ def _bridge_environ():
     """
     import time
     from datetime import datetime, timezone
+
     from lumen.services.wsgi_disconnect import SendBlocked
     return {
         "lumen.t0_monotonic": time.monotonic() - _QUEUE_WAIT,
@@ -574,6 +575,7 @@ def _allow_model(app, test_user, test_model):
 def _only_log(app):
     with app.app_context():
         from sqlalchemy import select
+
         from lumen.extensions import db
         from lumen.models.request_log import RequestLog
         return db.session.execute(select(RequestLog)).scalar_one()
@@ -713,6 +715,7 @@ def test_chat_stream_saves_the_conversation_when_the_client_leaves_during_billin
 
     with app.app_context():
         from sqlalchemy import select
+
         from lumen.extensions import db
         from lumen.models.message import Message
         stored = db.session.execute(select(Message).order_by(Message.id)).scalars().all()
@@ -772,6 +775,7 @@ def test_chat_stream_bills_the_abort_without_waiting_for_the_stream_to_be_collec
         assert disconnected.calls >= 2, "the disconnect never landed in the intended window"
         with app.app_context():
             from sqlalchemy import select
+
             from lumen.extensions import db
             from lumen.models.request_log import RequestLog
             logs = db.session.execute(select(RequestLog)).scalars().all()
@@ -935,6 +939,7 @@ def test_chat_stream_releases_on_client_disconnect(
     """The client vanishes mid-stream: the generator returns early and the
     ticket goes with it."""
     import threading
+
     from lumen.blueprints.chat import routes as chat_routes
     with app.app_context():
         _grant_unlimited_pool(app, test_user["id"])

@@ -7,7 +7,7 @@ from functools import wraps
 from http import HTTPStatus
 
 from flask import Blueprint, Response, current_app, request
-from prometheus_client import CollectorRegistry, generate_latest, CONTENT_TYPE_LATEST
+from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry, generate_latest
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 
 from lumen.extensions import db
@@ -180,6 +180,7 @@ def metrics():
     # otherwise fall back to the default per-process registry.
     if "PROMETHEUS_MULTIPROC_DIR" in os.environ:
         from prometheus_client.multiprocess import MultiProcessCollector
+
         # Imported lazily: importing the middleware constructs its metric objects,
         # and those must not be created before PROMETHEUS_MULTIPROC_DIR is set.
         from lumen.blueprints.metrics.middleware import reap_dead_workers

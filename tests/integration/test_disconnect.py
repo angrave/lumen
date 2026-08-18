@@ -49,8 +49,8 @@ import socket
 import struct
 import sys
 import threading
-import types
 import time
+import types
 from http import HTTPStatus
 
 import openai

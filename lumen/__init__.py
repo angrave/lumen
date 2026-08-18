@@ -7,9 +7,9 @@ from http import HTTPStatus
 
 import yaml
 from flask import Flask, g, jsonify, render_template, request, session
-from sqlalchemy import text
 from jinja2 import BaseLoader, ChoiceLoader, TemplateNotFound
 from markupsafe import Markup
+from sqlalchemy import text
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 
@@ -108,6 +108,7 @@ def create_app():
 
     # Initialize Prometheus registry with DB collector
     from prometheus_client import CollectorRegistry
+
     from lumen.blueprints.metrics.routes import LumenDBCollector
     prom_registry = CollectorRegistry()
     prom_registry.register(LumenDBCollector())
@@ -228,7 +229,7 @@ def create_app():
     app.config["SESSION_COOKIE_HTTPONLY"] = True
     app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
     app.config["PERMANENT_SESSION_LIFETIME"] = 86400
-    from lumen.services.config_watcher import apply_hot_config, _apply_theme
+    from lumen.services.config_watcher import _apply_theme, apply_hot_config
     apply_hot_config(app, yaml_data)
     app.config["APP_VERSION"] = os.environ.get("APP_VERSION", "develop")
     app.config["GIT_COMMIT"] = os.environ.get("GIT_COMMIT", "N/A")
@@ -294,9 +295,9 @@ def create_app():
             app.config[f"OAUTH2_{key.upper()}"] = oauth2_cfg[key]
 
     # Initialize extensions
-    from .extensions import db, migrate, oauth, limiter
-    from .services.pool_tracker import init_pool_tracking, record_teardown
+    from .extensions import db, limiter, migrate, oauth
     from .services.ctx_probe import install_ctx_probe
+    from .services.pool_tracker import init_pool_tracking, record_teardown
     init_pool_tracking()
     install_ctx_probe()
     db.init_app(app)
@@ -363,19 +364,20 @@ def create_app():
         sys.exit(1)
 
     # Import all models so Flask-Migrate can detect them
-    from . import models  # noqa: F401
+    from lumen.blueprints.admin.routes import admin_bp
+    from lumen.blueprints.api.routes import api_bp
 
     # Register blueprints
     from lumen.blueprints.auth.routes import auth_bp
     from lumen.blueprints.chat.routes import chat_bp
-    from lumen.blueprints.models_page.routes import models_page_bp
-    from lumen.blueprints.projects.routes import projects_bp
-    from lumen.blueprints.profile.routes import profile_bp
-    from lumen.blueprints.api.routes import api_bp
-    from lumen.blueprints.admin.routes import admin_bp
-    from lumen.blueprints.metrics.routes import metrics_bp
-    from lumen.blueprints.help.routes import help_bp
     from lumen.blueprints.connect.routes import connect_bp
+    from lumen.blueprints.help.routes import help_bp
+    from lumen.blueprints.metrics.routes import metrics_bp
+    from lumen.blueprints.models_page.routes import models_page_bp
+    from lumen.blueprints.profile.routes import profile_bp
+    from lumen.blueprints.projects.routes import projects_bp
+
+    from . import models  # noqa: F401
 
     app.register_blueprint(auth_bp)
     app.register_blueprint(chat_bp)
@@ -483,10 +485,11 @@ def create_app():
             return result
 
         from sqlalchemy import select
-        from lumen.models.entity_manager import EntityManager
-        from lumen.models.entity import Entity
-        from lumen.extensions import db
+
         from lumen.decorators import is_admin as _is_admin
+        from lumen.extensions import db
+        from lumen.models.entity import Entity
+        from lumen.models.entity_manager import EntityManager
         entity = db.session.get(Entity, session["entity_id"])
         is_admin_val = _is_admin(entity) if entity else False
         result["is_admin"] = is_admin_val
@@ -501,7 +504,7 @@ def create_app():
                 .where(
                     Entity.id.in_(project_ids),
                     Entity.entity_type == "project",
-                    Entity.active == True,
+                    Entity.active == True,  # noqa: E712 — SQL comparison, not a truth check
                 )
                 .order_by(Entity.name)
             ).scalars().all()
@@ -526,7 +529,14 @@ def create_app():
     app.jinja_env.filters["markdown"] = _md_filter
 
     # Sync models, groups, and projects from yaml into DB on every startup
-    from lumen.commands import backfill_projects_to_config, sync_groups_from_yaml, sync_models_from_yaml, sync_projects_from_yaml, sync_user_groups_from_yaml, sync_user_limits_from_yaml
+    from lumen.commands import (
+        backfill_projects_to_config,
+        sync_groups_from_yaml,
+        sync_models_from_yaml,
+        sync_projects_from_yaml,
+        sync_user_groups_from_yaml,
+        sync_user_limits_from_yaml,
+    )
     with app.app_context():
         try:
             sync_models_from_yaml(yaml_data)

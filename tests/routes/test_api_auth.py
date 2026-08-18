@@ -1463,6 +1463,7 @@ def _bridge_environ():
     """
     import time
     from datetime import datetime, timezone
+
     from lumen.services.wsgi_disconnect import SendBlocked
     return {
         "lumen.t0_monotonic": time.monotonic() - _QUEUE_WAIT,
@@ -1474,6 +1475,7 @@ def _bridge_environ():
 def _only_log(app):
     with app.app_context():
         from sqlalchemy import select
+
         from lumen.extensions import db
         from lumen.models.request_log import RequestLog
         return db.session.execute(select(RequestLog)).scalar_one()

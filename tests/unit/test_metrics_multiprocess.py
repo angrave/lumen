@@ -315,6 +315,7 @@ def _config_with_prometheus(tmp_path):
     active models.
     """
     import yaml
+
     from tests.conftest import TEST_CONFIG
 
     data = yaml.safe_load(open(TEST_CONFIG))

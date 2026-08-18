@@ -155,7 +155,8 @@ def _client(pg_app, eid):
 def _covers(pg_app, period):
     with pg_app.test_request_context():
         from lumen.blueprints.profile.routes import (
-            _entity_aggregate_covers, _usage_period_start,
+            _entity_aggregate_covers,
+            _usage_period_start,
         )
         return _entity_aggregate_covers(_usage_period_start(period))
 

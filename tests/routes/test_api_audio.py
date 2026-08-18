@@ -5,9 +5,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from tests.routes.test_api_auth import (  # noqa: F401 - fixture is used by name
-    fresh_rate_limit,
-)
+from tests.routes.test_api_auth import fresh_rate_limit
+
+# Re-exported so pytest resolves the fixture by name in this module's tests.
+__all__ = ["fresh_rate_limit"]
 
 
 @pytest.fixture
@@ -149,13 +150,14 @@ def test_transcription_duration_billing(
 
     expected_cost = round(11 / 3600 * 0.6, 6)
     with app.app_context():
-        from lumen.extensions import db
         from sqlalchemy import select
-        from lumen.models.request_log import RequestLog
-        from lumen.models.model_stat import ModelStat
-        from lumen.models.entity_stat import EntityStat
+
+        from lumen.extensions import db
         from lumen.models.api_key import APIKey
         from lumen.models.entity_balance import EntityBalance
+        from lumen.models.entity_stat import EntityStat
+        from lumen.models.model_stat import ModelStat
+        from lumen.models.request_log import RequestLog
 
         log = db.session.execute(select(RequestLog)).scalar_one()
         assert log.audio_seconds == 11
@@ -201,8 +203,9 @@ def test_transcription_token_billing(
     # input_cost=1.0/M, output_cost=2.0/M (from test_model fixture)
     expected_cost = round(1000 * 1.0 / 1_000_000 + 500 * 2.0 / 1_000_000, 6)
     with app.app_context():
-        from lumen.extensions import db
         from sqlalchemy import select
+
+        from lumen.extensions import db
         from lumen.models.request_log import RequestLog
         log = db.session.execute(select(RequestLog)).scalar_one()
         assert log.audio_seconds == 0
@@ -235,8 +238,9 @@ def test_translation_duration_billing(
 
     expected_cost = round(30 / 3600 * 1.2, 6)
     with app.app_context():
-        from lumen.extensions import db
         from sqlalchemy import select
+
+        from lumen.extensions import db
         from lumen.models.request_log import RequestLog
         log = db.session.execute(select(RequestLog)).scalar_one()
         assert log.audio_seconds == 30
@@ -252,10 +256,11 @@ def test_transcription_coin_budget_exhausted_429(
 ):
     token, _ = api_key
     with app.app_context():
-        from lumen.extensions import db
-        from lumen.models.entity_limit import EntityLimit
-        from lumen.models.entity_balance import EntityBalance
         from datetime import datetime, timezone
+
+        from lumen.extensions import db
+        from lumen.models.entity_balance import EntityBalance
+        from lumen.models.entity_limit import EntityLimit
         db.session.add(EntityLimit(
             entity_id=test_user["id"], max_coins=100, refresh_coins=0, starting_coins=100,
         ))
@@ -293,8 +298,9 @@ def test_transcription_no_usage_zero_cost(
     assert resp.status_code == HTTPStatus.OK
 
     with app.app_context():
-        from lumen.extensions import db
         from sqlalchemy import select
+
+        from lumen.extensions import db
         from lumen.models.request_log import RequestLog
         log = db.session.execute(select(RequestLog)).scalar_one()
         assert log.audio_seconds == 0
@@ -317,6 +323,7 @@ def _bridge_environ():
     """
     import time
     from datetime import datetime, timezone
+
     from lumen.services.wsgi_disconnect import SendBlocked
     return {
         "lumen.t0_monotonic": time.monotonic() - _QUEUE_WAIT,
@@ -351,6 +358,7 @@ def test_transcription_records_timing_columns(
 
     with app.app_context():
         from sqlalchemy import select
+
         from lumen.extensions import db
         from lumen.models.request_log import RequestLog
         log = db.session.execute(select(RequestLog)).scalar_one()
@@ -384,6 +392,7 @@ def test_transcription_without_the_bridge_records_nulls(
 
     with app.app_context():
         from sqlalchemy import select
+
         from lumen.extensions import db
         from lumen.models.request_log import RequestLog
         log = db.session.execute(select(RequestLog)).scalar_one()
@@ -409,6 +418,7 @@ def _recorder(monkeypatch):
 
 def _exhaust_budget(app, entity_id, refresh_coins, refilled_minutes_ago=30):
     from datetime import timedelta
+
     from lumen.extensions import db
     from lumen.models.entity_balance import EntityBalance
     from lumen.models.entity_limit import EntityLimit
@@ -471,7 +481,9 @@ def test_coin_exhaustion_retry_after_is_derived_from_the_refill(
     assert 29 * 60 <= half_way <= 30 * 60
 
     from datetime import timedelta
+
     from sqlalchemy import select
+
     from lumen.extensions import db
     from lumen.models.entity_balance import EntityBalance
     from lumen.timeutils import utcnow
@@ -646,6 +658,7 @@ def test_api_stream_releases_on_client_disconnect(
     fresh_rate_limit,
 ):
     import threading
+
     from lumen.blueprints.api import routes
     token, _ = api_key
     _allow_model(app, test_user, test_model)
