@@ -108,10 +108,17 @@ def test_plain_requests_do_not_accumulate_checkouts(app, client):
     # would otherwise still be holding a connection and skew the baseline.
     gc.collect()
     baseline = pool.checkedout()
+    # Baselined for the same reason the pool count is, and for one more: the
+    # registry dict is process-wide, so a background thread holding a session --
+    # the metrics-snapshot refresher, mid-pass -- owns an entry that has nothing
+    # to do with these requests. A bare `<= 1` fails whenever that pass overlaps
+    # the loop. What is under test is the *absence of accumulation*, so measure
+    # growth against whatever was already there.
+    sessions_baseline = len(db.session.registry.registry)
 
     for _ in range(5):
         assert client.get("/healthz").status_code == HTTPStatus.OK
         assert pool.checkedout() <= baseline + 1
-        assert len(db.session.registry.registry) <= 1
+        assert len(db.session.registry.registry) <= sessions_baseline + 1
 
     assert len(pool_tracker.outstanding()) <= 1

@@ -446,7 +446,17 @@ def test_api_stream_disconnect_stops_generation(
     # Task 1.6 — pool hygiene. A generator abandoned mid-flight is exactly how a
     # connection gets stranded idle-in-transaction and an app context gets left
     # current on a worker thread, poisoning every later request on it.
-    assert pool.checkedout() == 0, "a DB connection is still checked out after the abort"
+    # Polled for the same reason the registry check below is: the teardown runs
+    # on the server thread, and `pool.checkedout()` is a single cross-thread read
+    # of state that is still settling. This one is not the flaky assertion today
+    # — the connection is returned by `session.close()`, which runs *before* the
+    # `registry.clear()` the next assertion waits on, so by the time that one
+    # passes this one already would have — but the ordering is SQLAlchemy's to
+    # change, not ours to rely on. A real leak never returns the connection, so
+    # the timeout still fails it.
+    assert _wait_for(lambda: pool.checkedout() == 0, timeout=10), (
+        "a DB connection is still checked out after the abort"
+    )
     # Polled, not read once: the registry dict is process-wide (a ScopedRegistry
     # built with a scopefunc stores plain dict entries, not thread-locals) and the
     # request being torn down is on the server thread. ``scoped_session.remove()``
@@ -499,7 +509,17 @@ def test_chat_stream_disconnect_stops_generation(
     assert aborted, "no request_logs row was written for the aborted stream"
     _assert_billed_for_abort(aborted, "/chat/stream")
 
-    assert pool.checkedout() == 0, "a DB connection is still checked out after the abort"
+    # Polled for the same reason the registry check below is: the teardown runs
+    # on the server thread, and `pool.checkedout()` is a single cross-thread read
+    # of state that is still settling. This one is not the flaky assertion today
+    # — the connection is returned by `session.close()`, which runs *before* the
+    # `registry.clear()` the next assertion waits on, so by the time that one
+    # passes this one already would have — but the ordering is SQLAlchemy's to
+    # change, not ours to rely on. A real leak never returns the connection, so
+    # the timeout still fails it.
+    assert _wait_for(lambda: pool.checkedout() == 0, timeout=10), (
+        "a DB connection is still checked out after the abort"
+    )
     # Polled, not read once: the registry dict is process-wide (a ScopedRegistry
     # built with a scopefunc stores plain dict entries, not thread-locals) and the
     # request being torn down is on the server thread. ``scoped_session.remove()``
