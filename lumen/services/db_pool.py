@@ -18,6 +18,12 @@ import re
 from sqlalchemy import create_engine, text
 from sqlalchemy.pool import NullPool
 
+# Imported for its side effect: lumen.extensions registers the process-wide
+# "every PostgreSQL session is UTC" connect listener at import time, and this
+# module's throwaway engine (query_max_connections) connects during create_app
+# *before* anything else has imported lumen.extensions. Without this import it
+# would be the one connection in the process outside the guarantee.
+import lumen.extensions  # noqa: F401
 from lumen.services.pool_tracker import TimingQueuePool
 
 logger = logging.getLogger(__name__)
