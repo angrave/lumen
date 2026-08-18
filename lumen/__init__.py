@@ -540,6 +540,15 @@ def create_app():
         except Exception as e:
             print(f"WARNING: Could not sync projects from yaml (run 'flask db upgrade' first): {e}",
                   file=sys.stderr)
+        try:
+            # Prime the metrics snapshot synchronously: without it every rolling
+            # restart serves an empty snapshot for a whole refresh interval, and
+            # a fleet mid-restart mixes primed and unprimed workers.
+            from lumen.services.metrics_snapshot import refresh_snapshot
+            refresh_snapshot()
+        except Exception as e:
+            print(f"WARNING: Could not prime the metrics snapshot (run 'flask db upgrade' first): {e}",
+                  file=sys.stderr)
 
     # Start background threads only in the main worker process.
     # - Werkzeug dev server: double-imports the app; only run in the child (WERKZEUG_RUN_MAIN=true).
@@ -559,5 +568,13 @@ def create_app():
 
         from lumen.services.config_watcher import start_config_watcher
         start_config_watcher(app, config_yaml_path)
+
+    # Deliberately outside the guard above: BACKGROUND_WORKER=false keeps extra
+    # workers from duplicating *shared* work, but the snapshot is per-process
+    # in-memory state, so skipping it would leave that worker serving an empty
+    # /metrics forever. Started regardless of api.prometheus.enabled too — it is
+    # the application's own cache of its own state, not a Prometheus feature.
+    from lumen.services.metrics_snapshot import start_snapshot_refresher
+    start_snapshot_refresher(app)
 
     return app
