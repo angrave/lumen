@@ -190,6 +190,13 @@ def metrics():
     # otherwise fall back to the default per-process registry.
     if "PROMETHEUS_MULTIPROC_DIR" in os.environ:
         from prometheus_client.multiprocess import MultiProcessCollector
+        # Imported lazily: importing the middleware constructs its metric objects,
+        # and those must not be created before PROMETHEUS_MULTIPROC_DIR is set.
+        from lumen.blueprints.metrics.middleware import reap_dead_workers
+        # Before the collector is built, not after: a worker killed by SIGKILL
+        # never ran mark_process_dead, so its live gauges would otherwise be
+        # merged into this scrape's aggregates.
+        reap_dead_workers()
         mp_registry = CollectorRegistry()
         MultiProcessCollector(mp_registry)
         http_output = generate_latest(mp_registry)

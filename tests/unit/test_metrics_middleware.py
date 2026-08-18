@@ -39,8 +39,33 @@ def test_normalize_path_leading_id_only():
 # make_metrics_middleware
 # ---------------------------------------------------------------------------
 
-def _fake_environ(path="/", method="GET"):
-    return {"PATH_INFO": path, "REQUEST_METHOD": method}
+def _fake_environ(path="/", method="GET", rule=None):
+    """A minimal WSGI environ.
+
+    ``rule`` is what ``create_app``'s teardown_request hook would have stashed
+    for a routed request; leaving it None is an unrouted request (a scanner, a
+    404), which is what a bare fake app produces.
+    """
+    environ = {"PATH_INFO": path, "REQUEST_METHOD": method}
+    if rule is not None:
+        environ["lumen.url_rule"] = rule
+    return environ
+
+
+def _capture_labels(monkeypatch):
+    """Record the (method, path_template) of every counter/histogram label call."""
+    from lumen.blueprints.metrics import middleware as mw
+
+    recorded = []
+    for metric in (mw._http_requests, mw._http_latency):
+        orig = metric.labels
+
+        def spy(_orig=orig, **kwargs):
+            recorded.append((kwargs["method"], kwargs["path_template"]))
+            return _orig(**kwargs)
+
+        monkeypatch.setattr(metric, "labels", spy)
+    return recorded
 
 
 def test_middleware_passes_through_response():
@@ -71,27 +96,114 @@ def test_middleware_captures_4xx_status():
     assert status_seen == ["404 Not Found"]
 
 
-def test_middleware_normalizes_path_label(monkeypatch):
-    """Numeric path segments are collapsed before being recorded as a label."""
+# ---------------------------------------------------------------------------
+# Label cardinality — both dimensions. Every label value must come from a
+# bounded set, or a scanner mints unbounded series in every worker process's
+# memory and in the TSDB.
+# ---------------------------------------------------------------------------
+
+def _drive(wrapped, environ):
+    body = wrapped(environ, lambda *a: None)
+    list(body)
+    body.close()
+
+
+def _null_app(environ, start_response):
+    start_response("404 Not Found", [])
+    return []
+
+
+def test_unmatched_paths_all_share_one_label_value(monkeypatch):
+    """50 distinct junk paths must produce exactly one path_template value.
+
+    This is the pre-existing bug Phase 1 makes urgent: the old label was the
+    request path with numbers folded, so /.env, /wp-admin, /cgi-bin/... each
+    minted a new series — unbounded, and multiplied by the worker count.
+    """
     from lumen.blueprints.metrics import middleware as mw
 
-    recorded = []
-    orig = mw._http_requests.labels
+    recorded = _capture_labels(monkeypatch)
+    wrapped = mw.make_metrics_middleware(_null_app)
+    for i in range(50):
+        _drive(wrapped, _fake_environ(f"/wp-admin/setup-{i}.php"))
 
-    def spy(**kwargs):
-        recorded.append(kwargs.get("path_template"))
-        return orig(**kwargs)
+    assert len(recorded) == 100  # one counter + one histogram call per request
+    assert {path for _, path in recorded} == {"<unmatched>"}
 
-    monkeypatch.setattr(mw._http_requests, "labels", spy)
+    from prometheus_client import REGISTRY, generate_latest
+    assert "wp-admin" not in generate_latest(REGISTRY).decode()
 
-    def fake_app(environ, start_response):
-        start_response("200 OK", [])
-        return []
 
-    mw.make_metrics_middleware(fake_app)(
-        _fake_environ("/admin/groups/123"), lambda *a: None
+def test_matched_route_is_labelled_by_its_rule(app, monkeypatch):
+    """A routed request is labelled with the url_rule, not the concrete path."""
+    import re
+
+    from werkzeug.test import EnvironBuilder
+
+    from lumen.blueprints.metrics import middleware as mw
+
+    rule = next(
+        r for r in app.url_map.iter_rules()
+        if "<int:" in r.rule and "GET" in r.methods
     )
-    assert recorded and recorded[-1] == "/admin/groups/{id}"
+    concrete = re.sub(r"<int:[^>]+>", "987654", rule.rule)
+
+    recorded = _capture_labels(monkeypatch)
+    wrapped = mw.make_metrics_middleware(app.wsgi_app)
+    environ = EnvironBuilder(path=concrete).get_environ()
+    _drive(wrapped, environ)
+
+    # The teardown_request hook registered in create_app is the only way this
+    # value can reach the middleware: Flask pops the request context before
+    # wsgi_app returns, so the closures cannot read request.url_rule at all.
+    assert environ["lumen.url_rule"] == rule.rule
+    assert {path for _, path in recorded} == {rule.rule}
+    assert "987654" not in rule.rule
+
+
+def test_unrouted_request_through_the_real_app_is_unmatched(app, monkeypatch):
+    """A 404 has no url_rule; the hook stashes None and the label falls back."""
+    from werkzeug.test import EnvironBuilder
+
+    from lumen.blueprints.metrics import middleware as mw
+
+    recorded = _capture_labels(monkeypatch)
+    wrapped = mw.make_metrics_middleware(app.wsgi_app)
+    environ = EnvironBuilder(path="/.env").get_environ()
+    _drive(wrapped, environ)
+
+    assert environ["lumen.url_rule"] is None
+    assert {path for _, path in recorded} == {"<unmatched>"}
+
+
+def test_junk_methods_all_share_one_label_value(monkeypatch):
+    """HTTP methods are RFC token grammar, so the method label is unbounded too.
+
+    The path fix alone would pass a gate that only scans junk paths while the
+    same explosion continued through the other dimension.
+    """
+    from lumen.blueprints.metrics import middleware as mw
+
+    recorded = _capture_labels(monkeypatch)
+    wrapped = mw.make_metrics_middleware(_null_app)
+    for i in range(20):
+        _drive(wrapped, _fake_environ("/", f"FOOBARBAZ{i}"))
+
+    assert {method for method, _ in recorded} == {"<other>"}
+
+
+def test_standard_methods_are_kept_verbatim(monkeypatch):
+    """The allow-list must not flatten the methods anyone actually queries by."""
+    from lumen.blueprints.metrics import middleware as mw
+
+    recorded = _capture_labels(monkeypatch)
+    wrapped = mw.make_metrics_middleware(_null_app)
+    for method in ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"):
+        _drive(wrapped, _fake_environ("/", method))
+
+    assert {m for m, _ in recorded} == {
+        "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"
+    }
 
 
 def test_middleware_warns_when_a_context_survives_the_request(app, caplog):
@@ -328,7 +440,7 @@ def test_streaming_latency_is_measured_over_the_whole_body(monkeypatch):
 
     before = _latency_sum(path)
     wrapped = make_metrics_middleware(streaming_app)
-    body = wrapped(_fake_environ(path, "POST"), lambda s, h, *_: None)
+    body = wrapped(_fake_environ(path, "POST", rule=path), lambda s, h, *_: None)
     assert list(body) == [b"data: done\n\n"]
     body.close()
 
@@ -354,7 +466,7 @@ def test_latency_is_still_recorded_when_the_app_raises(monkeypatch):
     before = _latency_sum(path)
     wrapped = make_metrics_middleware(exploding_app)
     with pytest.raises(RuntimeError):
-        wrapped(_fake_environ(path, "POST"), lambda s, h, *_: None)
+        wrapped(_fake_environ(path, "POST", rule=path), lambda s, h, *_: None)
     assert _latency_sum(path) > before
 
 
@@ -377,8 +489,71 @@ def test_latency_is_observed_once_per_request():
         ) or 0.0
 
     before = count()
-    body = make_metrics_middleware(fake_app)(_fake_environ(path, "POST"), lambda s, h, *_: None)
+    body = make_metrics_middleware(fake_app)(
+        _fake_environ(path, "POST", rule=path), lambda s, h, *_: None
+    )
     list(body)
     body.close()
     body.close()
     assert count() - before == 1
+
+
+# ---------------------------------------------------------------------------
+# Multiprocess gauge invariant — static guard, same shape as
+# tests/unit/test_no_stream_with_context.py
+# ---------------------------------------------------------------------------
+
+def test_every_gauge_declares_a_multiprocess_mode():
+    """Under PROMETHEUS_MULTIPROC_DIR every process writes its own mmap file and
+    the scrape merges them. A Gauge with no explicit multiprocess_mode gets the
+    library default ("all"), which exposes one series per pid instead of the one
+    fleet number the dashboard is built on. Counter/Histogram need nothing —
+    summing is the only correct merge for them.
+    """
+    import ast
+    from pathlib import Path
+
+    lumen_dir = Path(__file__).resolve().parents[2] / "lumen"
+    offenders = []
+    for path in sorted(lumen_dir.rglob("*.py")):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+            if name != "Gauge":
+                continue
+            if not any(kw.arg == "multiprocess_mode" for kw in node.keywords):
+                offenders.append(f"{path.relative_to(lumen_dir.parent)}:{node.lineno}")
+    assert not offenders, (
+        "every Gauge must pass an explicit multiprocess_mode (see the invariant "
+        "comment in lumen/blueprints/metrics/middleware.py). Found:\n"
+        + "\n".join(offenders)
+    )
+
+
+# ---------------------------------------------------------------------------
+# lumen.queue_wait — computed by the before_request hook in create_app from the
+# mark the ASGI bridge leaves in environ.
+# ---------------------------------------------------------------------------
+
+def test_queue_wait_is_computed_from_the_bridge_mark(app):
+    import time
+
+    from werkzeug.test import EnvironBuilder
+
+    environ = EnvironBuilder(path="/healthz").get_environ()
+    environ["lumen.t0_monotonic"] = time.monotonic() - 0.5
+    app.wsgi_app(environ, lambda *a: None)
+    assert environ["lumen.queue_wait"] >= 0.5
+
+
+def test_queue_wait_is_absent_when_the_bridge_did_not_mark_the_request(app):
+    """The test client and the dev server never set the mark; the hook must not
+    invent a number for a request that never queued."""
+    from werkzeug.test import EnvironBuilder
+
+    environ = EnvironBuilder(path="/healthz").get_environ()
+    app.wsgi_app(environ, lambda *a: None)
+    assert "lumen.queue_wait" not in environ

@@ -2,6 +2,7 @@ import hashlib
 import logging
 import os
 import sys
+import time
 from http import HTTPStatus
 
 import yaml
@@ -100,8 +101,41 @@ def create_app():
         multiproc_dir = prom_cfg.get("multiproc_dir", "")
         if multiproc_dir:
             os.environ.setdefault("PROMETHEUS_MULTIPROC_DIR", multiproc_dir)
-        from lumen.blueprints.metrics.middleware import make_metrics_middleware
+        # Before importing the middleware: importing it constructs the metric
+        # objects, and prometheus_client opens each mmap eagerly at construction.
+        # A recycled pid would otherwise inherit a dead worker's gauge values.
+        from lumen.blueprints.metrics.multiproc import clear_own_stale_gauges
+        clear_own_stale_gauges()
+
+        from lumen.blueprints.metrics.middleware import make_metrics_middleware, reap_dead_workers
         app.wsgi_app = make_metrics_middleware(app.wsgi_app)
+        # Clear out any worker that died without running mark_process_dead
+        # (SIGKILL, OOM kill) before this process starts writing its own files.
+        reap_dead_workers()
+
+    # Both hooks are registered unconditionally, NOT under the prometheus flag:
+    # the metrics middleware is only installed when prometheus is enabled, so a
+    # value captured there is absent in a default deployment, and lumen.queue_wait
+    # is needed by request logging regardless.
+    @app.before_request
+    def _record_queue_wait():
+        # How long the request sat between arriving at the ASGI bridge and a WSGI
+        # worker thread picking it up. The t0 mark is set by the bridge
+        # (services/wsgi_disconnect.py); it is absent under the test client and
+        # the dev server, where there is no queue and nothing to measure.
+        t0 = request.environ.get("lumen.t0_monotonic")
+        if t0 is not None:
+            request.environ["lumen.queue_wait"] = time.monotonic() - t0
+
+    @app.teardown_request
+    def _stash_url_rule(exc):
+        # The metrics middleware labels by the matched rule, but its closures run
+        # with no request context at all: routing has not happened on the way in,
+        # and Flask's wsgi_app pops the context in its finally BEFORE returning
+        # the response iterable. environ is the only channel out. teardown_request
+        # rather than after_request, because after_request is skipped when a
+        # non-Exception BaseException unwinds the request.
+        request.environ["lumen.url_rule"] = request.url_rule.rule if request.url_rule else None
 
     # Configure rate limiting
     rl_cfg = yaml_data.get("rate_limiting", {})
