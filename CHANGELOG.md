@@ -44,6 +44,7 @@ All notable changes to Lumen will be documented in this file.
 
 ### Changed
 
+- CI's TimescaleDB service is pinned to `2.27.2-pg17`, the version production runs, instead of the floating `latest-pg17`. A floating tag adopts semantic changes silently, and this schema is sensitive to exactly that class of change: TimescaleDB 2.13 flipped the default of `timescaledb.materialized_only` to `true`, which decides whether a continuous aggregate returns the current bucket at all. Bump it deliberately, in step with the deployment.
 - The SkipTo navigation button is now hidden until it receives keyboard focus (`displayOption:popup`, matching illinois.edu), instead of always being visible in the corner of the page.
 - The profile page is now organized into tabs below the profile card: **Chat & API Keys**, **Projects** (shown only when the user can access projects), and **Models**. The selected tab is reflected in the URL hash (`/profile#models`) so tabs are deep-linkable.
 

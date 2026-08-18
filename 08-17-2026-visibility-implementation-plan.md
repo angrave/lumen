@@ -249,8 +249,9 @@ order* — it decides *how*.** That removes the conditional-scheduling language 
 - **Dependency constraints are not scheduling preferences.** Phase 8's internal order (entity
   aggregate → **rewrite the per-entity `/usage` queries onto it** → compression → retention) is a
   correctness constraint: following it out of order silently truncates every user's history. So is
-  the rule that **compression lands after all `request_logs` column additions**, since adding a
-  column to compressed chunks is a decompress/recompress migration. And Phase 4's refresher must not
+  the rule that **compression lands after all `request_logs` column additions** — though §4.1
+  now downgrades this one from a hard constraint to a preference, having measured 2.27.2 accepting
+  `ADD COLUMN` on compressed chunks directly. And Phase 4's refresher must not
   copy `lumen/services/health.py` *because* Phase 1 turns that file into a single-runner election.
   These hold no matter what order the phases are worked in.
 - **G0.6 is a safety gate, not a scheduling one**, and still blocks Phase 6 (see below).
@@ -261,7 +262,7 @@ order* — it decides *how*.** That removes the conditional-scheduling language 
 |---|---|
 | G0.1 | **[ANSWERED — §4.1: 1 process x 1 replica]** **Production topology** — replicas, `--workers`/`WEB_CONCURRENCY`, `LUMEN_WSGI_WORKERS`. Via `kubectl get deploy -o yaml`, or `GET /metrics/debug`, which already prints workers × replicas and the live `WSGI_*` thread count. **Decides what we test against**: at 1×1 the multi-process paths (dead-PID reaping, `livesum` aggregation, flock election) are never exercised in production, so their only coverage is the test suite — which raises the bar on the Phase 1 tests rather than lowering it |
 | G0.2 | **Is Redis deployed?** `redis.enabled`, or an external `redis.url` / `rate_limiting.storage_url`. **Decides whether Phase 5 also carries a provisioning task**, and whether its fail-open path is the normal case or the exception |
-| G0.3 | **[VERSION ANSWERED — §4.1: 2.27.2 / pg17; toolkit still open]** **Timescale version + is `timescaledb_toolkit` installed?** `SELECT extname, extversion FROM pg_extension WHERE extname LIKE 'timescale%'`. **Decides**: exact `percentile_agg` p95 vs hand-rolled bucket counts; hierarchical continuous aggregates; and — newly — whether adding a column to a compressed hypertable is restricted, which sets how firmly compression must trail the schema work |
+| G0.3 | **[ANSWERED — §4.1: 2.27.2 / pg17, no toolkit; measured, not inferred]** **Timescale version + is `timescaledb_toolkit` installed?** `SELECT extname, extversion FROM pg_extension WHERE extname LIKE 'timescale%'`. **Decides**: exact `percentile_agg` p95 vs hand-rolled bucket counts; hierarchical continuous aggregates; and — newly — whether adding a column to a compressed hypertable is restricted, which sets how firmly compression must trail the schema work |
 | G0.4 | **Size and growth of `request_logs`** — `SELECT pg_size_pretty(pg_total_relation_size('request_logs')), count(*), min(time), max(time) FROM request_logs`. **Decides** the retention window and, more urgently, how long the entity-aggregate's **full-history backfill** will run, since it cannot happen inside the migration transaction |
 | G0.5 | **[PARTLY ANSWERED — §4.1: yes, `/metrics` is enabled with a token]** **Does a Prometheus/Grafana stack scrape this cluster, at what interval?** **No longer decides ordering.** Still decides whether the ServiceMonitor needs the token work below, and what scrape interval the snapshot refresh should be tuned against |
 | **G0.6** | **Are the backends' `/metrics` reachable, and what engines/versions are they?** **Weakened, not retired, by the `http_sd` design in §10.1.** Under `http_sd` Prometheus scrapes the backends and Lumen never sends the endpoint API key anywhere, so a misidentified backend costs a down-looking target rather than a leaked credential. What still gates: reachability *from Prometheus*, and positively knowing each endpoint's engine — today only SGLang is detected, and vLLM is a fall-through indistinguishable from OpenAI, Azure or any OpenAI-compatible proxy |
@@ -391,6 +392,63 @@ production** per the Prometheus answer above) were added to measure. Note the po
 `resolve_wsgi_workers`'s `auto` path, which clamps `pool_size + max_overflow = 80` down to
 `MAX_AUTO_WSGI_WORKERS = 64` — so the thread ceiling, not the DB pool, is the binding constraint,
 and `queue_wait` rather than `preflight` is where a class-start burst will show up first.
+
+**2026-08-18 — G0.3 closed by measurement, not by reading release notes.** `timescale/timescaledb:2.27.2-pg17`
+was pulled and run locally; every claim below is a transcript, not an inference.
+
+- **[ANSWERED] `timescaledb_toolkit` is absent, and not even installable.**
+  `pg_available_extensions` lists exactly one matching row — `timescaledb 2.27.2` — so
+  `CREATE EXTENSION timescaledb_toolkit` cannot succeed: the community image ships no control file
+  for it. **§8(f) takes the hand-rolled fixed-bucket path; `percentile_agg` is off the table**
+  unless the deployment moves to `timescale/timescaledb-ha`, which is a separate decision with its
+  own cost.
+
+- **[CONFIRMED] `materialized_only` defaults to `true`, and the consequence is reproducible.**
+  A continuous aggregate created without the option reports `materialized_only = t`. Seeded with one
+  five-day-old row (cost 10) and one row in the current bucket (cost 99), then refreshed with
+  `end_offset => 1 hour` exactly as the existing policy would:
+
+  ```
+   src  | sum        <- raw table
+   raw  | 109
+   cagg |  10        <- the aggregate. The current bucket is simply not there.
+  ```
+
+  This is the §8(b) defect, demonstrated: **91% of that user's spend is invisible through the
+  aggregate.** `ALTER MATERIALIZED VIEW ... SET (timescaledb.materialized_only = false)` then
+  returns 109, matching raw. The `[DECISION]` in §8(b) is confirmed by experiment rather than
+  assumed, and the equality test in §8(a) step 2 **must** seed a row inside the current bucket —
+  seeded with history alone it passes at 10 = 10 and certifies the regression.
+
+- **[CORRECTED] Compression is *not* a one-way door on 2.27.2.** Against a hypertable with three
+  genuinely compressed chunks (verified via `timescaledb_information.chunks.is_compressed`, not
+  assumed from a `compress_chunk` call that silently matched nothing):
+
+  | statement | result |
+  |---|---|
+  | `ADD COLUMN ttft double precision` | ok |
+  | `ADD COLUMN qw double precision DEFAULT 0` | ok |
+  | `ADD COLUMN oc text NOT NULL DEFAULT 'ok'` | ok |
+  | `ADD COLUMN bad text NOT NULL` | **ERROR:** `cannot add column with NOT NULL constraint without default to a hypertable that has columnstore enabled` |
+
+  Only the last is refused, it is refused loudly, and it is the same restriction `y9z0a1b2c3d4`
+  already documents — now phrased in 2.27's columnstore vocabulary. §8(e) is resolved to its first
+  branch and the Gate 0 preamble's "decompress/recompress migration" claim is downgraded to a
+  preference. **A first attempt at this test proved nothing**: `show_chunks(older_than => '1 day')`
+  matched zero chunks because the default 7-day chunk interval put both seeded rows in one
+  still-open chunk, so the `ADD COLUMN`s ran against an *uncompressed* table and trivially passed.
+  Worth recording as the shape of a test that looks green and asserts nothing.
+
+- **[VERIFIED] The migration chain applies cleanly on the exact production version.**
+  `tests/integration` against 2.27.2-pg17: **14 passed**, the only skips being the Redis suite with
+  no `LUMEN_TEST_REDIS_URL`. Nothing in `f7a8b9c0d1e2` or its predecessors is version-sensitive here.
+
+- **[FINDING] CI tests a different Timescale than production runs.**
+  `.github/workflows/test.yml` pins `timescale/timescaledb:latest-pg17` — a floating tag — while
+  production pins `2.27.2-pg17`. The failure mode is precise and this plan is standing in it: the
+  2.13 `materialized_only` flip is exactly the class of change that a floating tag adopts silently,
+  so CI would validate §8 against semantics production does not have (or, after the next release,
+  against semantics production does not have *yet*). Pin CI to the production version.
 
 ---
 
@@ -1815,7 +1873,16 @@ to stop, add speculative columns (CLAUDE.md §2 forbids), or ignore the contract
 - **If it does not:** compression waits until the `request_logs` schema is settled, and that delay is
   a stated cost of running the older version — not a dependency on an undesigned phase.
 
-Record the answer against this decision when G0.3 returns.
+**[RESOLVED — §4.1, measured on 2.27.2] The first branch.** Nullable `ADD COLUMN`, `ADD COLUMN`
+with a `DEFAULT`, and `ADD COLUMN NOT NULL DEFAULT` were all executed against a hypertable with
+three genuinely compressed chunks and all three succeeded. Only `NOT NULL` *without* a default is
+refused, and it is refused loudly (`cannot add column with NOT NULL constraint without default to a
+hypertable that has columnstore enabled`) — the same restriction `y9z0a1b2c3d4` already documents,
+now stated in 2.27's columnstore vocabulary. So compression is **not** a one-way door on this
+deployment, the heading above overstates it, and later phases may add nullable columns freely.
+Keep the ordering as a preference for a different reason: recompressing a chunk to service an
+`ADD COLUMN` still costs I/O over the retention window, and doing the schema work first avoids
+paying it.
 
 **(f) Percentiles: exact if the toolkit is present, hand-rolled buckets if not.**
 Continuous aggregates hold `COUNT`/`SUM`/`MAX`, which gives means and worst cases but not p95. If

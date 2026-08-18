@@ -18,7 +18,13 @@ jobs:
     # the /api/usage/* SQL. Tests marked `postgres` skip when this is absent.
     services:
       timescaledb:
-        image: timescale/timescaledb:latest-pg17
+        # Pinned to the production version, not `latest-pg17`. A floating tag
+        # adopts semantic changes silently, and this schema is sensitive to
+        # exactly that class of change: 2.13 flipped the default of
+        # `timescaledb.materialized_only` to true, which decides whether a
+        # continuous aggregate returns the current bucket at all. Bump this
+        # deliberately, in step with the deployment.
+        image: timescale/timescaledb:2.27.2-pg17
         env:
           POSTGRES_USER: lumen
           POSTGRES_PASSWORD: lumen
