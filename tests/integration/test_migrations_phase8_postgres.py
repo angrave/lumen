@@ -18,7 +18,16 @@ Three things are being proven here, and only the first is obvious.
    those rows are provably above the watermark and reachable only through
    real-time aggregation.
 
-3. Compression is a lossless round trip. The trap there is that
+3. **A row that was already in the table when the timing migration ran reads
+   NULL, not 0.** Everything above runs against a database migrated from empty,
+   where no row can exist at migration time — the exact scenario the hazard
+   needs. ``ADD COLUMN ... DEFAULT`` initialises every *existing* row, so a
+   server default on the timing columns would write "measured, and instant"
+   over the whole history and every ``ttft_le_*`` bucket would count it. The
+   populated-migration test at the bottom of this file is the only one that can
+   see that.
+
+4. Compression is a lossless round trip. The trap there is that
    ``show_chunks(older_than => ...)`` silently matches nothing when every seeded
    row lands in one still-open chunk, so "results are identical before and
    after" would hold trivially without a byte having been compressed. The test
@@ -35,6 +44,8 @@ import time as _time
 
 import pytest
 from sqlalchemy import exc, text
+
+from tests.integration.conftest import flask_db
 
 pytestmark = pytest.mark.postgres
 
@@ -436,3 +447,83 @@ def test_downgrade_and_upgrade_round_trip(pg_url, pg_migrated, seeded):
         assert conn.execute(text(
             f"SELECT SUM(requests) FROM request_counts_hourly_by_entity WHERE source = '{SOURCE}'"
         )).scalar() == len(_HISTORY) + len(_CURRENT)
+
+
+# The revision immediately before f7a8b9c0d1e2, which adds the timing columns.
+# A database stopped here is a production database on the day of the deploy.
+_BEFORE_TIMING = "e6f7a8b9c0d1"
+
+# Its own source tag: these rows live in a database of their own.
+_PRE_SOURCE = "ph8pre"
+
+_PRE_INSERT = """
+    INSERT INTO request_logs
+        (time, source, input_tokens, output_tokens, cost, duration, aborted)
+    VALUES (:time, :source, 1, 2, 0.1, 1.0, false)
+"""
+
+_PRE_ROWS = 2
+
+
+def test_rows_that_predate_the_timing_columns_read_null_not_zero(pg_blank):
+    """Migrate a *populated* database, the way production will be migrated.
+
+    Every other test in this file starts from an empty database, so no row ever
+    exists when ``f7a8b9c0d1e2`` runs and the hazard cannot appear. It is a
+    hazard of the ADD itself: PostgreSQL's ``ADD COLUMN ... DEFAULT 0``
+    initialises every pre-existing row to 0, so thirteen months of history would
+    be recorded as measured and instant. ``ttft_count`` is
+    ``COUNT(ttft_visible)`` and would count them all; every cumulative
+    ``ttft_le_*`` filters ``ttft_visible <= edge`` and would count them all as
+    sub-edge; p95 TTFT for every historical bucket would read 0 seconds. After
+    retention drops the raw chunks only those materialised zeros survive, so
+    this is not recoverable after the fact — hence a test rather than a comment.
+    """
+    url, engine = pg_blank
+    flask_db(url, "upgrade", _BEFORE_TIMING)
+
+    with engine.begin() as conn:
+        # Two hours back: comfortably inside the aggregate's 30-day start_offset
+        # and outside its 1-hour end_offset, so the bucket is well-defined
+        # whether or not the refresh policy has fired.
+        stamped = conn.execute(text(
+            _PRE_INSERT.replace(":time", "now() - INTERVAL '2 hours'") + " RETURNING time"
+        ), {"source": _PRE_SOURCE}).scalar()
+        conn.execute(text(_PRE_INSERT), {"time": stamped, "source": _PRE_SOURCE})
+
+    # Release pooled connections before the DDL, as the round-trip test does.
+    engine.dispose()
+    flask_db(url, "upgrade")
+
+    with engine.connect() as conn:
+        stored = conn.execute(text(
+            "SELECT queue_wait, preflight, ttft, ttft_visible, send_blocked "
+            "FROM request_logs WHERE source = :source"
+        ), {"source": _PRE_SOURCE}).all()
+        agg = conn.execute(text(
+            "SELECT SUM(requests), SUM(ttft_count), SUM(ttft_le_0_5), SUM(ttft_le_1), "
+            "       SUM(ttft_le_2), SUM(ttft_le_5), SUM(ttft_le_10), SUM(ttft_le_30) "
+            "FROM request_counts_hourly_by_entity "
+            "WHERE source = :source AND bucket = date_trunc('hour', CAST(:t AS timestamptz))"
+        ), {"source": _PRE_SOURCE, "t": stamped}).one()
+
+    assert len(stored) == _PRE_ROWS
+    for row in stored:
+        assert all(v is None for v in row), (
+            f"a row that predates f7a8b9c0d1e2 has timing {tuple(row)!r} — "
+            "ADD COLUMN ... DEFAULT backfilled it, and every one of production's "
+            "historical rows now claims it was measured"
+        )
+
+    requests, ttft_count, *buckets = agg
+    assert requests == _PRE_ROWS, (
+        "the aggregate does not see the pre-existing rows at all, so the zeros "
+        "below prove nothing"
+    )
+    assert int(ttft_count) == 0, (
+        "pre-migration rows are in the percentile denominator; every historical "
+        "p95 is computed over rows nothing measured"
+    )
+    assert [int(b) for b in buckets] == [0] * len(buckets), (
+        f"pre-migration rows counted as sub-edge: {buckets}"
+    )

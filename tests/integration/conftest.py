@@ -31,6 +31,58 @@ def _admin_engine(url: str):
     return create_engine(url, isolation_level="AUTOCOMMIT")
 
 
+def flask_db(url: str, *args: str):
+    """Run ``flask db <args>`` against ``url``, the way ``entrypoint.sh`` does.
+
+    Exposed for tests that drive the migration chain themselves — running it
+    only as far as a named revision, seeding, and then upgrading over the seed.
+    """
+    env = {**os.environ, "DATABASE_URL": url, "CONFIG_YAML": TEST_CONFIG,
+           "BACKGROUND_WORKER": "false"}
+    result = subprocess.run(
+        ["uv", "run", "flask", "--app", "run", "db", *args],
+        capture_output=True, text=True, env=env, timeout=300,
+    )
+    assert result.returncode == 0, (
+        f"flask db {' '.join(args)} failed:\n--- stdout ---\n{result.stdout}\n"
+        f"--- stderr ---\n{result.stderr}"
+    )
+
+
+@pytest.fixture
+def pg_blank():
+    """A created but deliberately *unmigrated* database: yields ``(url, engine)``.
+
+    Every other fixture here hands back a database that is already at head,
+    which cannot express "what happens to rows that were already in the table
+    when a migration ran". Callers drive ``flask_db`` themselves.
+    """
+    base = os.environ.get(PG_URL_ENV)
+    if not base:
+        pytest.skip(f"{PG_URL_ENV} is not set; skipping PostgreSQL/TimescaleDB tests")
+
+    name = f"lumen_blank_{uuid.uuid4().hex[:12]}"
+    admin = _admin_engine(base)
+    with admin.connect() as conn:
+        conn.execute(text(f'CREATE DATABASE "{name}"'))
+    admin.dispose()
+    url = base.rsplit("/", 1)[0] + "/" + name
+
+    engine = create_engine(url)
+    try:
+        yield url, engine
+    finally:
+        engine.dispose()
+        admin = _admin_engine(base)
+        with admin.connect() as conn:
+            # Terminate stragglers first; DROP DATABASE fails while anything is connected.
+            conn.execute(text(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = :n"
+            ), {"n": name})
+            conn.execute(text(f'DROP DATABASE IF EXISTS "{name}"'))
+        admin.dispose()
+
+
 @pytest.fixture(scope="session")
 def pg_url():
     """A freshly created, disposable database on the CI PostgreSQL service."""

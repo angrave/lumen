@@ -1278,6 +1278,42 @@ def test_stream_without_the_bridge_records_nulls_not_zeros(app, test_user, test_
         assert log.outcome == "ok"
 
 
+def test_unmeasured_timing_columns_store_sql_null(app, test_user, test_model):
+    """A None-valued timing attribute must reach the database as SQL NULL.
+
+    Read back with raw SQL rather than through the ORM: the instance still holds
+    the Python None either way, so only the stored value distinguishes "not
+    measured" from a fictitious 0.0. This is the invariant that forbids a
+    ``server_default`` on these columns — with one, SQLAlchemy omits the
+    None-valued attribute from the INSERT and the server writes the default,
+    and (worse) the migration's ADD COLUMN would have written it over every
+    pre-existing row as well.
+    """
+    with app.app_context():
+        from sqlalchemy import text
+        from lumen.extensions import db
+        from lumen.models.request_log import RequestLog
+        log = RequestLog(
+            time=datetime.now(timezone.utc),
+            entity_id=test_user["id"],
+            model_config_id=test_model["id"],
+            source="chat",
+            input_tokens=0, output_tokens=0, cost=0, duration=0.0,
+            started_at=None, queue_wait=None, preflight=None,
+            ttft=None, ttft_visible=None, send_blocked=None, outcome=None,
+        )
+        db.session.add(log)
+        db.session.commit()
+
+        stored = db.session.execute(text(
+            "SELECT started_at, queue_wait, preflight, ttft, ttft_visible, "
+            "       send_blocked, outcome "
+            "FROM request_logs WHERE id = :id"
+        ), {"id": log.id}).one()
+
+    assert all(v is None for v in stored), f"unmeasured timing stored as {stored!r}"
+
+
 def test_stream_records_the_bridge_marks_captured_in_the_view(app, test_user, test_model_endpoint):
     """The marks reach the row even though the generator never touches ``request``."""
     entity_id = test_user["id"]

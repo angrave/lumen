@@ -97,31 +97,26 @@ class RequestLog(db.Model):
     queue_wait: Mapped[Optional[float]] = mapped_column(
         db.Float,
         nullable=True,
-        server_default="0",
         comment="Seconds spent waiting for a WSGI worker thread (T1-T0). The queue Lumen itself owns, and the number that distinguishes 'we are under-provisioned' from 'the model is slow'",
     )
     preflight: Mapped[Optional[float]] = mapped_column(
         db.Float,
         nullable=True,
-        server_default="0",
         comment="Seconds from worker pickup to the upstream call (T2-T1): auth, model lookup, coin budget, endpoint selection, DB pool checkout. NOTE: composition differs by path - on the audio path it is dominated by multipart upload parsing, and on the chat stream it spans two preflights",
     )
     ttft: Mapped[Optional[float]] = mapped_column(
         db.Float,
         nullable=True,
-        server_default="0",
         comment="Seconds to the first upstream chunk of ANY kind, including reasoning deltas",
     )
     ttft_visible: Mapped[Optional[float]] = mapped_column(
         db.Float,
         nullable=True,
-        server_default="0",
         comment="Seconds to the first visible content delta. On a reasoning model this trails ttft by the whole thinking phase, which is why both are stored: it separates 'the model was queued' from 'the model was thinking'",
     )
     send_blocked: Mapped[Optional[float]] = mapped_column(
         db.Float,
         nullable=True,
-        server_default="0",
         comment="Seconds blocked handing response chunks to the server. A large share means a slow client, not a slow backend - duration conflates the two. 0 on non-streaming paths, where billing completes before the body is handed over and the value is unknowable",
     )
     # Only values the code can actually write. `billing_error` and

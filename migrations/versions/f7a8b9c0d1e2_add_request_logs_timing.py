@@ -48,10 +48,29 @@ No backfill, following ``e6f7a8b9c0d1``. Historical rows have no arrival time
 to recover — nothing recorded one — and inventing one from ``time - duration``
 would produce a column that looks authoritative and is quietly wrong for every
 pre-migration row. NULL means "not measured", which is honest and easy to
-filter. That is also why the float columns carry ``server_default='0'`` for
-Timescale's benefit while the ORM leaves them nullable: a request that genuinely
-did not pass through the ASGI bridge (dev server, test client) writes NULL
-rather than a fictitious zero.
+filter.
+
+**Every column is added bare — nullable, no server default — and that is the
+load-bearing detail.** ``ALTER TABLE ... ADD COLUMN x FLOAT DEFAULT 0`` does not
+merely default *future* inserts: PostgreSQL initialises **every existing row** to
+0 as part of the ADD. On thirteen months of ``request_logs`` a default of 0 would
+therefore write "measured, and instant" over the entire history — and the
+aggregates read exactly those columns. ``ttft_count`` is ``COUNT(ttft_visible)``,
+so it would count every pre-migration row; every cumulative ``ttft_le_*`` bucket
+filters ``ttft_visible <= edge``, so it would count them all as sub-edge; and p95
+TTFT for every historical bucket would read 0 seconds. Once retention drops the
+raw chunks, only those materialised zeros remain. NULL is the only value that
+tells the truth about a row that predates the measurement, and it is also what a
+live request that never passed through the ASGI bridge (dev server, test client)
+must store.
+
+The Timescale restriction sometimes cited as requiring the default is a
+different one: a **NOT NULL** column with no default is what a populated
+hypertable rejects (see ``y9z0a1b2c3d4``). These columns are nullable, so it does
+not apply — a bare nullable ADD COLUMN propagates to every existing chunk,
+including compressed ones, which
+``test_add_column_still_works_on_a_compressed_hypertable`` asserts on the
+deployed 2.27.2.
 
 """
 
@@ -68,29 +87,27 @@ def _is_postgresql():
     return op.get_bind().dialect.name == "postgresql"
 
 
-# (name, type, server_default) — nullable in every case.
+# (name, type) — nullable and without a server default in every case.
 _COLUMNS = [
-    ("started_at", sa.DateTime(timezone=True), None),
-    ("queue_wait", sa.Float(), "0"),
-    ("preflight", sa.Float(), "0"),
-    ("ttft", sa.Float(), "0"),
-    ("ttft_visible", sa.Float(), "0"),
-    ("send_blocked", sa.Float(), "0"),
-    ("outcome", sa.String(16), None),
+    ("started_at", sa.DateTime(timezone=True)),
+    ("queue_wait", sa.Float()),
+    ("preflight", sa.Float()),
+    ("ttft", sa.Float()),
+    ("ttft_visible", sa.Float()),
+    ("send_blocked", sa.Float()),
+    ("outcome", sa.String(16)),
 ]
 
 
 def upgrade():
-    # Nullable WITH a server default on the numeric columns. A populated
-    # TimescaleDB hypertable rejects a NOT NULL column that has no default
-    # (see y9z0a1b2c3d4); supplying one lets the ADD COLUMN propagate to every
-    # existing chunk. These stay nullable regardless, because "not measured"
-    # has to remain distinguishable from "measured as zero".
+    # Nullable, and deliberately WITHOUT a server default. ADD COLUMN ... DEFAULT
+    # backfills every existing row with that default, so a default of 0 would
+    # record thirteen months of history as "measured, and instant" (see the
+    # module docstring). Only a NOT NULL column needs a default for a populated
+    # hypertable to accept it (y9z0a1b2c3d4); these are nullable.
     with op.batch_alter_table("request_logs") as batch_op:
-        for name, type_, default in _COLUMNS:
-            batch_op.add_column(
-                sa.Column(name, type_, nullable=True, server_default=default)
-            )
+        for name, type_ in _COLUMNS:
+            batch_op.add_column(sa.Column(name, type_, nullable=True))
 
     if _is_postgresql():
         # The operator queries all filter by model and time; this is the
@@ -118,5 +135,5 @@ def downgrade():
     if _is_postgresql():
         op.drop_index("ix_request_logs_model_config_id_time", table_name="request_logs")
     with op.batch_alter_table("request_logs") as batch_op:
-        for name, _type, _default in reversed(_COLUMNS):
+        for name, _type in reversed(_COLUMNS):
             batch_op.drop_column(name)

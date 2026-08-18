@@ -8,7 +8,7 @@ from typing import NamedTuple, Optional
 
 import openai
 from flask import current_app, has_request_context, request
-from sqlalchemy import null, select
+from sqlalchemy import select
 from sqlalchemy import update as sa_update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.compiler import compiles
@@ -623,18 +623,6 @@ class RequestTiming(NamedTuple):
         return None if self.send_blocked is None else self.send_blocked.seconds
 
 
-def _or_null(value):
-    """The value, or an explicit SQL NULL when it was never measured.
-
-    The Float timing columns carry ``server_default='0'`` (Timescale refuses to
-    propagate a non-defaulted NOT NULL column to populated chunks), and
-    SQLAlchemy *omits* a None-valued attribute on a column that has a default —
-    which would quietly store 0.0, "no wait at all", for "never measured". The
-    two must stay distinguishable, so the NULL is rendered explicitly.
-    """
-    return null() if value is None else value
-
-
 def capture_request_timing() -> RequestTiming:
     """Read this request's bridge marks out of the WSGI environ.
 
@@ -752,13 +740,13 @@ def update_stats(
         duration=duration,
         aborted=aborted,
         started_at=timing.started_at,
-        queue_wait=_or_null(timing.queue_wait),
-        preflight=_or_null(timing.preflight(upstream_t0)),
-        ttft=_or_null(ttft),
-        ttft_visible=_or_null(ttft_visible),
+        queue_wait=timing.queue_wait,
+        preflight=timing.preflight(upstream_t0),
+        ttft=ttft,
+        ttft_visible=ttft_visible,
         # Read here rather than captured in the view: on the streaming paths
         # nothing had been sent yet when the view ran.
-        send_blocked=_or_null(timing.blocked_seconds()),
+        send_blocked=timing.blocked_seconds(),
         outcome=outcome,
     )
     db.session.add(log)
