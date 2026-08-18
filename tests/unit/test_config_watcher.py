@@ -97,6 +97,7 @@ def test_restart_keys_covered():
 
 def test_start_config_watcher_creates_daemon_thread(app, tmp_path):
     from unittest.mock import MagicMock, patch
+
     from lumen.services.config_watcher import start_config_watcher
 
     config_path = str(tmp_path / "config.yaml")
@@ -111,8 +112,10 @@ def test_start_config_watcher_creates_daemon_thread(app, tmp_path):
 
 
 def test_watcher_reloads_config_on_mtime_change(app, tmp_path, restore_config):
-    import yaml
     from unittest.mock import patch
+
+    import yaml
+
     from lumen.services.config_watcher import _watcher
 
     config_file = tmp_path / "config.yaml"
@@ -147,8 +150,10 @@ def test_watcher_reloads_config_on_mtime_change(app, tmp_path, restore_config):
 
 
 def test_watcher_reconciles_user_groups_on_reload(app, tmp_path, restore_config):
-    import yaml
     from unittest.mock import patch
+
+    import yaml
+
     from lumen.services.config_watcher import _watcher
 
     config_file = tmp_path / "config.yaml"
@@ -188,8 +193,10 @@ def test_watcher_reconciles_user_groups_on_reload(app, tmp_path, restore_config)
 
 
 def test_watcher_skips_when_mtime_unchanged(app, tmp_path, restore_config):
-    import yaml
     from unittest.mock import patch
+
+    import yaml
+
     from lumen.services.config_watcher import _watcher
 
     config_file = tmp_path / "config.yaml"
@@ -218,6 +225,7 @@ def test_watcher_skips_when_mtime_unchanged(app, tmp_path, restore_config):
 
 def test_watcher_handles_read_error_gracefully(app, tmp_path, restore_config):
     from unittest.mock import patch
+
     from lumen.services.config_watcher import _watcher
 
     config_file = tmp_path / "config.yaml"
@@ -252,6 +260,7 @@ def test_watcher_handles_read_error_gracefully(app, tmp_path, restore_config):
 def test_dev_user_set_logs_warning(app, caplog, restore_config):
     """A configured dev_user emits a loud warning so an accidental prod setting is visible."""
     import logging
+
     from lumen.services.config_watcher import apply_hot_config
     with caplog.at_level(logging.WARNING, logger="lumen.services.config_watcher"):
         with app.app_context():
@@ -261,6 +270,7 @@ def test_dev_user_set_logs_warning(app, caplog, restore_config):
 
 def test_no_dev_user_no_warning(app, caplog, restore_config):
     import logging
+
     from lumen.services.config_watcher import apply_hot_config
     with caplog.at_level(logging.WARNING, logger="lumen.services.config_watcher"):
         with app.app_context():
@@ -281,6 +291,7 @@ def test_unknown_app_key_warns(app, caplog, restore_config):
     developer's dev database and dropping its tables on every run.
     """
     import logging
+
     from lumen.services.config_watcher import apply_hot_config
     with caplog.at_level(logging.WARNING, logger="lumen.services.config_watcher"):
         with app.app_context():
@@ -292,6 +303,7 @@ def test_unknown_app_key_warns(app, caplog, restore_config):
 
 def test_known_app_keys_do_not_warn(app, caplog, restore_config):
     import logging
+
     from lumen.services.config_watcher import KNOWN_APP_KEYS, apply_hot_config
     # Empty dicts are inert placeholders for every shape these keys can take
     # (str, bool, mapping); the point is only that the key name is recognised.
@@ -381,6 +393,7 @@ def test_apply_hot_config_config_editor_disabled(app, restore_config):
 
 def test_apply_hot_config_v1_emits_version_deprecation_warning(app, caplog, restore_config):
     import logging
+
     import lumen.services.config_watcher as cw
     cw._version_warned = False
     try:
@@ -394,6 +407,7 @@ def test_apply_hot_config_v1_emits_version_deprecation_warning(app, caplog, rest
 
 def test_apply_hot_config_v2_no_version_warning(app, caplog, restore_config):
     import logging
+
     import lumen.services.config_watcher as cw
     cw._version_warned = False
     try:
