@@ -931,6 +931,46 @@ def test_streaming_error_after_billing_holds_no_connection(
         resp.close()
 
 
+def test_streaming_billing_error_is_not_reported_as_an_upstream_error(
+    app, client, monkeypatch, test_user, test_model, test_model_endpoint, api_key,
+):
+    """A failed commit is not the endpoint's fault, and must not be blamed on it.
+
+    The stream ran to completion and the client already holds every chunk; only
+    the accounting failed. The abort metric keeps the two apart via ``phase``,
+    but the error event and the log line went through the upstream classifier,
+    so both named an endpoint and a model that had done nothing wrong -- an
+    operator following either goes hunting a backend problem that does not
+    exist.
+    """
+    from lumen.blueprints.api import routes
+    token, _ = api_key
+    _allow_model(app, test_user, test_model)
+
+    def boom(*a, **k):
+        raise RuntimeError("billing blew up")
+
+    _fake_openai(monkeypatch, routes, [_UsageChunk()])
+    monkeypatch.setattr(routes, "_record_api_key_usage", boom)
+
+    resp = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"model": test_model["model_name"],
+              "messages": [{"role": "user", "content": "hi"}], "stream": True},
+    )
+    assert resp.status_code == HTTPStatus.OK
+    try:
+        body = b"".join(resp.response)
+    finally:
+        resp.close()
+
+    assert b'"error"' in body, "the billing failure was not reported to the client at all"
+    assert b"Upstream error" not in body, (
+        "a billing failure was reported to the client as an upstream failure"
+    )
+
+
 def test_streaming_abandoned_by_client_releases_connection(
     app, client, monkeypatch, test_user, test_model, test_model_endpoint, api_key,
 ):

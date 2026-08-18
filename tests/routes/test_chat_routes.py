@@ -164,7 +164,13 @@ def test_chat_stream_graylist_no_consent_403(app, auth_client, test_user, test_m
 def test_chat_stream_graylist_with_consent_passes_access(
     app, auth_client, test_user, test_model,
 ):
-    """needs_ack + consent clears the access gate (stream starts, fails at LLM level)."""
+    """needs_ack + consent clears the access gate (stream starts, fails at LLM level).
+
+    Asserted as OK rather than "not FORBIDDEN": the failure this test guards
+    against is the access gate refusing a consented user, but "not 403" is also
+    satisfied by a 500 from a view that crashed after the gate, which would
+    certify the opposite of what the name claims.
+    """
     with app.app_context():
         from lumen.extensions import db
         from lumen.models.entity_model_access import EntityModelAccess
@@ -188,7 +194,8 @@ def test_chat_stream_graylist_with_consent_passes_access(
         "messages": [{"role": "user", "content": "hi"}],
         "model": test_model["model_name"],
     })
-    assert resp.status_code != HTTPStatus.FORBIDDEN
+    assert resp.status_code == HTTPStatus.OK
+    resp.close()
 
 
 def test_chat_stream_holds_no_connection_at_yields(app, auth_client, test_user, test_model, monkeypatch):
@@ -434,7 +441,11 @@ def test_chat_stream_counts_conversation_when_storing_disabled(app, auth_client,
 
 
 def test_chat_stream_whitelist_passes_access(app, auth_client, test_user, test_model):
-    """Whitelist clears the access gate (stream starts, fails at LLM level)."""
+    """Whitelist clears the access gate (stream starts, fails at LLM level).
+
+    Asserted as OK rather than "not FORBIDDEN" — see
+    ``test_chat_stream_graylist_with_consent_passes_access``.
+    """
     with app.app_context():
         from lumen.extensions import db
         from lumen.models.entity_model_access import EntityModelAccess
@@ -450,7 +461,8 @@ def test_chat_stream_whitelist_passes_access(app, auth_client, test_user, test_m
         "messages": [{"role": "user", "content": "hi"}],
         "model": test_model["model_name"],
     })
-    assert resp.status_code != HTTPStatus.FORBIDDEN
+    assert resp.status_code == HTTPStatus.OK
+    resp.close()
 
 
 def test_chat_stream_disconnect_is_not_reported_as_empty_response(
@@ -635,6 +647,143 @@ def test_chat_stream_without_the_bridge_records_nulls(
     assert log.ttft is not None
     assert log.ttft_visible is not None
     assert log.outcome == "ok"
+
+
+class _SetOnCheck:
+    """A disconnect flag that flips on the Nth ``is_set()`` call.
+
+    The chunk loop in ``send_message_stream`` polls the flag before yielding and
+    ``generate()`` polls it after receiving, so a real client can vanish in
+    between. Counting the calls is the only way to land a disconnect in that
+    one-statement window deterministically.
+    """
+
+    def __init__(self, flip_after):
+        self._flip_after = flip_after
+        self.calls = 0
+
+    def is_set(self):
+        self.calls += 1
+        return self.calls > self._flip_after
+
+
+def test_chat_stream_saves_the_conversation_when_the_client_leaves_during_billing(
+    app, auth_client, test_user, test_model, test_model_endpoint, monkeypatch,
+):
+    """A disconnect inside the billing window must not throw away the reply.
+
+    ``send_message_stream`` bills the stream — coins subtracted, request_logs
+    written with outcome "ok" and aborted false — between the last upstream
+    chunk and the final result tuple it yields. A client that leaves in that
+    window has already paid for the reply, so the conversation must still be
+    written. Breaking out of the loop there instead loses the reply with nothing
+    in request_logs to say it happened.
+    """
+    import threading
+    from unittest.mock import patch
+
+    _allow_model(app, test_user, test_model)
+    disconnected = threading.Event()
+
+    def chunks():
+        yield _Chunk(content="hi")
+        yield _Chunk(usage=_Usage())
+        # Runs when the chunk loop asks for the next chunk: after the flag check
+        # on the usage chunk above, and before the billing block. Exactly the
+        # window this test is about.
+        disconnected.set()
+
+    from lumen.blueprints.chat import routes as chat_routes
+    from lumen.services import llm as llm_service
+    monkeypatch.setattr(chat_routes, "client_disconnect_event", lambda: disconnected)
+    monkeypatch.setattr(llm_service, "client_disconnect_event", lambda: disconnected)
+
+    with patch("lumen.services.llm.openai.OpenAI", _fake_openai(chunks())):
+        resp = auth_client.post("/chat/stream", json={
+            "messages": [{"role": "user", "content": "hi"}],
+            "model": test_model["model_name"],
+        })
+        assert resp.status_code == HTTPStatus.OK
+        b"".join(resp.response)
+        resp.close()
+
+    log = _only_log(app)
+    assert log.outcome == "ok", "a stream that completed and billed was logged as something else"
+    assert log.aborted is False
+
+    with app.app_context():
+        from sqlalchemy import select
+        from lumen.extensions import db
+        from lumen.models.message import Message
+        stored = db.session.execute(select(Message).order_by(Message.id)).scalars().all()
+    assert [m.role for m in stored] == ["user", "assistant"], (
+        "the reply was billed but the conversation was not saved"
+    )
+    assert stored[1].content == "hi"
+
+
+def test_chat_stream_bills_the_abort_without_waiting_for_the_stream_to_be_collected(
+    app, auth_client, test_user, test_model, test_model_endpoint, monkeypatch,
+):
+    """``generate()`` closes the LLM stream itself rather than leaving it to GC.
+
+    When ``generate()``'s own disconnect check wins the race, the
+    ``send_message_stream`` generator is left suspended at a yield, and the
+    ``except GeneratorExit`` handler that bills an abandoned stream only runs
+    once that generator object is destroyed. Under refcounting that is usually
+    immediate — but anything still referencing the frame (a traceback, a log
+    record carrying exc_info, a profiler) postpones the abort indefinitely, and
+    an exception raised during collection is swallowed. Here the reference is
+    the test's own, standing in for all of them.
+    """
+    from unittest.mock import patch
+
+    _allow_model(app, test_user, test_model)
+    # Call 1 is the chunk loop's check on the content chunk (still connected);
+    # call 2 is generate()'s check on the tuple it just received.
+    disconnected = _SetOnCheck(flip_after=1)
+
+    from lumen.blueprints.chat import routes as chat_routes
+    from lumen.services import llm as llm_service
+    monkeypatch.setattr(chat_routes, "client_disconnect_event", lambda: disconnected)
+    monkeypatch.setattr(llm_service, "client_disconnect_event", lambda: disconnected)
+
+    held = []
+    real_send = chat_routes.send_message_stream
+
+    def capturing(*args, **kwargs):
+        stream = real_send(*args, **kwargs)
+        held.append(stream)
+        return stream
+
+    monkeypatch.setattr(chat_routes, "send_message_stream", capturing)
+
+    chunks = [_Chunk(content="hi"), _Chunk(content=" there"), _Chunk(usage=_Usage())]
+    try:
+        with patch("lumen.services.llm.openai.OpenAI", _fake_openai(chunks)):
+            resp = auth_client.post("/chat/stream", json={
+                "messages": [{"role": "user", "content": "hi"}],
+                "model": test_model["model_name"],
+            })
+            assert resp.status_code == HTTPStatus.OK
+            b"".join(resp.response)
+            resp.close()
+
+        assert disconnected.calls >= 2, "the disconnect never landed in the intended window"
+        with app.app_context():
+            from sqlalchemy import select
+            from lumen.extensions import db
+            from lumen.models.request_log import RequestLog
+            logs = db.session.execute(select(RequestLog)).scalars().all()
+        assert len(logs) == 1, (
+            "the abandoned stream was not billed; the abort waited on the "
+            "generator being collected"
+        )
+        assert logs[0].aborted is True
+        assert logs[0].outcome == "disconnect"
+    finally:
+        for stream in held:
+            stream.close()
 
 
 # ---------------------------------------------------------------------------

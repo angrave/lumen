@@ -272,14 +272,23 @@ def chat_stream():
         try:
             result = None
             for chunk, thinking, final in llm_stream:
+                if final is not None:
+                    # Taken before the disconnect check, not after: reaching the
+                    # final tuple means the stream ran to completion and
+                    # send_message_stream has already billed it (outcome "ok",
+                    # aborted false). A client that leaves inside that billing
+                    # window — a few milliseconds, but a busy one — would
+                    # otherwise break here and lose the reply it paid for, with
+                    # nothing in request_logs to say the conversation was
+                    # dropped. Keep it and let the write below run.
+                    result = final
+                    continue
                 if disconnected.is_set():
                     break
                 if thinking is not None:
                     yield f"data: {json.dumps({'thinking_chunk': thinking})}\n\n"
                 elif chunk is not None:
                     yield f"data: {json.dumps({'chunk': chunk})}\n\n"
-                else:
-                    result = final
 
             if result is None and disconnected.is_set():
                 # The client left mid-stream; send_message_stream has already
@@ -360,6 +369,17 @@ def chat_stream():
             logger.exception("chat_stream error (model=%s, entity=%s)", model, entity_id)
             yield f"data: {json.dumps({'error': 'An error occurred. Please try again.'})}\n\n"
         finally:
+            # Close the LLM stream here rather than leaving it to be collected.
+            # Closing it is what raises GeneratorExit inside send_message_stream,
+            # and that handler is where an abandoned stream gets billed. Two
+            # exits above leave it suspended mid-stream: the disconnect check in
+            # the loop, and a GeneratorExit thrown in at a yield. Under
+            # refcounting the collection is usually immediate, but anything
+            # still referencing this frame (a traceback, a log record carrying
+            # exc_info) postpones it indefinitely and an exception raised during
+            # collection is swallowed — so the abort accounting would silently
+            # never happen. A no-op once the stream has run to completion.
+            llm_stream.close()
             # Best effort, not the correctness argument: an abandoned generator
             # is never closed, so this may never run. The ticket's deadline is
             # what bounds the count. Context-free — no db.session, no

@@ -645,11 +645,24 @@ def _do_chat(model_name: str, messages: list, stream: bool, **kwargs):
             # and only the accounting broke, and conflating the two would send
             # an operator hunting a backend problem that does not exist.
             observe_stream_abort("api", f"{phase}_error")
-            msg, err_type, _ = _classify_upstream_error(
-                exc,
-                f"Error during streaming request "
-                f"(endpoint={ep_id} {ep_url} model={remote_model}, entity_id={entity_id})",
-            )
+            if phase == "billing":
+                # Same separation the metric already makes, carried into the log
+                # and the client's error event. _classify_upstream_error names
+                # the endpoint and the model and reports "Upstream error", which
+                # for a failed commit is a false lead: the backend generated the
+                # whole reply and the client has every chunk of it. An operator
+                # reading either would go looking at an endpoint that was fine.
+                logger.exception(
+                    "Billing failed after a completed streaming request "
+                    "(model=%s, entity_id=%s)", remote_model, entity_id,
+                )
+                msg, err_type = "Internal error. Please try again.", "api_error"
+            else:
+                msg, err_type, _ = _classify_upstream_error(
+                    exc,
+                    f"Error during streaming request "
+                    f"(endpoint={ep_id} {ep_url} model={remote_model}, entity_id={entity_id})",
+                )
             # Any half-finished billing was already rolled back when its app
             # context exited; nothing is held while the error events below
             # are in flight — a client that has gone away can leave those
