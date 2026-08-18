@@ -49,6 +49,7 @@ import socket
 import struct
 import sys
 import threading
+import types
 import time
 from http import HTTPStatus
 
@@ -499,3 +500,122 @@ def test_chat_stream_disconnect_stops_generation(
     assert _leftover_context_count() == anomalies_before, (
         "an app context outlived the aborted request"
     )
+
+
+# ---------------------------------------------------------------------------
+# The ASGI bridge actually publishes the timing marks
+# ---------------------------------------------------------------------------
+
+class _UsageChunk:
+    """Terminal chunk carrying usage, which is what makes the API path bill.
+
+    Deliberately not folded into ``_SlowUpstream``: the disconnect tests depend
+    on that stub never completing normally, and a usage chunk would change what
+    they exercise.
+    """
+
+    def __init__(self):
+        self.choices = []
+        self.usage = types.SimpleNamespace(prompt_tokens=7, completion_tokens=11)
+
+    def model_dump(self):
+        return {"choices": [], "usage": {"prompt_tokens": 7, "completion_tokens": 11}}
+
+
+class _CompletingUpstream:
+    """Streams a few chunks and then finishes properly, usage and all."""
+
+    def chunks(self):
+        for i in range(3):
+            yield _Chunk(f"tok{i} ")
+        yield _UsageChunk()
+
+    def __call__(self, *args, **kwargs):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    @property
+    def chat(self):
+        return self
+
+    @property
+    def completions(self):
+        return self
+
+    def create(self, *args, **kwargs):
+        return self.chunks()
+
+
+def test_completed_request_records_arrival_through_the_real_bridge(
+    app, server, monkeypatch, test_user, test_model, test_model_endpoint, api_token,
+):
+    """The one link the Flask test client structurally cannot prove.
+
+    ``started_at``/``queue_wait``/``preflight`` are stamped into the WSGI environ
+    by ``_DisconnectAwareWSGIResponder`` in ``lumen/services/wsgi_disconnect.py``,
+    which only exists on the ASGI path. ``app.test_client()`` bypasses ``asgi.py``
+    entirely, so every unit and route test can prove Lumen writes those columns
+    *given* the environ keys, and none can prove the bridge ever sets them. A
+    typo in a key name would leave every production row NULL while the whole
+    suite stayed green — the columns are nullable by design, so nothing raises.
+
+    This drives a real, completed request through real uvicorn and reads the row.
+    """
+    import http.client
+    import json
+
+    from sqlalchemy import select
+
+    from lumen.extensions import db
+    from lumen.models.request_log import RequestLog
+
+    monkeypatch.setattr(openai, "OpenAI", _CompletingUpstream())
+    _grant_access(app, test_user["id"], test_model["id"])
+    with app.app_context():
+        db.session.execute(RequestLog.__table__.delete())
+        db.session.commit()
+
+    conn = http.client.HTTPConnection("127.0.0.1", server, timeout=30)
+    try:
+        conn.request(
+            "POST", "/v1/chat/completions",
+            body=json.dumps({
+                "model": test_model["model_name"],
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            }),
+            headers={"Authorization": f"Bearer {api_token}",
+                     "Content-Type": "application/json"},
+        )
+        resp = conn.getresponse()
+        body = resp.read()  # read to completion; no hangup here
+    finally:
+        conn.close()
+
+    # Fail for the right reason: a 4xx would make every assertion below vacuous.
+    assert resp.status == HTTPStatus.OK, f"request failed: {resp.status} {body[:400]!r}"
+    assert b"data:" in body, f"the stream never started: {body[:400]!r}"
+
+    with app.app_context():
+        row = db.session.execute(select(RequestLog)).scalars().one()
+
+    assert row.started_at is not None, (
+        "the ASGI bridge did not publish lumen.started_at — every production row "
+        "would carry a NULL arrival time, silently"
+    )
+    assert row.queue_wait is not None, "the bridge did not publish lumen.t0_monotonic"
+    assert row.preflight is not None, "preflight could not be derived from the bridge marks"
+
+    # Sane magnitudes: a mixed-clock regression lands at ~1.76e9 or goes negative.
+    assert 0 <= row.queue_wait < 60, f"implausible queue_wait {row.queue_wait}"
+    assert 0 <= row.preflight < 60, f"implausible preflight {row.preflight}"
+    assert row.outcome == "ok"
+
+    assert row.started_at <= row.time
+    span = (row.time - row.started_at).total_seconds()
+    assert 0 <= span < 60, f"implausible arrival-to-completion span {span}"

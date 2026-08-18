@@ -79,6 +79,29 @@ drive the **real code path end-to-end** and compare against an independently cap
 Ask of every test: what bug could exist that this test would not notice? If the answer is "the one
 this feature is about", the test is decoration.
 
+### 1.5a A `server_default` silently swallows an explicit `None`
+
+The timing columns are nullable *and* carry `server_default='0'` — nullable because "not measured"
+must stay distinguishable from "measured as zero", and defaulted because a populated TimescaleDB
+hypertable will not accept a new column without one.
+
+Those two requirements interact in a way that destroys the first. SQLAlchemy **omits** an attribute
+set to `None` from the INSERT when the column has a default, so the database fills in the default:
+
+```python
+s.add(T(v=None))        # stored as 0.0   <-- "not measured" became "measured as zero"
+s.add(T(v=sa.null()))   # stored as NULL
+```
+
+Verified directly against the installed SQLAlchemy. A subagent found it because one of its tests
+asserted `0.0 is None`; without that test the column would have shipped looking correct, with every
+unmeasured request indistinguishable from a request that waited exactly zero seconds — the precise
+distinction the migration docstring spends a paragraph defending.
+
+**Apply it:** whenever a column is *both* nullable and defaulted, writing NULL requires an explicit
+`sa.null()`. And more generally: if two schema requirements pull in opposite directions, write the
+test that proves which one won.
+
 ### 1.6 Verify `[FACT]` claims against HEAD, not against an earlier read
 
 The proposal asserted that the HTTP latency histogram was blind to streaming responses with a 10 s

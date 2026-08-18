@@ -489,3 +489,149 @@ def test_chat_stream_disconnect_is_not_reported_as_empty_response(
     assert b"Empty response from model" not in body, (
         "a client disconnect was reported to the client as an empty model response"
     )
+
+
+# ---------------------------------------------------------------------------
+# Request timing columns
+#
+# The chat path is the only one where the LLM call lives in llm.py rather than
+# in the view, so the marks have to travel view -> send_message_stream ->
+# context-free generator. The real send_message_stream runs here (only the
+# openai client is faked) so that journey is actually exercised.
+# ---------------------------------------------------------------------------
+
+_MAX_PLAUSIBLE_SPAN = 60 * 60  # seconds; a test request takes milliseconds
+_QUEUE_WAIT = 0.05             # seconds of admission wait to stamp T0 behind
+_SEND_BLOCKED = 0.25           # seconds the responder reports blocked in send
+
+
+def _bridge_environ():
+    """The environ keys ``asgi.py`` publishes; the test client bypasses it.
+
+    ``lumen.queue_wait`` is left out on purpose — the real before_request hook
+    derives it from the arrival mark.
+    """
+    import time
+    from datetime import datetime, timezone
+    from lumen.services.wsgi_disconnect import SendBlocked
+    return {
+        "lumen.t0_monotonic": time.monotonic() - _QUEUE_WAIT,
+        "lumen.started_at": datetime.now(timezone.utc),
+        "lumen.send_blocked": SendBlocked(),
+    }
+
+
+class _Chunk:
+    """One upstream streaming chunk: a reasoning delta, a content delta, or usage."""
+
+    def __init__(self, content=None, reasoning=None, usage=None):
+        self.usage = usage
+        delta = type("Delta", (), {
+            "content": content, "reasoning_content": reasoning, "reasoning": None,
+        })()
+        self.choices = [type("Choice", (), {"delta": delta})()] if (content or reasoning) else []
+
+
+class _Usage:
+    prompt_tokens = 10
+    completion_tokens = 5
+    completion_tokens_details = None
+
+
+def _fake_openai(chunks):
+    from unittest.mock import MagicMock
+    client = MagicMock()
+    client.chat.completions.create.return_value = iter(chunks)
+    client.__enter__ = MagicMock(return_value=client)
+    client.__exit__ = MagicMock(return_value=False)
+    return MagicMock(return_value=client)
+
+
+def _allow_model(app, test_user, test_model):
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.entity_model_access import EntityModelAccess
+        _grant_unlimited_pool(app, test_user["id"])
+        db.session.add(EntityModelAccess(
+            entity_id=test_user["id"], model_config_id=test_model["id"],
+            access_type="allowed",
+        ))
+        db.session.commit()
+
+
+def _only_log(app):
+    with app.app_context():
+        from sqlalchemy import select
+        from lumen.extensions import db
+        from lumen.models.request_log import RequestLog
+        return db.session.execute(select(RequestLog)).scalar_one()
+
+
+def test_chat_stream_records_timing_columns(
+    app, auth_client, test_user, test_model, test_model_endpoint,
+):
+    """A reasoning delta ahead of the content splits ttft from ttft_visible.
+
+    send_blocked is mutated after the first event is out: a float captured in
+    the view would still read 0.0 there, since nothing had been sent yet.
+    """
+    from unittest.mock import patch
+    _allow_model(app, test_user, test_model)
+    chunks = [_Chunk(reasoning="thinking"), _Chunk(content="hi"), _Chunk(usage=_Usage())]
+
+    environ = _bridge_environ()
+    with patch("lumen.services.llm.openai.OpenAI", _fake_openai(chunks)):
+        resp = auth_client.post(
+            "/chat/stream",
+            json={"messages": [{"role": "user", "content": "hi"}],
+                  "model": test_model["model_name"]},
+            environ_base=environ,
+        )
+        assert resp.status_code == HTTPStatus.OK
+        assert resp.is_streamed
+        events = iter(resp.response)
+        try:
+            next(events)  # one event out; the generator is suspended mid-stream
+            environ["lumen.send_blocked"].seconds = _SEND_BLOCKED
+            for _ in events:
+                pass
+        finally:
+            resp.close()
+
+    log = _only_log(app)
+    assert log.started_at is not None
+    assert _QUEUE_WAIT <= log.queue_wait < _MAX_PLAUSIBLE_SPAN
+    assert 0 <= log.preflight < _MAX_PLAUSIBLE_SPAN
+    # The thinking phase sits between the two marks.
+    assert 0 < log.ttft < log.ttft_visible < _MAX_PLAUSIBLE_SPAN
+    assert log.send_blocked == _SEND_BLOCKED
+    assert log.outcome == "ok"
+    assert log.aborted is False
+
+
+def test_chat_stream_without_the_bridge_records_nulls(
+    app, auth_client, test_user, test_model, test_model_endpoint,
+):
+    """Absent marks are NULL — "not measured", not "measured as zero"."""
+    from unittest.mock import patch
+    _allow_model(app, test_user, test_model)
+    chunks = [_Chunk(content="hi"), _Chunk(usage=_Usage())]
+
+    with patch("lumen.services.llm.openai.OpenAI", _fake_openai(chunks)):
+        resp = auth_client.post(
+            "/chat/stream",
+            json={"messages": [{"role": "user", "content": "hi"}],
+                  "model": test_model["model_name"]},
+        )
+        assert resp.status_code == HTTPStatus.OK
+        b"".join(resp.response)
+        resp.close()
+
+    log = _only_log(app)
+    assert log.started_at is None
+    assert log.queue_wait is None
+    assert log.preflight is None
+    assert log.send_blocked is None
+    assert log.ttft is not None
+    assert log.ttft_visible is not None
+    assert log.outcome == "ok"

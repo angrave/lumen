@@ -24,6 +24,7 @@ from lumen.services.cost import calculate_audio_cost
 from lumen.services.crypto import cache_salt_for_entity, hash_api_key
 from lumen.services.llm import (
     bulk_model_access_info,
+    capture_request_timing,
     check_coin_budget,
     estimate_abort_usage,
     get_effective_limit,
@@ -374,6 +375,9 @@ def _complete_and_bill(model_name: str, messages: list, **kwargs):
     mc_in_cost   = float(model_config.input_cost_per_million)
     mc_out_cost  = float(model_config.output_cost_per_million)
     timeout, max_retries = upstream_call_bounds(streaming=False)
+    # The arrival marks live in the WSGI environ; read them while the request
+    # context is current.
+    timing = capture_request_timing()
     db.session.remove()  # return connection to pool before the LLM call
 
     try:
@@ -401,7 +405,11 @@ def _complete_and_bill(model_name: str, messages: list, **kwargs):
     cost = round(usage_prompt * mc_in_cost / 1_000_000 + usage_completion * mc_out_cost / 1_000_000, 6)
     subtract_coins(entity_id, mc_id, cost, effective=effective)
     update_stats(entity_id, mc_id, "api", usage_prompt, usage_completion, cost,
-                 endpoint_id=ep_id, duration=duration)
+                 endpoint_id=ep_id, duration=duration,
+                 timing=timing, upstream_t0=t0,
+                 # Non-streaming: the whole body arrives in one piece, so the
+                 # first chunk is the response and both marks are the duration.
+                 ttft=duration, ttft_visible=duration, outcome="ok")
     _record_api_key_usage(ak_id, usage_prompt, usage_completion, cost)
     db.session.commit()
     return response, None
@@ -460,6 +468,9 @@ def _do_chat(model_name: str, messages: list, stream: bool, **kwargs):
     # Captured while the request context is still current; polled in the loop
     # below. GeneratorExit alone never fires under uvicorn + a2wsgi.
     disconnected = client_disconnect_event()
+    # Likewise captured here and not in generate(): the arrival marks are in the
+    # WSGI environ, which only the view can reach.
+    timing = capture_request_timing()
     # Likewise read here, not in generate(): the client is constructed inside
     # the generator, which runs context-free with no current_app to read from.
     timeout, max_retries = upstream_call_bounds(streaming=True)
@@ -472,6 +483,10 @@ def _do_chat(model_name: str, messages: list, stream: bool, **kwargs):
         usage = None
         content_deltas = 0
         t0 = _time.monotonic()
+        # First chunk of any kind (reasoning included) and first visible content
+        # delta: on a reasoning model they differ by the whole thinking phase.
+        t_first_any = None
+        t_first_visible = None
 
         def _abort():
             """Bill and log what this stream consumed before the client went away.
@@ -487,6 +502,7 @@ def _do_chat(model_name: str, messages: list, stream: bool, **kwargs):
                 source="api", endpoint_id=ep_id, stream_t0=t0,
                 input_tokens=input_tokens, output_tokens=output_tokens, cost=cost,
                 effective=effective,
+                timing=timing, ttft=t_first_any, ttft_visible=t_first_visible,
                 record_extra=lambda: _record_api_key_usage(ak_id, input_tokens, output_tokens, cost),
             )
 
@@ -516,6 +532,8 @@ def _do_chat(model_name: str, messages: list, stream: bool, **kwargs):
                     **kwargs,
                 )
                 for chunk in resp_stream:
+                    if t_first_any is None:
+                        t_first_any = _time.monotonic() - t0
                     # Capture usage before testing the flag — see llm.py: the
                     # totals ride on the terminal chunk, and a disconnect in that
                     # window must not discard figures already in hand.
@@ -530,6 +548,8 @@ def _do_chat(model_name: str, messages: list, stream: bool, **kwargs):
                     delta = getattr(choices[0], "delta", None) if choices else None
                     if getattr(delta, "content", None):
                         content_deltas += 1
+                        if t_first_visible is None:
+                            t_first_visible = _time.monotonic() - t0
                     yield f"data: {json.dumps(chunk.model_dump())}\n\n"
                 if not aborted:
                     duration = _time.monotonic() - t0
@@ -543,7 +563,10 @@ def _do_chat(model_name: str, messages: list, stream: bool, **kwargs):
                         with app.app_context():
                             subtract_coins(entity_id, mc_id, cost, effective=effective)
                             update_stats(entity_id, mc_id, "api", usage.prompt_tokens, usage.completion_tokens, cost,
-                                         endpoint_id=ep_id, duration=duration)
+                                         endpoint_id=ep_id, duration=duration,
+                                         timing=timing, upstream_t0=t0,
+                                         ttft=t_first_any, ttft_visible=t_first_visible,
+                                         outcome="ok")
                             _record_api_key_usage(ak_id, usage.prompt_tokens, usage.completion_tokens, cost)
                             db.session.commit()
                         billed = True
@@ -647,6 +670,8 @@ def _do_audio(kind: str):
     mc_out_cost      = float(model_config.output_cost_per_million)
     mc_audio_per_hour = float(model_config.audio_cost_per_hour or 0)
     timeout, max_retries = upstream_call_bounds(streaming=False)
+    # Read while the request context is current, like the paths above.
+    timing = capture_request_timing()
     db.session.remove()
 
     try:
@@ -686,7 +711,11 @@ def _do_audio(kind: str):
 
     subtract_coins(entity_id, mc_id, cost, effective=effective)
     update_stats(entity_id, mc_id, "api", in_tok, out_tok, cost,
-                 endpoint_id=ep_id, duration=duration, audio_seconds=seconds)
+                 endpoint_id=ep_id, duration=duration, audio_seconds=seconds,
+                 timing=timing, upstream_t0=t0,
+                 # Non-streaming: the transcription arrives in one piece, so the
+                 # first chunk is the response and both marks are the duration.
+                 ttft=duration, ttft_visible=duration, outcome="ok")
     _record_api_key_usage(ak_id, in_tok, out_tok, cost, audio_seconds=seconds)
     db.session.commit()
 

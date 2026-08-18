@@ -3,11 +3,11 @@ import threading
 import time
 from datetime import datetime, timezone
 from http import HTTPStatus
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 import openai
-from flask import current_app
-from sqlalchemy import select
+from flask import current_app, has_request_context, request
+from sqlalchemy import null, select
 from sqlalchemy import update as sa_update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.compiler import compiles
@@ -30,7 +30,13 @@ from lumen.models.model_endpoint import ModelEndpoint
 from lumen.models.model_stat import ModelStat
 from lumen.models.request_log import RequestLog
 from lumen.services.crypto import cache_salt_for_entity
-from lumen.services.wsgi_disconnect import client_disconnect_event
+from lumen.services.wsgi_disconnect import (
+    SEND_BLOCKED_ENVIRON_KEY,
+    STARTED_AT_ENVIRON_KEY,
+    T0_ENVIRON_KEY,
+    SendBlocked,
+    client_disconnect_event,
+)
 from lumen.timeutils import utcnow
 
 logger = logging.getLogger(__name__)
@@ -481,6 +487,80 @@ def check_coin_budget(entity_id: int, model_config_id: int, require_consent: boo
     return True, None, None, effective
 
 
+#: WSGI environ key holding the seconds the request waited for a WSGI worker.
+#: Written by the ``before_request`` hook in ``lumen/__init__.py``, which
+#: subtracts the bridge's T0 mark on pickup.
+QUEUE_WAIT_ENVIRON_KEY = "lumen.queue_wait"
+
+
+class RequestTiming(NamedTuple):
+    """The per-request marks the ASGI bridge publishes, captured in the view.
+
+    Read it with :func:`capture_request_timing` while the request context is
+    still current and pass it into the streaming generators as a parameter: the
+    generators run context-free and must never touch ``request`` (the same rule
+    ``client_disconnect_event`` documents).
+
+    Every field is None when the request did not come through the bridge — the
+    Werkzeug dev server, the Flask test client, direct unit-test calls. None
+    stores SQL NULL, which means "not measured" and stays distinguishable from a
+    measured zero.
+
+    ``send_blocked`` is the live holder rather than a float on purpose: on the
+    streaming paths nothing has been sent when the view captures this, so only a
+    read taken at billing time carries a total.
+    """
+
+    started_at: Optional[datetime] = None
+    queue_wait: Optional[float] = None
+    #: T1 — the monotonic instant a worker thread picked the request up.
+    picked_up_at: Optional[float] = None
+    send_blocked: Optional[SendBlocked] = None
+
+    def preflight(self, upstream_t0: Optional[float]) -> Optional[float]:
+        """Seconds from worker pickup (T1) to the upstream call (T2)."""
+        if self.picked_up_at is None or upstream_t0 is None:
+            return None
+        return upstream_t0 - self.picked_up_at
+
+    def blocked_seconds(self) -> Optional[float]:
+        """The send-blocked total as it stands now; None when there is no holder."""
+        return None if self.send_blocked is None else self.send_blocked.seconds
+
+
+def _or_null(value):
+    """The value, or an explicit SQL NULL when it was never measured.
+
+    The Float timing columns carry ``server_default='0'`` (Timescale refuses to
+    propagate a non-defaulted NOT NULL column to populated chunks), and
+    SQLAlchemy *omits* a None-valued attribute on a column that has a default —
+    which would quietly store 0.0, "no wait at all", for "never measured". The
+    two must stay distinguishable, so the NULL is rendered explicitly.
+    """
+    return null() if value is None else value
+
+
+def capture_request_timing() -> RequestTiming:
+    """Read this request's bridge marks out of the WSGI environ.
+
+    Call it from view code while the request context is live, never from a
+    streaming generator. Never raises: the keys are absent on every non-ASGI
+    deployment, and a missing mark must degrade to "not measured" rather than to
+    a 500 on a path that is meant to be a pure observability improvement.
+    """
+    environ = request.environ if has_request_context() else {}
+    t0 = environ.get(T0_ENVIRON_KEY)
+    queue_wait = environ.get(QUEUE_WAIT_ENVIRON_KEY)
+    return RequestTiming(
+        started_at=environ.get(STARTED_AT_ENVIRON_KEY),
+        queue_wait=queue_wait,
+        # T1 is not published directly — it is the arrival mark plus the wait
+        # the before_request hook measured against it.
+        picked_up_at=None if t0 is None or queue_wait is None else t0 + queue_wait,
+        send_blocked=environ.get(SEND_BLOCKED_ENVIRON_KEY),
+    )
+
+
 def update_stats(
     entity_id: int,
     model_config_id: int,
@@ -492,12 +572,24 @@ def update_stats(
     duration: float = 0.0,
     audio_seconds: int = 0,
     aborted: bool = False,
+    timing: RequestTiming = RequestTiming(),
+    upstream_t0: float = None,
+    ttft: float = None,
+    ttft_visible: float = None,
+    outcome: str = None,
 ):
     """Update or create ModelStat/EntityStat running totals and append a RequestLog row.
 
     ``aborted`` marks the RequestLog row as one whose stream ended before the
     client had read it; its token counts may be estimated (see
     estimate_abort_usage).
+
+    ``timing`` carries the arrival marks captured in the view (see
+    RequestTiming) and ``upstream_t0`` is the monotonic instant taken
+    immediately before the upstream call, from which the preflight span is
+    derived. The timing columns ride the RequestLog INSERT that already runs, so
+    none of this adds a statement. Anything not measured stays None and is
+    stored as SQL NULL — deliberately not zero.
     """
     now = utcnow()
 
@@ -564,6 +656,15 @@ def update_stats(
         cost=cost,
         duration=duration,
         aborted=aborted,
+        started_at=timing.started_at,
+        queue_wait=_or_null(timing.queue_wait),
+        preflight=_or_null(timing.preflight(upstream_t0)),
+        ttft=_or_null(ttft),
+        ttft_visible=_or_null(ttft_visible),
+        # Read here rather than captured in the view: on the streaming paths
+        # nothing had been sent yet when the view ran.
+        send_blocked=_or_null(timing.blocked_seconds()),
+        outcome=outcome,
     )
     db.session.add(log)
     db.session.flush()
@@ -619,7 +720,8 @@ def estimate_abort_usage(usage, messages, content_deltas, in_cost_per_million, o
 
 def record_aborted_request(entity_id, model_config_id, source, endpoint_id=None, duration=0.0,
                            input_tokens=0, output_tokens=0, cost=0.0,
-                           effective=_UNSET, record_extra=None):
+                           effective=_UNSET, record_extra=None,
+                           timing=RequestTiming(), upstream_t0=None, ttft=None, ttft_visible=None):
     """Bill and log a request_logs row for a stream the client abandoned mid-response.
 
     Billed exactly like a completed request — coins deducted and running totals
@@ -643,6 +745,8 @@ def record_aborted_request(entity_id, model_config_id, source, endpoint_id=None,
             entity_id, model_config_id, source,
             input_tokens, output_tokens, cost,
             endpoint_id=endpoint_id, duration=duration, aborted=True,
+            timing=timing, upstream_t0=upstream_t0,
+            ttft=ttft, ttft_visible=ttft_visible, outcome="disconnect",
         )
         if record_extra is not None:
             record_extra()
@@ -654,7 +758,7 @@ def record_aborted_request(entity_id, model_config_id, source, endpoint_id=None,
 
 def record_stream_abort(app, *, billed, entity_id, model_config_id, source, endpoint_id, stream_t0,
                         input_tokens=0, output_tokens=0, cost=0.0, effective=_UNSET, record_extra=None,
-                        reason="disconnect"):
+                        reason="disconnect", timing=RequestTiming(), ttft=None, ttft_visible=None):
     """Abort accounting for a streaming generator that ends before billing.
 
     Every path that can end a stream early shares this, so they cannot drift:
@@ -687,6 +791,8 @@ def record_stream_abort(app, *, billed, entity_id, model_config_id, source, endp
                 endpoint_id=endpoint_id, duration=time.monotonic() - stream_t0,
                 input_tokens=input_tokens, output_tokens=output_tokens, cost=cost,
                 effective=effective, record_extra=record_extra,
+                timing=timing, upstream_t0=stream_t0,
+                ttft=ttft, ttft_visible=ttft_visible,
             )
     except Exception:
         logger.exception("abort accounting failed (entity_id=%s, model=%s)", entity_id, model_config_id)
@@ -719,10 +825,13 @@ def send_message_stream(
     """
     app = current_app._get_current_object()
     disconnected = client_disconnect_event()
-    return _send_message_stream(app, messages, model, entity_id, source, effective, disconnected)
+    # Same reason as the disconnect Event: the arrival marks live in the WSGI
+    # environ and only the view can reach them.
+    timing = capture_request_timing()
+    return _send_message_stream(app, messages, model, entity_id, source, effective, disconnected, timing)
 
 
-def _send_message_stream(app, messages, model, entity_id, source, effective, disconnected):
+def _send_message_stream(app, messages, model, entity_id, source, effective, disconnected, timing):
     with app.app_context():
         config = db.session.execute(select(ModelConfig).where(ModelConfig.model_name == model, ModelConfig.active)).scalar_one_or_none()
         if config is None:
@@ -752,6 +861,9 @@ def _send_message_stream(app, messages, model, entity_id, source, effective, dis
 
     t0 = time.monotonic()
     t_first = None
+    # First chunk of any kind, reasoning included — ttft, where t_first is
+    # ttft_visible. On a reasoning model the two differ by the thinking phase.
+    t_first_any = None
     parts = []
     usage = None
     billed = False
@@ -773,6 +885,7 @@ def _send_message_stream(app, messages, model, entity_id, source, effective, dis
             source=source, endpoint_id=ep_id, stream_t0=t0,
             input_tokens=input_tokens, output_tokens=output_tokens, cost=cost,
             effective=effective,
+            timing=timing, ttft=t_first_any, ttft_visible=t_first,
         )
 
     try:
@@ -799,6 +912,8 @@ def _send_message_stream(app, messages, model, entity_id, source, effective, dis
 
             thinking_parts = []
             for chunk in stream:
+                if t_first_any is None:
+                    t_first_any = time.monotonic() - t0
                 # Capture usage before testing the flag. The totals ride on the
                 # terminal chunk, so a disconnect landing in that same window
                 # would otherwise throw away figures already in hand — and bill
@@ -850,6 +965,8 @@ def _send_message_stream(app, messages, model, entity_id, source, effective, dis
                     entity_id, mc_id, source,
                     input_tokens, output_tokens, cost,
                     endpoint_id=ep_id, duration=duration,
+                    timing=timing, upstream_t0=t0,
+                    ttft=t_first_any, ttft_visible=t_first, outcome="ok",
                 )
                 db.session.commit()
             billed = True

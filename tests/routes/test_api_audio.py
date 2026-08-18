@@ -295,3 +295,96 @@ def test_transcription_no_usage_zero_cost(
         log = db.session.execute(select(RequestLog)).scalar_one()
         assert log.audio_seconds == 0
         assert float(log.cost) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Request timing columns
+# ---------------------------------------------------------------------------
+
+_MAX_PLAUSIBLE_SPAN = 60 * 60  # seconds; a test request takes milliseconds
+_QUEUE_WAIT = 0.05             # seconds of admission wait to stamp T0 behind
+
+
+def _bridge_environ():
+    """The environ keys ``asgi.py`` publishes; the test client bypasses it.
+
+    ``lumen.queue_wait`` is left out on purpose — the real before_request hook
+    derives it from the arrival mark.
+    """
+    import time
+    from datetime import datetime, timezone
+    from lumen.services.wsgi_disconnect import SendBlocked
+    return {
+        "lumen.t0_monotonic": time.monotonic() - _QUEUE_WAIT,
+        "lumen.started_at": datetime.now(timezone.utc),
+        "lumen.send_blocked": SendBlocked(),
+    }
+
+
+def test_transcription_records_timing_columns(
+    app, client, test_user, test_model, test_model_endpoint, api_key,
+):
+    """The audio path is the fourth billing site and the easiest one to forget.
+
+    Its preflight is not database contention: it includes reading the whole
+    multipart upload, which for a large file dominates.
+    """
+    token, _ = api_key
+    with app.app_context():
+        _grant_finite_pool(app, test_user["id"], coins=100)
+        _set_audio_rate(app, test_model["id"], 0.6)
+
+    payload = {"text": "hello", "usage": {"type": "duration", "seconds": 11}}
+    with patch("lumen.blueprints.api.routes.openai.OpenAI", _mock_openai(payload)):
+        resp = client.post(
+            "/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {token}"},
+            data=_audio_data(),
+            content_type="multipart/form-data",
+            environ_base=_bridge_environ(),
+        )
+    assert resp.status_code == HTTPStatus.OK
+
+    with app.app_context():
+        from sqlalchemy import select
+        from lumen.extensions import db
+        from lumen.models.request_log import RequestLog
+        log = db.session.execute(select(RequestLog)).scalar_one()
+    assert log.started_at is not None
+    assert _QUEUE_WAIT <= log.queue_wait < _MAX_PLAUSIBLE_SPAN
+    assert 0 <= log.preflight < _MAX_PLAUSIBLE_SPAN
+    # Nothing streams, so the first chunk is the whole transcription.
+    assert log.ttft == log.ttft_visible == log.duration
+    assert log.send_blocked == 0.0  # a holder is present; the view never blocks
+    assert log.outcome == "ok"
+
+
+def test_transcription_without_the_bridge_records_nulls(
+    app, client, test_user, test_model, test_model_endpoint, api_key,
+):
+    """Absent marks are NULL — "not measured", not "measured as zero"."""
+    token, _ = api_key
+    with app.app_context():
+        _grant_finite_pool(app, test_user["id"], coins=100)
+        _set_audio_rate(app, test_model["id"], 0.6)
+
+    payload = {"text": "hello", "usage": {"type": "duration", "seconds": 11}}
+    with patch("lumen.blueprints.api.routes.openai.OpenAI", _mock_openai(payload)):
+        resp = client.post(
+            "/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {token}"},
+            data=_audio_data(),
+            content_type="multipart/form-data",
+        )
+    assert resp.status_code == HTTPStatus.OK
+
+    with app.app_context():
+        from sqlalchemy import select
+        from lumen.extensions import db
+        from lumen.models.request_log import RequestLog
+        log = db.session.execute(select(RequestLog)).scalar_one()
+    assert log.started_at is None
+    assert log.queue_wait is None
+    assert log.preflight is None
+    assert log.send_blocked is None
+    assert log.outcome == "ok"
