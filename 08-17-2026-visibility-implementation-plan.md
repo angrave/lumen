@@ -1331,6 +1331,63 @@ send the endpoint API key to a `/metrics` path.
 weaker form: backend `/metrics` must be reachable *from Prometheus*, and the engine of each endpoint
 must be positively known rather than inferred.
 
+### Implementation contract — decisions this plan makes so nobody has to stop and ask
+
+**(a) `backend` is a three-valued column, and `vllm` requires positive evidence.**
+**[FACT]** `lumen/services/model_sync.py:80-95` tags `sglang` only when `/get_server_info` returns a
+body containing an SGLang-specific key — the code comments say a 200 alone is not proof. vLLM is
+never tagged; it is the **fall-through** at `:97-108`, which is equally reached by OpenAI, Azure,
+another Lumen, or any OpenAI-compatible proxy.
+
+**[DECISION]** `model_endpoints.backend` is `'sglang' | 'vllm' | 'unknown'`, defaulting to `unknown`.
+`vllm` is set only on positive evidence — an unauthenticated `GET {root}/metrics` that returns a body
+containing `vllm:`-prefixed metric families. Never by elimination. An endpoint that fails to identify
+stays `unknown` and is simply absent from service discovery; a permanently-down target is a worse
+outcome than an unmonitored one, because it trains operators to ignore the alert.
+
+**(b) Service discovery never carries a credential, and the payload is asserted to.**
+`GET /metrics/targets` emits `targets` and `labels` only. `model_endpoints.api_key` must not appear,
+directly or in a URL. **[DECISION]** a test asserts the raw response body contains no endpoint API
+key, using a key value seeded specifically to be searched for. This is cheap and it guards the one
+mistake that would matter: the endpoint is behind the metrics token, so it is trusted, but a
+credential in a scrape-target list gets copied into Prometheus config and then into git.
+
+**(c) The label is `lumen_model`. Never `model_name`.**
+vLLM emits its own `model_name` label. On collision Prometheus renames the scraped one to
+`exported_model_name`, which silently breaks every join written against it. Keeping Lumen's alias
+under a distinct name also makes drift visible when the served name and the configured alias diverge.
+A test asserts `model_name` appears in no emitted label set.
+
+**(d) Emit only endpoints that have been healthy at least once — which needs a new column.**
+A brand-new endpoint with a typo'd URL otherwise appears as a down target, indistinguishable from a
+backend that crashed. Neither existing field expresses "has worked":
+- `last_checked_at IS NOT NULL` is wrong — a misconfigured endpoint is still *checked*, it just
+  always fails.
+- `healthy = true` is worse — it drops a crashed backend out of discovery and destroys the `up == 0`
+  alert, which is the signal the whole job exists to produce.
+
+**[DECISION]** Add `model_endpoints.first_healthy_at` (nullable timestamp, naive UTC per CLAUDE.md),
+set once by the health checker on the first successful probe and never cleared. Discovery filters on
+`first_healthy_at IS NOT NULL`.
+
+**(e) The capacity denominator is operator-configured, and `model_sync` never overwrites it.**
+**[FACT]** vLLM's `/metrics` exposes `num_requests_running` and `num_requests_waiting` but **no
+capacity gauge**; SGLang exposes `max_running_requests`. So for the most likely backend the
+denominator cannot be discovered. **[DECISION]** `model_endpoints.max_concurrency` (nullable int),
+set by an admin. Where the backend does report it, `model_sync` may fill it **only when it is NULL**,
+never replacing a value a human set. A NULL denominator renders as "unknown", never as a guess —
+saturation displayed against an invented capacity is worse than no saturation figure.
+
+**(f) The Lumen-side scraper (§10.2) is not built until something needs it.**
+It exists in the plan for two reasons: `/admin/status` without Prometheus, and upstream depth stored
+in Lumen's own DB. Neither is required by Phase 7a. **[DECISION]** defer it; if it is built later, it
+must not send the endpoint API key to a `/metrics` path, which is the risk `http_sd` removes.
+
+**Tests.** Token required; valid `http_sd` JSON shape; no API key in the body; hosted providers and
+`unknown` backends excluded; an endpoint that was healthy and is now down is still **included**; the
+label is `lumen_model`; URL → target strips `/v1` and yields `host:port` including for a path prefix.
+
+
 ---
 
 ## 11. Phase 7 — the views
@@ -1375,6 +1432,69 @@ compliance sweep); `tests/routes/test_admin_routes.py` for `@admin_required` on 
 the topology label renders "this process" when `LocalLiveState` is active. Re-capture affected
 screenshots in `docs/img/` and update the matching `docs/guides/` pages (CLAUDE.md §5).
 
+### Implementation contract — decisions this plan makes so nobody has to stop and ask
+
+**(a) 7a and 7b are separate deliverables with different dependencies. Do not merge them.**
+7a (live tiles) depends on Phase 4 only. 7b (historical charts) needs `request_metrics_1m` from §12.2
+and the percentile decision from G0.3. Building 7b early means charting raw `request_logs` — a
+`period=all` p95 over per-user rows is a full-history scan **per page load**, on the one page most
+likely to be open during an incident, reintroducing exactly the burst-time scans Phase 4 removed.
+
+**(b) 7a issues zero SQL. This is a hard constraint, not an aspiration.**
+Every tile reads the Phase 4 snapshot and `LiveState`. §14 already asserts it for `/metrics`; the same
+`before_cursor_execute` counter guards `/admin/api/status`. The page auto-refreshes on a timer, so a
+single query here becomes a query every 5 seconds per open admin tab, during the incident.
+
+**(c) Every live number renders with the topology it was computed from.**
+Use `LiveState.topology()`. A tile reading "12 users waiting" that is silently per-process at 4
+processes is not a smaller number, it is a **wrong** number, and the failure is invisible precisely
+because it looks plausible. Render "(this process — 1 of 4 × 2 replicas)" or the fleet-wide
+equivalent. **[DECISION]** when `LocalLiveState` is active at more than one process, the tile must say
+so in text, not only in a tooltip.
+
+**(d) "N ahead of you" in chat is Phase 6 data, not Phase 4 data.**
+Per §8's contract, "live" means admitted→completion, so `LiveState`'s in-flight count includes users
+who are happily streaming — it is not a queue position. The honest source for "N ahead of you" is the
+backend's own `num_requests_waiting` (Phase 6). **[DECISION]** until Phase 6 lands, chat shows an
+elapsed-time indicator only, with no position claim. A wrong queue position is worse than none: a
+student told "3 ahead" who then waits four minutes learns the number is a lie and reloads, which is
+the behaviour the indicator exists to prevent.
+
+**(e) A model has many endpoints; say which number is shown.**
+**[FACT]** `lumen/blueprints/models_page/routes.py` shows a model owning a list of endpoints. Depth
+summed across endpoints tells a student "40 ahead" when they are behind 10 on the endpoint they will
+actually land on — and which endpoint that is cannot be known before dispatch (round-robin selects
+later). **[DECISION]** display the **maximum** across an endpoint set, labelled "busiest endpoint",
+never the sum.
+
+**(f) The chat indicator is client-side elapsed time.**
+Server-emitted heartbeat frames would interact with proxy buffering and with the context-free
+generator rule, for a number the browser already knows. **[DECISION]** if any new SSE event type is
+ever added, it is emitted from the chat blueprint, never from `lumen/services/llm.py`'s shared
+`send_message_stream` — `lumen/blueprints/api/routes.py` emits raw OpenAI chunks, and a new event type
+leaking into `/v1` would break every OpenAI-client parser.
+
+**(g) Accessibility decisions that are easy to get wrong here** (CLAUDE.md §6):
+auto-refreshing numeric tiles are **`aria-live="off"`** with an explicit Refresh button, plus a
+*separate* small `role="status"` region announcing only **state transitions** ("model X is now
+queued"). A polite live region updating every 5 seconds is unusable with a screen reader — it reads
+the whole dashboard aloud continuously. Every `<canvas>` gets `role="img"` + `aria-label` + a text
+fallback; every table a `<caption class="visually-hidden">`; queue state never colour-only; timestamps
+as `<span class="local-datetime" data-utc="…Z">`.
+
+**(h) Reclaiming `/admin/analytics`.** It is a bare redirect to `/usage`, and its 346-line template is
+an orphaned older copy of `usage.html`. **[DECISION]** delete the orphan in the same change that adds
+`admin/status.html`, so the repo does not carry two near-identical analytics templates.
+
+**Nav:** a third `{% if is_admin %}` item in **all four** theme headers
+(`themes/{default,illinois,uic,uis}/templates/theme/header.html`). Factor them into a shared partial
+in the same change — four copies is how the next page gets added to three of them.
+
+**Tests:** `@admin_required` on page and JSON endpoint; `/admin/api/status` executes zero SQL;
+the topology label renders when `LocalLiveState` is active; `tests/ui/test_accessibility.py` covers the
+new page; screenshots in `docs/img/` re-captured and `docs/admin/` updated (CLAUDE.md).
+
+
 ---
 
 ## 12. Phase 8 — lifecycle: aggregates, compression, retention
@@ -1412,6 +1532,85 @@ the 1-minute aggregate is within one bucket of the raw table for a synthetic bur
 
 **[GATE] Phase 8 exit** — retention is enabled **only after** a dry run on a copy of production
 demonstrates no per-user chart changes. If it changes anything, the phase stops.
+
+### Implementation contract — decisions this plan makes so nobody has to stop and ask
+
+**(a) The step that protects per-user history is the QUERY REWRITE, not the aggregate.**
+Creating `request_counts_hourly_by_entity` protects nothing on its own. **[FACT]** five per-entity
+branches in `lumen/blueprints/profile/routes.py` read raw `request_logs` — at `:444` (summary), `:588`
+(requests), `:630` (tokens), `:670` (models) and `:714` (heatmap) — because the existing aggregate has
+no `entity_id`. Enabling retention while those still read raw truncates **every individual user's
+"All Time" history** while the org-wide charts, fed by the aggregate, keep going. That asymmetry
+would be reported as data loss, and it is reachable by following §12's numbered list literally.
+
+**[DECISION] The order is: (1) create the entity aggregate → (2) rewrite all five queries onto it and
+prove them equal → (3) compression → (4) retention.** Step 2 is a numbered step with its own
+acceptance test, not a line in a test table.
+
+**(b) The bucket is one hour. A daily bucket silently breaks the heatmap.**
+**[FACT]** the heatmap does `EXTRACT(HOUR FROM bucket)` (`lumen/blueprints/profile/routes.py:721-722`).
+On a daily bucket every row collapses to hour 0 and the 7×24 grid becomes a single column — no error,
+just a wrong chart. Daily is the cheaper and therefore tempting choice, so this is stated rather than
+left to judgement.
+
+**[DECISION]** `request_counts_hourly_by_entity`, `time_bucket('1 hour', time)`, grouped by
+`bucket, entity_id, model_config_id, source`, aggregating the same measures as the existing hourly
+aggregate. Cardinality is bounded by *active* user-hours, not users × models × hours: a student uses
+one or two models in an hour, so a 300-student class produces a few hundred rows per hour, not tens of
+thousands. **Verify against G0.4 before enabling retention.**
+
+**(c) The full-history backfill cannot run inside the migration.**
+**[FACT]** the existing migration creates its aggregate `WITH NO DATA`
+(`migrations/versions/i9j0k1l2m3n4_timescaledb_tracking.py:66`), and `seed_analytics.py` calls
+`refresh_continuous_aggregate` as a standalone `CALL` on an AUTOCOMMIT connection — because it cannot
+run in a transaction block. A policy-created aggregate materialises only its recent window, so
+per-user "All Time" stays empty until a full refresh runs.
+
+**[DECISION]** the migration creates the aggregate `WITH NO DATA` and adds the policy; the
+full-history refresh is a separate `flask` CLI command, run deliberately by an operator, with its
+expected runtime estimated from G0.4 first. **Do not** put an unbounded materialisation on the deploy
+path — on a production-sized hypertable it can run for hours while `flask db upgrade` blocks container
+start (`entrypoint.sh:8`).
+
+**(d) `start_offset` and retention must agree, or step 4 appears broken.**
+A refresh policy whose `start_offset` reaches into chunks that retention has dropped errors out.
+**[DECISION]** set `start_offset` to a finite window comfortably inside the retention window, and
+state both numbers next to each other in the migration so the relationship is visible when either is
+changed.
+
+**(e) Compression is a one-way door for `request_logs` schema changes.**
+Adding a column to a hypertable with compressed chunks is restricted and version-dependent; the
+practical consequence is a decompress/recompress migration over the whole retention window.
+**[DECISION]** compression lands **after all planned `request_logs` column additions** — which
+includes anything Phase 9 would want, such as a rejection or queue-position column. **G0.3's version
+answer decides this, not just the percentile question**; record it against this decision explicitly.
+
+**(f) Percentiles: exact if the toolkit is present, hand-rolled buckets if not.**
+Continuous aggregates hold `COUNT`/`SUM`/`MAX`, which gives means and worst cases but not p95. If
+G0.3 confirms `timescaledb_toolkit`, use `percentile_agg`. If not, store fixed-bucket counts in the
+aggregate — ugly, exact, dependency-free. **Do not** compute p95 from raw rows for long windows; that
+is the full-history scan this phase exists to eliminate.
+
+**(g) Retention window: 13 months, and it is a policy decision the team owns.**
+Chosen because this is an academic deployment where term-over-term comparison is the natural
+analysis, and the storage cost of being generous is small. **Revisit against G0.4** — every storage
+figure in this plan is an estimate until that query is run.
+
+**(h) Lifetime totals survive retention, and the UI should say so.**
+`entity_stats` and `model_stats` are cumulative all-time counters written synchronously with every
+request, so dropping raw chunks loses no one's lifetime usage or cost. Say this next to any chart that
+truncates, or the first user to notice will report it as data loss.
+
+**Tests** (all `@pytest.mark.postgres`): each rewritten per-entity query returns results identical to
+the raw-table version over the same window, per endpoint; a **retention-drop simulation** — seed rows
+older than the window, drop the chunks, assert per-user charts still render from the aggregate and
+`entity_stats` totals are unchanged; the heatmap returns 24 distinct hours from the aggregate (the
+guard for (b)); compression round-trip leaves query results identical; the 1-minute aggregate is
+within one bucket of the raw table for a synthetic burst.
+
+**[GATE]** retention is enabled only after a dry run on a copy of production shows no per-user chart
+changes. If anything changes, the phase stops.
+
 
 ---
 
