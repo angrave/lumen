@@ -45,6 +45,34 @@ class _ThemeLoader(BaseLoader):
         return source, path, uptodate
 
 
+logger = logging.getLogger(__name__)
+
+# Fallback when the limit's own window cannot be read. One minute matches the
+# default limit ("30 per minute") and is short enough not to punish a client
+# that merely burst.
+_RATE_LIMIT_RETRY_AFTER_FALLBACK = 60
+
+
+def _rejection_source() -> str:
+    """Which surface the rejected request came from, matching request_logs.source."""
+    return "api" if request.path.startswith("/v1/") else "chat"
+
+
+def _observe_rejection_quietly(reason: str, source: str, model: str) -> None:
+    """Count a rejection, never at the cost of the response.
+
+    The metrics middleware is only imported when Prometheus is enabled (see the
+    ordering constraint in create_app), so this import has to be lazy and its
+    absence has to be survivable. A counter that cannot be incremented is not a
+    reason to fail a request that was already being rejected cleanly.
+    """
+    try:
+        from lumen.blueprints.metrics.middleware import observe_rejection
+        observe_rejection(reason, source, model)
+    except Exception:  # noqa: BLE001 - instrumentation must never escalate
+        pass
+
+
 def create_app():
     app = Flask(__name__)
     app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
@@ -364,10 +392,29 @@ def create_app():
     # Rate limit error handler
     @app.errorhandler(HTTPStatus.TOO_MANY_REQUESTS)
     def ratelimit_handler(e):
+        # Retry-After matters more here than it looks. 300 students whose
+        # OpenAI-SDK clients all receive a bare 429 retry on their own
+        # independent schedules and can synchronise into a storm; the SDK
+        # honours Retry-After and spreads them out instead. Derived from the
+        # limit's own window so it tells the truth, but defensively: a
+        # flask-limiter internal changing shape must degrade to a sane default,
+        # never 500 the error handler.
+        retry_after = _RATE_LIMIT_RETRY_AFTER_FALLBACK
+        try:
+            retry_after = max(1, int(e.limit.limit.get_expiry()))
+        except Exception:  # noqa: BLE001 - any shape change lands here
+            logger.debug("could not derive Retry-After from the rate limit", exc_info=True)
+
+        # reason="rate_limit" with an empty model: the request body has not been
+        # parsed at this point, so which model was wanted is genuinely unknown.
+        # Reporting it empty is honest; guessing would not be.
+        _observe_rejection_quietly("rate_limit", _rejection_source(), "")
+
+        headers = {"Retry-After": str(retry_after)}
         if request.path.startswith("/v1/"):
             return jsonify({"error": {"message": "Rate limit exceeded. Please slow down.",
-                                       "type": "rate_limit_error", "code": "rate_limit_exceeded"}}), HTTPStatus.TOO_MANY_REQUESTS
-        return jsonify({"error": "Rate limit exceeded. Please slow down."}), HTTPStatus.TOO_MANY_REQUESTS
+                                       "type": "rate_limit_error", "code": "rate_limit_exceeded"}}), HTTPStatus.TOO_MANY_REQUESTS, headers
+        return jsonify({"error": "Rate limit exceeded. Please slow down."}), HTTPStatus.TOO_MANY_REQUESTS, headers
 
     # Friendly themed pages for not-found and server errors (JSON for API clients).
     @app.errorhandler(HTTPStatus.NOT_FOUND)

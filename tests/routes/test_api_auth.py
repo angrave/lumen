@@ -1397,3 +1397,4 @@ def test_completed_api_stream_is_not_counted_as_an_abort(
     body = _chat_post(client, token, test_model["model_name"], True).get_data(as_text=True)
     assert "data: [DONE]" in body
     assert _abort_count("api", "disconnect") == before
+
