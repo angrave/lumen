@@ -35,11 +35,21 @@ here is equality, not existence:
 
 6. The SQLite early return still short-circuits before any of this SQL runs.
 
+7. The window's first hour is only partial — ``start`` is ``now - offset``, which
+   is mid-hour in general, while ``bucket`` is the hour's start. Section 7 seeds
+   a row inside ``[start, next hour)`` for week/month/year, which the fixture
+   above structurally cannot: its rows are at fixed whole-day and whole-hour
+   depths.
+
+8. A hard-deleted entity answers the same through either arm. The foreign key
+   nulls the raw rows; the aggregate materialised the id and never re-checks it.
+
 This module runs against ``pg_migrated_isolated`` — a database of its own — for
 the reasons that fixture's docstring gives.
 """
 
 import os
+from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 
 import pytest
@@ -118,20 +128,31 @@ def _autocommit(engine):
     return engine.connect().execution_options(isolation_level="AUTOCOMMIT")
 
 
-def _refresh(engine, view=VIEW, deadline=90.0):
+def _refresh(engine, view=VIEW, deadline=90.0, window=None):
     """Materialise the view's full history, retrying while a policy job holds it.
 
     The aggregates carry background refresh policies and TimescaleDB refuses an
     overlapping refresh outright rather than waiting. Nothing about that is
     specific to tests — an operator backfill hits the same wall — so retrying is
     the whole remedy.
+
+    ``window`` narrows the refresh to one ``(start, end)`` pair. Tests that add
+    history *after* the module fixture's full refresh need it: those rows sit
+    below the watermark, so they are invisible until materialised, and a second
+    unbounded refresh would materialise the current hour too — destroying the
+    one thing ``test_the_current_hour_is_included_in_every_endpoint`` proves.
     """
     import time as _time
+    if window is None:
+        sql, params = f"CALL refresh_continuous_aggregate('{view}', NULL, NULL)", {}
+    else:
+        sql = f"CALL refresh_continuous_aggregate('{view}', :w_start, :w_end)"
+        params = {"w_start": window[0], "w_end": window[1]}
     end = _time.monotonic() + deadline
     while True:
         try:
             with _autocommit(engine) as conn:
-                conn.execute(text(f"CALL refresh_continuous_aggregate('{view}', NULL, NULL)"))
+                conn.execute(text(sql), params)
             return
         except exc.OperationalError as err:
             if "concurrent refresh" not in str(err) or _time.monotonic() > end:
@@ -323,6 +344,22 @@ def _bucket_for(period):
     return {"week": "1 day", "month": "1 day", "year": "1 week", "all": "1 month"}[period]
 
 
+def _assert_models_match(body, expected):
+    """Compare the two arms' model rankings without depending on tie order.
+
+    ``ORDER BY requests DESC`` is not a total order: two models on the same
+    count may come back in either order, and the two arms sort different row
+    sets (hourly groups vs individual requests), so they are free to disagree
+    on which tied model comes first. Comparing sorted pairs keeps every
+    model-and-count assertion intact, and the second assertion keeps the
+    ordering contract the endpoint actually promises.
+    """
+    assert (sorted((m["model"], m["requests"]) for m in body)
+            == sorted((r[0], int(r[1])) for r in expected))
+    counts = [m["requests"] for m in body]
+    assert counts == sorted(counts, reverse=True), "the rows are not in requests-DESC order"
+
+
 # --------------------------------------------------------------------------
 # 1 + 2. Equality, per endpoint, per period, current bucket included.
 # --------------------------------------------------------------------------
@@ -379,11 +416,8 @@ def test_models_chart_matches_the_raw_query(pg_app, pg_migrated, main_client, en
     eid = entity_usage["entities"]["main"]
     start = _period_start(pg_app, period)
     assert _covers(pg_app, start) is True
-    expected = [
-        {"model": r[0], "requests": int(r[1])}
-        for r in _raw(pg_migrated, RAW_MODELS, start, eid, alias="rl.")
-    ]
-    assert _json(main_client, "/api/usage/models", period) == expected
+    expected = _raw(pg_migrated, RAW_MODELS, start, eid, alias="rl.")
+    _assert_models_match(_json(main_client, "/api/usage/models", period), expected)
     assert expected
 
 
@@ -596,3 +630,229 @@ def test_sqlite_short_circuits_before_any_timescale_sql(auth_client, path, empty
 
 def test_sqlite_usage_page_still_renders(auth_client):
     assert auth_client.get("/usage").status_code == HTTPStatus.OK
+
+
+# --------------------------------------------------------------------------
+# 7. The window's first, partial hour.
+# --------------------------------------------------------------------------
+#
+# ``bucket`` is ``time_bucket('1 hour', time)`` — the hour's *start*. So
+# ``bucket >= :start`` and ``time >= :start`` are the same predicate only when
+# ``start`` is hour-aligned. On a mid-hour start every row in
+# ``[start, next hour)`` is counted by the raw arm and dropped by the aggregate
+# arm, and the whole ``entity_usage`` seed misses it: its rows sit at
+# ``now() - {200d, 25d, 3d, 2h}`` and ``now()``, none of which can ever land in
+# the first partial hour of a 7 / 30 / 365-day window. Every equality assertion
+# above therefore passes with that skew live.
+#
+# The second-order effect is the reason this is not merely cosmetic. On deploy
+# the aggregate is ``WITH NO DATA``, ``_entity_aggregate_covers`` is False and
+# every window is answered from raw — correctly. The first time the refresh
+# policy runs, ``covers`` flips True and the same numbers *drop* by whatever
+# happened in that first hour, with nothing to tell the user why.
+
+BOUNDARY_PERIODS = {"week": 7, "month": 30, "year": 365}
+
+# Minutes past the hour for the frozen clock and for the probe rows. The clock
+# sits mid-hour — that is the entire point — and each probe sits later in the
+# same hour, so it is inside the window for ``time >= :start`` while carrying
+# ``bucket`` = that hour's start, which is *before* an unfloored ``:start``.
+_CLOCK_MINUTE = 17
+_PROBE_MINUTE = 30
+
+
+@pytest.fixture(scope="module")
+def boundary_usage(pg_app, pg_migrated, entity_usage):
+    """One row inside the first, partial hour of each of week / month / year.
+
+    Its own entity, so none of the counts asserted above move. The rows are
+    written after ``entity_usage`` has already refreshed the whole view, which
+    puts them below the watermark and therefore invisible until materialised —
+    so each is materialised by a refresh bounded to exactly its own hour. A
+    second unbounded refresh would drag the current hour under the watermark
+    and quietly disarm ``test_the_current_hour_is_included_in_every_endpoint``.
+    """
+    ref = datetime.now(timezone.utc).replace(minute=_CLOCK_MINUTE, second=0, microsecond=0)
+    probes = {}
+    with pg_migrated.begin() as conn:
+        eid = conn.execute(text(
+            "INSERT INTO entities (entity_type, name, initials, active) "
+            "VALUES ('user', 'ph8q-edge', 'PQ', true) RETURNING id"
+        )).scalar()
+        for period, days in BOUNDARY_PERIODS.items():
+            probe = (ref - timedelta(days=days)).replace(minute=_PROBE_MINUTE)
+            conn.execute(text(_INSERT.replace(":time", "CAST(:ts AS timestamptz)")), {
+                "ts": probe, "eid": eid, "model": entity_usage["models"][0],
+                "inp": 3, "out": 4, "cost": "0.5", "dur": 1.0, "ttft": 0.5,
+            })
+            probes[period] = probe
+
+    for probe in probes.values():
+        hour = probe.replace(minute=0)
+        _refresh(pg_migrated, window=(hour, hour + timedelta(hours=1)))
+
+    return {"eid": eid, "ref": ref, "probes": probes}
+
+
+@pytest.fixture
+def frozen_clock(monkeypatch, boundary_usage):
+    """Pin ``_usage_period_start``'s clock to the fixture's mid-hour instant.
+
+    Without this the test only catches the bug when the wall clock's minute
+    happens to be below ``_PROBE_MINUTE``, i.e. half the time — a test that
+    passes on a coin flip is not coverage. ``datetime.now`` is called in
+    exactly one place in the module under test, so the subclass is surgical.
+    """
+    ref = boundary_usage["ref"]
+
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return ref
+
+    from lumen.blueprints.profile import routes
+    monkeypatch.setattr(routes, "datetime", _FrozenDatetime)
+    return ref
+
+
+@pytest.mark.postgres
+@pytest.mark.parametrize("period", list(BOUNDARY_PERIODS))
+def test_the_windows_first_partial_hour_is_not_dropped(
+    pg_app, pg_migrated, boundary_usage, frozen_clock, period
+):
+    """Every per-entity endpoint, over a window that starts mid-hour.
+
+    With an unfloored start the aggregate arm loses the probe row and each
+    assertion below fails against the raw oracle it is compared to.
+    """
+    eid = boundary_usage["eid"]
+    probe = boundary_usage["probes"][period]
+    start = _period_start(pg_app, period)
+    assert _covers(pg_app, start) is True, (
+        "the aggregate does not cover this window, so the endpoint fell back to "
+        "raw and this test would compare raw against raw"
+    )
+
+    # The probe is inside the window and inside its first hourly bucket, which
+    # is what makes this test about the skew and not about anything else.
+    unfloored = frozen_clock - timedelta(days=BOUNDARY_PERIODS[period])
+    assert unfloored < probe < unfloored.replace(minute=0) + timedelta(hours=1)
+
+    in_window = sum(1 for d in BOUNDARY_PERIODS.values() if d <= BOUNDARY_PERIODS[period])
+    client = _client(pg_app, eid)
+
+    summary = _raw(pg_migrated, RAW_SUMMARY, start, eid)[0]
+    assert int(summary[0]) == in_window, "the oracle itself lost the probe row"
+    body = _json(client, "/api/usage/summary", period)
+    assert body["requests"] == int(summary[0])
+    assert body["tokens"] == int(summary[1])
+    assert body["cost"] == pytest.approx(float(summary[2]))
+
+    for path, sql in (("/api/usage/requests", RAW_REQUESTS), ("/api/usage/tokens", RAW_TOKENS)):
+        expected = [
+            {"period": r[0].isoformat(), "count": int(r[1])}
+            for r in _raw(pg_migrated, sql, start, eid, bucket=_bucket_for(period))
+        ]
+        assert _json(client, path, period) == expected, path
+        assert expected
+
+    _assert_models_match(
+        _json(client, "/api/usage/models", period),
+        _raw(pg_migrated, RAW_MODELS, start, eid, alias="rl."),
+    )
+
+    heatmap = sorted(
+        (int(r[0]), int(r[1]), int(r[2]))
+        for r in _raw(pg_migrated, RAW_HEATMAP, start, eid)
+    )
+    assert sorted((c["dow"], c["hour"], c["count"]) for c in _json(client, "/api/usage/heatmap", period)) == heatmap
+    assert heatmap
+
+
+# --------------------------------------------------------------------------
+# 8. A hard-deleted entity.
+# --------------------------------------------------------------------------
+
+@pytest.fixture
+def deleted_entity(pg_migrated, entity_usage):
+    """History that is materialised in the aggregate, then its entity deleted.
+
+    Nothing in the application does this — deleting a project flips ``active``
+    — so it is the DBA-level ``DELETE FROM entities`` that ``ON DELETE SET
+    NULL`` on ``request_logs.entity_id`` exists to survive. Raw rows drop to
+    NULL; the aggregate materialised the id and never re-evaluates the foreign
+    key, so its rows keep the old id for as long as the view lives.
+
+    Yields ``(admin_client_entity_id, deleted_entity_id, hour)``.
+    """
+    ts = datetime.now(timezone.utc) - timedelta(hours=2)
+    with pg_migrated.begin() as conn:
+        gone = conn.execute(text(
+            "INSERT INTO entities (entity_type, name, initials, active) "
+            "VALUES ('user', 'ph8q-gone', 'PQ', true) RETURNING id"
+        )).scalar()
+        admin = conn.execute(text(
+            "INSERT INTO entities (entity_type, name, email, initials, active) "
+            "VALUES ('user', 'ph8q-admin', 'admin@example.com', 'PQ', true) RETURNING id"
+        )).scalar()
+        for _ in range(3):
+            conn.execute(text(_INSERT.replace(":time", "CAST(:ts AS timestamptz)")), {
+                "ts": ts, "eid": gone, "model": entity_usage["models"][0],
+                "inp": 5, "out": 6, "cost": "0.5", "dur": 1.0, "ttft": 0.5,
+            })
+
+    hour = ts.replace(minute=0, second=0, microsecond=0)
+    _refresh(pg_migrated, window=(hour, hour + timedelta(hours=1)))
+
+    with pg_migrated.begin() as conn:
+        conn.execute(text("DELETE FROM entities WHERE id = :e"), {"e": gone})
+
+    yield admin, gone, hour
+
+    with pg_migrated.begin() as conn:
+        conn.execute(text(
+            "DELETE FROM request_logs WHERE entity_id IS NULL AND time = CAST(:ts AS timestamptz)"
+        ), {"ts": ts})
+        conn.execute(text("DELETE FROM entities WHERE id = :e"), {"e": admin})
+
+
+@pytest.mark.postgres
+def test_a_deleted_entitys_history_is_gone_from_both_arms(pg_app, pg_migrated, deleted_entity):
+    """The aggregate must not resurrect what the foreign key nulled out.
+
+    Both arms answer for an entity that no longer exists, and they have to
+    answer the same thing. Without the existence clause the raw arm returns
+    nothing and the aggregate arm returns the entity's full materialised
+    history — so the same admin URL changes its answer the first time the
+    refresh policy runs.
+    """
+    admin, gone, hour = deleted_entity
+    with pg_migrated.connect() as conn:
+        raw_rows = conn.execute(text(
+            "SELECT COUNT(*) FROM request_logs WHERE entity_id = :e"
+        ), {"e": gone}).scalar()
+        in_view = conn.execute(text(
+            f"SELECT COALESCE(SUM(requests), 0) FROM {VIEW} WHERE entity_id = :e"
+        ), {"e": gone}).scalar()
+    assert raw_rows == 0, "ON DELETE SET NULL did not fire; this test proves nothing"
+    assert int(in_view) == 3, (
+        "the aggregate no longer holds the deleted entity's rows, so there is "
+        "nothing here for the endpoints to leak and this test is vacuous"
+    )
+
+    start = _period_start(pg_app, "week")
+    assert _covers(pg_app, start) is True, "the endpoints would fall back to raw"
+
+    client = pg_app.test_client()
+    with client.session_transaction() as sess:
+        sess["entity_id"] = admin
+        sess["admin_mode"] = True
+
+    body = client.get(f"/api/usage/summary?entity_id={gone}&period=week")
+    assert body.status_code == HTTPStatus.OK
+    assert body.get_json()["requests"] == 0
+    assert body.get_json()["tokens"] == 0
+    for path in ("/api/usage/requests", "/api/usage/tokens", "/api/usage/models", "/api/usage/heatmap"):
+        resp = client.get(f"{path}?entity_id={gone}&period=week")
+        assert resp.status_code == HTTPStatus.OK
+        assert resp.get_json() == [], path

@@ -388,10 +388,29 @@ _VALID_TRUNC   = frozenset(cfg["trunc"]  for cfg in _USAGE_PERIODS.values())
 
 
 def _usage_period_start(period_str):
+    """Start of the window, **floored to the hour**.
+
+    The alignment is load-bearing, not cosmetic. Every aggregate this module
+    reads is hourly: ``bucket`` is ``time_bucket('1 hour', time)``, the hour's
+    start. On an unaligned start the aggregate arms (``bucket >= :start``) and
+    the raw arms (``time >= :start``) are not the same predicate — a request at
+    09:45 has ``bucket = 09:00``, so with ``start = 09:30`` the raw arm counts
+    it and the aggregate arm drops it, along with everything else in the
+    window's first partial hour. Flooring makes the two predicates identical,
+    because for an hour-aligned ``S``, ``time_bucket('1 hour', time) >= S`` is
+    true exactly when ``time >= S``.
+
+    The cost is that a window can reach up to 59 minutes further back than its
+    name suggests. That is invisible at the page's coarsest-to-finest bucket
+    widths (1 day / 1 week / 1 month) and is the same widening for every chart
+    on the page, per-entity and org-wide alike, which is the point.
+    """
     cfg = _USAGE_PERIODS.get(period_str, _USAGE_PERIODS["week"])
     if cfg["offset"] is None:
         return None
-    return datetime.now(timezone.utc) - cfg["offset"]
+    return (datetime.now(timezone.utc) - cfg["offset"]).replace(
+        minute=0, second=0, microsecond=0
+    )
 
 
 def _usage_period_bucket(period_str):
@@ -473,6 +492,16 @@ def _entity_aggregate_covers(start):
     return g.usage_raw_earliest is None or earliest <= g.usage_raw_earliest
 
 
+# ``request_logs.entity_id`` is ON DELETE SET NULL, so a hard-deleted entity's
+# raw rows answer for nobody. The aggregate materialised the id at refresh time
+# and never re-evaluates the foreign key, so it keeps that entity's groups for
+# as long as the view lives. Both arms carry this clause so they keep answering
+# alike: without it the same admin URL returns nothing before the refresh policy
+# first runs and a full history afterwards. For an entity that still exists it
+# is one primary-key probe, evaluated once.
+_ENTITY_STILL_EXISTS = " AND EXISTS (SELECT 1 FROM entities WHERE id = :eid)"
+
+
 @profile_bp.route("/usage")
 @login_required
 def usage():
@@ -491,12 +520,15 @@ def usage_summary():
     if eid:
         params = {"eid": eid}
         use_agg = _entity_aggregate_covers(start)
-        where = "WHERE entity_id = :eid"
+        where = "WHERE entity_id = :eid" + _ENTITY_STILL_EXISTS
         if start is not None:
             params["start"] = start
             where += " AND bucket >= :start" if use_agg else " AND time >= :start"
         # The two statements answer the same question over the same window and
         # are kept side by side so that equality stays auditable by reading.
+        # The equality holds only because ``_usage_period_start`` floors to the
+        # hour: `bucket >= :start` and `time >= :start` are the same predicate
+        # on an hour-aligned start and on no other.
         agg_sql = f"""
             SELECT
                 COALESCE(SUM(requests), 0),
@@ -650,7 +682,7 @@ def usage_requests():
     if eid:
         params = {"bucket": bucket, "eid": eid}
         use_agg = _entity_aggregate_covers(start)
-        where = "WHERE entity_id = :eid"
+        where = "WHERE entity_id = :eid" + _ENTITY_STILL_EXISTS
         if start is not None:
             params["start"] = start
             where += " AND bucket >= :start" if use_agg else " AND time >= :start"
@@ -700,7 +732,7 @@ def usage_tokens():
     if eid:
         params = {"bucket": bucket, "eid": eid}
         use_agg = _entity_aggregate_covers(start)
-        where = "WHERE entity_id = :eid"
+        where = "WHERE entity_id = :eid" + _ENTITY_STILL_EXISTS
         if start is not None:
             params["start"] = start
             where += " AND bucket >= :start" if use_agg else " AND time >= :start"
@@ -751,7 +783,7 @@ def usage_models():
     if eid:
         params = {"eid": eid}
         use_agg = _entity_aggregate_covers(start)
-        where = "WHERE rl.entity_id = :eid"
+        where = "WHERE rl.entity_id = :eid" + _ENTITY_STILL_EXISTS
         if start is not None:
             params["start"] = start
             where += " AND rl.bucket >= :start" if use_agg else " AND rl.time >= :start"
@@ -803,7 +835,7 @@ def usage_heatmap():
     if eid:
         params = {"eid": eid}
         use_agg = _entity_aggregate_covers(start)
-        where = "WHERE entity_id = :eid"
+        where = "WHERE entity_id = :eid" + _ENTITY_STILL_EXISTS
         if start is not None:
             params["start"] = start
             where += " AND bucket >= :start" if use_agg else " AND time >= :start"
