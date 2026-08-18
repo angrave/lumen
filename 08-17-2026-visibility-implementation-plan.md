@@ -156,13 +156,16 @@ This is the entire topology-sensitive surface. It is small on purpose:
 `LocalLiveState` (a dict + lock) and `RedisLiveState` — selected at startup by whether a Redis URL is
 configured. Not three backends, not a plugin registry.
 
-**Amended after review:** if Gate 0 finds production is 1 process × 1 replica, ship
-`LocalLiveState` as **a plain class with no interface and no factory**, and introduce the abstraction
-*together with* `RedisLiveState` when Phase 5 is actually unblocked. An interface with one
-implementation is exactly the speculative generality CLAUDE.md §2 forbids, and "the seam makes
-deferring free" is only true if the seam is free — it isn't if it is never used. Topology-invariance
-survives this: `LocalLiveState` is correct at 1×1, and the call sites (`admit`/`release`) do not move
-when the second implementation arrives.
+**Settled: the interface is justified, because both implementations will exist.** Round 2 objected
+that an interface with one implementation is the speculative generality CLAUDE.md §2 forbids, and
+that objection was correct *given* the possibility that Phase 5 would be deferred. The team has since
+decided to implement every phase, so `RedisLiveState` is not conditional — two implementations exist,
+and the abstraction earns its place on the ordinary grounds. Build the interface with
+`LocalLiveState` in Phase 4 and add `RedisLiveState` in Phase 5.
+
+This does **not** relax the honesty requirement: `LocalLiveState` remains the fallback whenever Redis
+is absent or failing, so the topology label is what keeps a per-process number from being read as a
+fleet number.
 
 **The honesty requirement.** Every live number rendered in the UI or served by
 `/admin/api/status` carries the topology it was computed from, using the functions that already
@@ -237,20 +240,34 @@ does not change shape**, which is the point of the seam in §2.
 
 ## 4. Gate 0 — ground truth before code
 
-No code. These five answers change effort allocation, and four of them cannot be derived from the
-repository. Everything in Phases 1–4 is safe to start in parallel with this; Phase 5 and Phase 8 are
-blocked on it.
+No code. Four of these cannot be derived from the repository.
+
+**[DECISION] Every phase will be implemented, so Gate 0 no longer decides *whether* or *in what
+order* — it decides *how*.** That removes the conditional-scheduling language from this document
+(Phase 5 no longer defers; Phase 7 no longer jumps the queue). Two things it does **not** remove:
+
+- **Dependency constraints are not scheduling preferences.** Phase 8's internal order (entity
+  aggregate → **rewrite the per-entity `/usage` queries onto it** → compression → retention) is a
+  correctness constraint: following it out of order silently truncates every user's history. So is
+  the rule that **compression lands after all `request_logs` column additions**, since adding a
+  column to compressed chunks is a decompress/recompress migration. And Phase 4's refresher must not
+  copy `lumen/services/health.py` *because* Phase 1 turns that file into a single-runner election.
+  These hold no matter what order the phases are worked in.
+- **G0.6 is a safety gate, not a scheduling one**, and still blocks Phase 6 (see below).
 
 | # | Question | How to get it | What it decides |
 |---|---|---|---|
-| G0.1 | **Actual production topology** — replicas, `--workers`/`WEB_CONCURRENCY`, `LUMEN_WSGI_WORKERS` | `kubectl get deploy -o yaml`; `GET /metrics/debug` already prints workers × replicas and live `WSGI_*` thread count (`lumen/blueprints/metrics/routes.py:_format_deployment`) | Whether Phase 5 ships now or is deferred; whether Phase 1 is urgent or merely correct |
-| G0.2 | **Is Redis deployed?** `redis.enabled`, or an external `redis.url` | Rendered values / `config.yaml` `rate_limiting.storage_url` | Whether Phase 5 is "add two calls" or "provision infrastructure" |
-| G0.3 | **Timescale version, and is `timescaledb_toolkit` installed?** | `SELECT extversion FROM pg_extension WHERE extname LIKE 'timescale%'` | Exact p95 (`percentile_agg`) vs hand-rolled bucket counts; hierarchical continuous aggregates in Phase 8 |
-| G0.4 | **Current size and growth of `request_logs`** | `SELECT pg_total_relation_size('request_logs'), count(*), min(time), max(time) FROM request_logs` | Replaces every storage estimate in proposal §9 with a measurement; sets the retention window |
-| G0.5 | **Does a Prometheus/Grafana stack scrape this cluster, and at what interval?** | Ask the operators | Whether `/admin/status` is the primary surface or a convenience; whether Phase 1's ServiceMonitor is the deliverable |
+| # | Still gates what, now that everything ships |
+|---|---|
+| G0.1 | **Production topology** — replicas, `--workers`/`WEB_CONCURRENCY`, `LUMEN_WSGI_WORKERS`. Via `kubectl get deploy -o yaml`, or `GET /metrics/debug`, which already prints workers × replicas and the live `WSGI_*` thread count. **Decides what we test against**: at 1×1 the multi-process paths (dead-PID reaping, `livesum` aggregation, flock election) are never exercised in production, so their only coverage is the test suite — which raises the bar on the Phase 1 tests rather than lowering it |
+| G0.2 | **Is Redis deployed?** `redis.enabled`, or an external `redis.url` / `rate_limiting.storage_url`. **Decides whether Phase 5 also carries a provisioning task**, and whether its fail-open path is the normal case or the exception |
+| G0.3 | **Timescale version + is `timescaledb_toolkit` installed?** `SELECT extname, extversion FROM pg_extension WHERE extname LIKE 'timescale%'`. **Decides**: exact `percentile_agg` p95 vs hand-rolled bucket counts; hierarchical continuous aggregates; and — newly — whether adding a column to a compressed hypertable is restricted, which sets how firmly compression must trail the schema work |
+| G0.4 | **Size and growth of `request_logs`** — `SELECT pg_size_pretty(pg_total_relation_size('request_logs')), count(*), min(time), max(time) FROM request_logs`. **Decides** the retention window and, more urgently, how long the entity-aggregate's **full-history backfill** will run, since it cannot happen inside the migration transaction |
+| G0.5 | **Does a Prometheus/Grafana stack scrape this cluster, at what interval?** **No longer decides ordering.** Still decides whether the ServiceMonitor needs the token work below, and what scrape interval the snapshot refresh should be tuned against |
+| **G0.6** | **Are the backends' `/metrics` reachable and unauthenticated from the Lumen pod, and what backends/versions are they?** **This one still blocks Phase 6, on safety grounds.** Only SGLang is positively detected today; vLLM is a fall-through indistinguishable from OpenAI, Azure, or any OpenAI-compatible proxy. Guessing "not-sglang ⇒ vllm" would send scrapes — possibly carrying the endpoint's API key — to arbitrary third-party hosts |
 
-**[GATE] G0** — the five answers are written into this document before Phase 5 or Phase 8 begins.
-G0.1 and G0.2 are the blocking pair.
+**[GATE] G0.6 blocks Phase 6.** The rest are inputs to be written into this document as they arrive;
+they no longer hold work up.
 
 ---
 
@@ -295,8 +312,16 @@ small and it is a prerequisite for everything after it.
    respawned worker that draws the same PID opens the **same mmap** and inherits the dead worker's
    values — a worker killed holding `queue_depth=5` gives its successor a permanent +5 offset on
    every `inc`/`dec`. An mtime cross-check does not help, because the new process rewrites mtime.
-   Mitigate by having each worker unlink **its own** PID's files at startup, before touching any
-   metric.
+   **Do not "unlink your own pid's files at startup"** — an earlier draft said to, and it is wrong
+   twice. (i) A blanket unlink of `*_{pid}.db` also removes **counter** files, violating the
+   asymmetry stated two items above: a dead worker's counter increments are real history, and
+   dropping them makes the summed counter *decrease*, which Prometheus reads as a reset. (ii) The
+   only per-worker startup seam is `lumen/__init__.py`, where importing the middleware **constructs
+   the metric objects** — `prometheus_client/values.py` opens and caches the mmap handle eagerly at
+   construction — so unlinking there deletes files the process is still writing to, and that worker's
+   metrics never appear in any scrape again, silently. **Instead call
+   `mark_process_dead(os.getpid(), path)` before importing the middleware**: it removes exactly the
+   live-gauge files and nothing else.
 4. **Document the invariant at the definition site** in `lumen/blueprints/metrics/middleware.py`: every `Gauge` added from
    here on declares an explicit `multiprocess_mode`; `Counter`/`Histogram` need nothing. State the
    asymmetry explicitly so nobody "fixes" it later: **dead PIDs' counter files are summed, and that
@@ -453,8 +478,13 @@ argument — the queue is per-process, and per-process queues sum.
    `lumen/blueprints/api/routes.py:584`). A check placed where an earlier draft said would leave only
    an in-band SSE `error` event on a 200 — which the OpenAI SDK does not treat as a retryable 429 and
    which carries no `Retry-After`, defeating the anti-synchronisation argument in item 4. **Put the
-   admission check in the views, before the `Response(...)` is constructed**, using T1 (the value
-   available there); state plainly that it therefore excludes the generator's own preflight.
+   admission check in the views, before the `Response(...)` is constructed** — and compute the spend
+   as `time.monotonic() - environ["lumen.t0_monotonic"]`, i.e. **from T0**. An earlier draft said
+   "using T1", which is `queue_wait` alone and therefore exactly the under-count this item's own
+   decision calls wrong: everything the view does after `before_request` — auth, model lookup,
+   `check_coin_budget`, the conversation query, the pool checkout — is post-T1 preflight. Measuring
+   from T0 captures it. State plainly that the check still excludes the *generator's* preflight,
+   which happens later.
 
    **Two cases, and be honest that this catches one of them.** The admission check catches requests
    whose budget is *already* spent at admission. A request that starts with 100 s of budget and then
@@ -636,14 +666,33 @@ Convert `t0` to monotonic without touching `:686` and **every aborted row stores
 user-visible: it flows to `Message.time_to_first_token` and is rendered in the chat UI, and §7 item 2
 defines `ttft_visible` as "today's `t_first`".
 
-**Enumerate all six, convert all six:** `lumen/services/llm.py:686`, `:819`, `:832`;
-`lumen/blueprints/api/routes.py:377`, `:523`, `:649`. Only `started_at` stays wall-clock, because it
-is a stored instant rather than a span.
+**TEN sites, not six — and an earlier draft of this very fix listed six.** The six obvious ones are
+*subtractions*; the variables they subtract from are *assigned* four lines elsewhere:
 
-**Guard it with a static test** in the shape of `tests/unit/test_no_stream_with_context.py`: no
-`time.time()` may appear in a subtraction anywhere in `lumen/services/llm.py` or
-`lumen/blueprints/api/routes.py`. A grep-shaped invariant is the only thing that stops the seventh
-site being added later.
+```
+assignments   lumen/services/llm.py:752            t0 = time.time()
+              lumen/blueprints/api/routes.py:368   t0 = _time.time()
+              lumen/blueprints/api/routes.py:462   t0 = _time.time()
+              lumen/blueprints/api/routes.py:641   t0 = _time.time()
+subtractions  lumen/services/llm.py:686, :819, :832
+              lumen/blueprints/api/routes.py:377, :523, :649
+```
+
+Convert only the six and you get `duration = monotonic() − wall` ≈ **−1.76e9 on EVERY request on
+every path** — not merely on aborted ones. That is strictly worse than the bug this fix exists to
+prevent: `output_speed` silently becomes 0.0 behind `llm.py:842`'s `if duration > 0` guard,
+`Message.time_to_first_token` goes negative in the chat UI, and `lumen_llm_duration_seconds` collapses
+into the lowest bucket. Nothing raises.
+
+**Guard it as a PRESENCE test, not a subtraction test.** An earlier draft specified "no `time.time()`
+may appear in a subtraction" — which passes green in exactly the broken state above, because the four
+survivors are plain assignments. **The invariant is: `time.time()` may not appear *at all* in
+`lumen/services/llm.py` or `lumen/blueprints/api/routes.py`**, with the single exception of the
+`wall_started_at` stamp. Shape it like `tests/unit/test_no_stream_with_context.py`.
+
+**Note what does *not* break:** converting `:819` leaves `Message.time_to_first_token` and the chat UI
+unchanged — it is a span on both sides, so the stored value is identical. An earlier draft raised an
+alarm there that was unfounded.
 
 **(b) `started_at` is stamped with `datetime.now(timezone.utc)`, not `utcnow()`.** CLAUDE.md §5
 mandates `lumen.timeutils.utcnow()`, which returns **naive** UTC. Writing naive into a `TIMESTAMPTZ`
@@ -797,8 +846,9 @@ as database pressure.
 
 ## 9. Phase 5 — the Redis backend
 
-**Blocked on [GATE] G0.1/G0.2.** If production is 1 process × 1 replica, this phase is **deferred,
-not cancelled** — the seam from Phase 4 is what makes deferring it free.
+**No longer conditional** — this phase ships regardless of topology, which is what makes the Phase 4
+interface justified rather than speculative (§2). G0.2 only decides whether it also carries a
+provisioning task.
 
 ### Changes
 
@@ -872,13 +922,18 @@ still block it.
 
 ## 11. Phase 7 — the views
 
-**[DECISION] Conditional on Gate 0.5 — this phase may need to move to the front.** If G0.5 finds
-there is **no Prometheus/Grafana stack scraping this cluster**, then every metric added in Phases 1–6
-has no consumer, and the only operator surface in existence is the plain-text `/metrics/debug`. In
-that case a bare-bones `/admin/status` — live tiles reading the Phase 4 snapshot, nothing historical
-— should ship immediately after Phase 4, before Phases 5 and 6. Building six phases of Prometheus
-instrumentation for a Prometheus that does not exist is the most expensive mistake available in this
-plan, and G0.5 is a single question to the operators.
+**[DECISION] Split into 7a and 7b — a dependency, not a scheduling preference.** Every phase ships,
+so this one no longer jumps the queue on a G0.5 answer. But §11 as written consumes Phase 8's
+1-minute aggregate and Phase 8's percentile decision, so it cannot all be built at once:
+
+- **7a — live tiles**, reading the Phase 4 snapshot and LiveState only. Depends on Phase 4 alone, and
+  must issue **zero SQL** (§14 already asserts this). Buildable as soon as Phase 4 lands.
+- **7b — historical charts**, which need `request_metrics_1m` from §12.2 and the exact-vs-approximate
+  percentile decision from G0.3. Strictly after Phase 8's aggregate work.
+
+Building 7b early would mean charting raw `request_logs` — reintroducing the burst-time hypertable
+scans Phase 4 exists to remove, on the one page most likely to be open *during* the incident. A
+`period=all` p95 over raw per-user rows is a full-history scan per page load.
 
 - **`/admin/status`**, reclaiming the dead `/admin/analytics` redirect slot (its 346-line orphaned
   template is a stale near-copy of `usage.html`). Live tiles from the Phase 4 snapshot + LiveState —
