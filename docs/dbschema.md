@@ -199,6 +199,13 @@ erDiagram
         numeric cost
         float duration
         bool aborted
+        datetime started_at
+        float queue_wait
+        float preflight
+        float ttft
+        float ttft_visible
+        float send_blocked
+        string outcome
     }
 
     entities ||--o{ api_keys : "owns"
@@ -611,7 +618,7 @@ PostgreSQL only. TimescaleDB continuous aggregates over `request_logs`, refreshe
 background policies. They are what makes the usage charts survive a retention policy
 dropping raw chunks — anything not carried here is unrecoverable once the raw rows are gone.
 
-The two views added below are **real-time**: they set `timescaledb.materialized_only = false`, so
+All three views below are **real-time**: they set `timescaledb.materialized_only = false`, so
 a query unions the materialised rows with a live scan of the raw rows newer than the
 materialisation watermark. Without that — and `true` is the default on TimescaleDB 2.13+ — the
 current bucket is missing, and a user who ran forty requests this hour sees zero.
@@ -631,8 +638,16 @@ empty and deletes the materialised rows, without erroring.
 
 `time_bucket('1 hour', time)` grouped by `bucket, model_config_id, source`, carrying `requests`,
 `input_tokens`, `output_tokens`, `cost`. Org-wide only — it has no `entity_id`, which is why the
-per-entity charts needed the aggregate below. `materialized_only` is at its default (`true`),
-`start_offset` 3 hours, `end_offset` 1 hour, refreshed hourly.
+per-entity charts needed the aggregate below. `materialized_only = false`, `start_offset` 3 hours,
+`end_offset` 1 hour, refreshed hourly.
+
+It was created before TimescaleDB 2.13 flipped the `materialized_only` default to `true`, and was
+left unset — so from that version on it silently became materialised-only and the org-wide `/usage`
+charts, which read this view and have no raw-`request_logs` fallback, lost the last one to two hours
+of every day. Migration `j4k5l6m7n8o9` sets it explicitly. `end_offset` stays at one bucket width:
+real-time aggregation already covers everything past the watermark, and an `end_offset` shorter than
+the bucket would materialise a partial open bucket and hide the rest of that hour until the next
+scheduled run.
 
 ### request_counts_hourly_by_entity
 

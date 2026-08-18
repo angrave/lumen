@@ -447,9 +447,15 @@ def test_api_stream_disconnect_stops_generation(
     # connection gets stranded idle-in-transaction and an app context gets left
     # current on a worker thread, poisoning every later request on it.
     assert pool.checkedout() == 0, "a DB connection is still checked out after the abort"
-    assert len(db.session.registry.registry) == sessions_before, (
-        "a session is still registered — its app context was never torn down"
-    )
+    # Polled, not read once: the registry dict is process-wide (a ScopedRegistry
+    # built with a scopefunc stores plain dict entries, not thread-locals) and the
+    # request being torn down is on the server thread. ``scoped_session.remove()``
+    # calls ``close()`` and then ``clear()`` on consecutive lines, so the moment
+    # ``pool.checkedout()`` reaches 0 the entry is still there for a few
+    # microseconds. A real leak never clears, so the timeout still fails it.
+    assert _wait_for(
+        lambda: len(db.session.registry.registry) == sessions_before, timeout=10,
+    ), "a session is still registered — its app context was never torn down"
     assert _leftover_context_count() == anomalies_before, (
         "an app context outlived the aborted request (see /metrics/debug's "
         "app-context anomalies section)"
@@ -494,9 +500,15 @@ def test_chat_stream_disconnect_stops_generation(
     _assert_billed_for_abort(aborted, "/chat/stream")
 
     assert pool.checkedout() == 0, "a DB connection is still checked out after the abort"
-    assert len(db.session.registry.registry) == sessions_before, (
-        "a session is still registered — its app context was never torn down"
-    )
+    # Polled, not read once: the registry dict is process-wide (a ScopedRegistry
+    # built with a scopefunc stores plain dict entries, not thread-locals) and the
+    # request being torn down is on the server thread. ``scoped_session.remove()``
+    # calls ``close()`` and then ``clear()`` on consecutive lines, so the moment
+    # ``pool.checkedout()`` reaches 0 the entry is still there for a few
+    # microseconds. A real leak never clears, so the timeout still fails it.
+    assert _wait_for(
+        lambda: len(db.session.registry.registry) == sessions_before, timeout=10,
+    ), "a session is still registered — its app context was never torn down"
     assert _leftover_context_count() == anomalies_before, (
         "an app context outlived the aborted request"
     )
