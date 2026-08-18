@@ -214,7 +214,9 @@ def chat_stream():
     if not model_config:
         return jsonify({"error": f"Unknown model: {model}"}), HTTPStatus.BAD_REQUEST
 
-    ok, code, msg, effective = check_coin_budget(entity_id, model_config.id)
+    ok, code, msg, effective = check_coin_budget(
+        entity_id, model_config.id, source="chat", model_name=model,
+    )
     if not ok:
         return jsonify({"error": msg}), code
 

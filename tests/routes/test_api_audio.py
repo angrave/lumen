@@ -5,6 +5,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tests.routes.test_api_auth import (  # noqa: F401 - fixture is used by name
+    fresh_rate_limit,
+)
+
 
 @pytest.fixture
 def api_key(app, test_user):
@@ -388,3 +392,189 @@ def test_transcription_without_the_bridge_records_nulls(
     assert log.preflight is None
     assert log.send_blocked is None
     assert log.outcome == "ok"
+
+
+# ---------------------------------------------------------------------------
+# Rejection taxonomy on the /v1 surface
+# ---------------------------------------------------------------------------
+
+def _recorder(monkeypatch):
+    recorded = []
+    monkeypatch.setattr(
+        "lumen.blueprints.metrics.middleware.observe_rejection",
+        lambda reason, source, model="": recorded.append((reason, source, model)),
+    )
+    return recorded
+
+
+def _exhaust_budget(app, entity_id, refresh_coins, refilled_minutes_ago=30):
+    from datetime import timedelta
+    from lumen.extensions import db
+    from lumen.models.entity_balance import EntityBalance
+    from lumen.models.entity_limit import EntityLimit
+    from lumen.timeutils import utcnow
+    db.session.add(EntityLimit(
+        entity_id=entity_id, max_coins=100, refresh_coins=refresh_coins, starting_coins=100,
+    ))
+    db.session.add(EntityBalance(
+        entity_id=entity_id, coins_left=0,
+        last_refill_at=utcnow() - timedelta(minutes=refilled_minutes_ago),
+    ))
+    db.session.commit()
+
+
+def _transcribe(client, token):
+    return client.post(
+        "/v1/audio/transcriptions",
+        headers={"Authorization": f"Bearer {token}"},
+        data=_audio_data(),
+        content_type="multipart/form-data",
+    )
+
+
+def test_coin_exhaustion_is_insufficient_quota_not_rate_limited(
+    app, client, test_user, test_model, test_model_endpoint, api_key, fresh_rate_limit,
+):
+    """Both conditions answer 429 and they need opposite reactions.
+
+    The limiter means "retry shortly"; an exhausted budget means "stop until it
+    refills". Only the OpenAI type/code tells the two apart in the body, and the
+    SDK branches on it.
+    """
+    token, _ = api_key
+    with app.app_context():
+        _exhaust_budget(app, test_user["id"], refresh_coins=10)
+
+    resp = _transcribe(client, token)
+
+    assert resp.status_code == HTTPStatus.TOO_MANY_REQUESTS
+    err = resp.get_json()["error"]
+    assert err["type"] == "insufficient_quota"
+    assert err["code"] == "insufficient_quota"
+    # Distinguishable from the limiter's 429, which uses the other pair.
+    assert err["code"] != "rate_limit_exceeded"
+
+
+def test_coin_exhaustion_retry_after_is_derived_from_the_refill(
+    app, client, test_user, test_model, test_model_endpoint, api_key, fresh_rate_limit,
+):
+    """The refiller credits an hour after the last refill, so the wait is knowable.
+
+    It must shrink as that hour is used up — a constant would send every client
+    back at the same instant, which is the storm Retry-After exists to prevent.
+    """
+    token, _ = api_key
+    with app.app_context():
+        _exhaust_budget(app, test_user["id"], refresh_coins=10, refilled_minutes_ago=30)
+
+    half_way = int(_transcribe(client, token).headers["Retry-After"])
+    assert 29 * 60 <= half_way <= 30 * 60
+
+    from datetime import timedelta
+    from sqlalchemy import select
+    from lumen.extensions import db
+    from lumen.models.entity_balance import EntityBalance
+    from lumen.timeutils import utcnow
+    with app.app_context():
+        bal = db.session.execute(
+            select(EntityBalance).filter_by(entity_id=test_user["id"])
+        ).scalar_one()
+        bal.last_refill_at = utcnow() - timedelta(minutes=10)
+        db.session.commit()
+
+    later = int(_transcribe(client, token).headers["Retry-After"])
+    assert 49 * 60 <= later <= 50 * 60
+    assert later > half_way
+
+
+def test_no_retry_after_when_the_budget_never_refills(
+    app, client, test_user, test_model, test_model_endpoint, api_key, fresh_rate_limit,
+):
+    """A pool with refresh_coins=0 has no next refill; a header would be a lie."""
+    token, _ = api_key
+    with app.app_context():
+        _exhaust_budget(app, test_user["id"], refresh_coins=0)
+
+    resp = _transcribe(client, token)
+    assert resp.status_code == HTTPStatus.TOO_MANY_REQUESTS
+    assert "Retry-After" not in resp.headers
+
+
+def test_coin_exhaustion_is_counted_with_its_model(
+    app, client, monkeypatch, test_user, test_model, test_model_endpoint, api_key, fresh_rate_limit,
+):
+    """Unlike the limiter's rejection, this one knows which model was asked for."""
+    token, _ = api_key
+    with app.app_context():
+        _exhaust_budget(app, test_user["id"], refresh_coins=10)
+    recorded = _recorder(monkeypatch)
+
+    assert _transcribe(client, token).status_code == HTTPStatus.TOO_MANY_REQUESTS
+    assert ("coin_budget", "api", test_model["model_name"]) in recorded
+
+
+def test_no_healthy_endpoint_is_counted(
+    app, client, monkeypatch, test_user, test_model, api_key, fresh_rate_limit,
+):
+    """Preflight passed and there was still nowhere to send it."""
+    token, _ = api_key
+    with app.app_context():
+        _grant_finite_pool(app, test_user["id"])
+    recorded = _recorder(monkeypatch)
+
+    resp = _transcribe(client, token)
+
+    assert resp.status_code == HTTPStatus.SERVICE_UNAVAILABLE
+    assert ("no_healthy_endpoint", "api", test_model["model_name"]) in recorded
+
+
+def test_a_broken_counter_never_turns_a_rejection_into_a_500(
+    app, client, monkeypatch, test_user, test_model, test_model_endpoint, api_key, fresh_rate_limit,
+):
+    """Instrumentation is not allowed to escalate a clean refusal."""
+    def boom(*a, **kw):
+        raise RuntimeError("prometheus is unhappy")
+
+    monkeypatch.setattr("lumen.blueprints.metrics.middleware.observe_rejection", boom)
+    token, _ = api_key
+    with app.app_context():
+        _exhaust_budget(app, test_user["id"], refresh_coins=10)
+
+    resp = _transcribe(client, token)
+    assert resp.status_code == HTTPStatus.TOO_MANY_REQUESTS
+    assert resp.get_json()["error"]["code"] == "insufficient_quota"
+
+
+def test_a_broken_counter_never_turns_a_403_into_a_500(
+    app, client, monkeypatch, test_user, test_model, test_model_endpoint, api_key, fresh_rate_limit,
+):
+    def boom(*a, **kw):
+        raise RuntimeError("prometheus is unhappy")
+
+    monkeypatch.setattr("lumen.blueprints.metrics.middleware.observe_rejection", boom)
+    token, _ = api_key
+    with app.app_context():
+        from lumen.extensions import db
+        from lumen.models.entity_model_access import EntityModelAccess
+        _grant_finite_pool(app, test_user["id"])
+        db.session.add(EntityModelAccess(
+            entity_id=test_user["id"], model_config_id=test_model["id"],
+            access_type="blocked",
+        ))
+        db.session.commit()
+
+    assert _transcribe(client, token).status_code == HTTPStatus.FORBIDDEN
+
+
+def test_a_broken_counter_never_turns_a_503_into_a_500(
+    app, client, monkeypatch, test_user, test_model, api_key, fresh_rate_limit,
+):
+    def boom(*a, **kw):
+        raise RuntimeError("prometheus is unhappy")
+
+    monkeypatch.setattr("lumen.blueprints.metrics.middleware.observe_rejection", boom)
+    token, _ = api_key
+    with app.app_context():
+        _grant_finite_pool(app, test_user["id"])
+
+    assert _transcribe(client, token).status_code == HTTPStatus.SERVICE_UNAVAILABLE

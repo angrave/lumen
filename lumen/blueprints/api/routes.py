@@ -26,10 +26,12 @@ from lumen.services.llm import (
     bulk_model_access_info,
     capture_request_timing,
     check_coin_budget,
+    coin_retry_after,
     estimate_abort_usage,
     get_effective_limit,
     get_next_endpoint,
     get_pool_limit,
+    observe_rejection_quietly,
     record_stream_abort,
     subtract_coins,
     update_stats,
@@ -210,8 +212,12 @@ def _model_dict(c, rates: dict, eps: list) -> dict:
     return d
 
 
-def _err(msg: str, err_type: str = "invalid_request_error", status: HTTPStatus = HTTPStatus.BAD_REQUEST):
-    return jsonify({"error": {"message": msg, "type": err_type}}), status
+def _err(msg: str, err_type: str = "invalid_request_error", status: HTTPStatus = HTTPStatus.BAD_REQUEST,
+         err_code: str = None, headers: dict = None):
+    body = {"message": msg, "type": err_type}
+    if err_code:
+        body["code"] = err_code
+    return jsonify({"error": body}), status, (headers or {})
 
 
 def _upstream_error_detail(exc):
@@ -345,11 +351,27 @@ def _preflight(model_name: str):
     if not model_config:
         return None, None, None, _err(f"Model '{model_name}' not found", status=HTTPStatus.NOT_FOUND)
     consent_required = current_app.config.get("API_REQUIRE_MODEL_CONSENT", True)
-    ok, code, msg, effective = check_coin_budget(g.entity.id, model_config.id, require_consent=consent_required)
+    ok, code, msg, effective = check_coin_budget(
+        g.entity.id, model_config.id, require_consent=consent_required,
+        source="api", model_name=model_name,
+    )
     if not ok:
+        if code == HTTPStatus.TOO_MANY_REQUESTS:
+            # Two different conditions answer 429 on this surface and they need
+            # opposite reactions from the caller: the limiter means "retry
+            # shortly", an exhausted coin budget means "stop until it refills".
+            # A bare 429 cannot say which, so use the taxonomy the rest of /v1
+            # already follows — the OpenAI SDK branches on `code`.
+            retry_after = coin_retry_after(g.entity.id)
+            headers = {"Retry-After": str(retry_after)} if retry_after is not None else None
+            return None, None, None, _err(
+                msg, "insufficient_quota", code,
+                err_code="insufficient_quota", headers=headers,
+            )
         return None, None, None, _err(msg, status=code)
     endpoint = get_next_endpoint(model_config.id)
     if endpoint is None:
+        observe_rejection_quietly("no_healthy_endpoint", "api", model_name)
         return None, None, None, _err(f"No healthy endpoints for model '{model_name}'", "server_error", HTTPStatus.SERVICE_UNAVAILABLE)
     return model_config, endpoint, effective, None
 

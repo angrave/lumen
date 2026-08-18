@@ -350,3 +350,69 @@ def test_request_disconnected_while_queued_is_shed_before_the_view():
     assert queue_shed_total() == before + 1
     assert gone.sent[0]["type"] == "http.response.start"
     assert gone.sent[0]["status"] == 499
+
+
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize(
+    "path, source",
+    [("/v1/chat/completions", "api"), ("/chat/stream", "chat")],
+)
+def test_shed_request_is_counted_in_the_rejection_taxonomy(monkeypatch, path, source):
+    """A shed request is a rejection, and the only one nothing in Flask can see.
+
+    The model label is empty because it genuinely is: the body is never parsed —
+    that is the whole point of shedding — so the bridge cannot know which model
+    was wanted. Guessing would make the per-model breakdown quietly wrong; this
+    is the same honest empty the rate limiter reports. ``source`` comes from the
+    path because there is no request context to ask.
+    """
+    recorded = []
+    monkeypatch.setattr(
+        "lumen.blueprints.metrics.middleware.observe_rejection",
+        lambda reason, src, model="": recorded.append((reason, src, model)),
+    )
+    release = threading.Event()
+
+    def app(environ, start_response):
+        if environ["PATH_INFO"] == "/first":
+            release.wait(timeout=10)
+        start_response("200 OK", [("Content-Type", "text/plain")])
+        return [b"ok"]
+
+    _drive(
+        app,
+        [_Client("/first"), _Client(path, messages=DISCONNECT_WHILE_QUEUED)],
+        workers=1,
+        coordinator=_park_coordinator(release, {}),
+    )
+
+    assert recorded == [("queue_shed", source, "")]
+
+
+@pytest.mark.timeout(60)
+def test_a_broken_counter_still_sheds_the_request(monkeypatch):
+    """Counting must not turn a 499 into an unhandled error on the bridge."""
+    def boom(*a, **kw):
+        raise RuntimeError("prometheus is unhappy")
+
+    monkeypatch.setattr("lumen.blueprints.metrics.middleware.observe_rejection", boom)
+    release = threading.Event()
+
+    def app(environ, start_response):
+        if environ["PATH_INFO"] == "/first":
+            release.wait(timeout=10)
+        start_response("200 OK", [("Content-Type", "text/plain")])
+        return [b"ok"]
+
+    before = queue_shed_total()
+    gone = _Client("/gone", messages=DISCONNECT_WHILE_QUEUED)
+    _drive(
+        app,
+        [_Client("/first"), gone],
+        workers=1,
+        coordinator=_park_coordinator(release, {}),
+    )
+
+    assert gone.error is None
+    assert queue_shed_total() == before + 1
+    assert gone.sent[0]["status"] == 499

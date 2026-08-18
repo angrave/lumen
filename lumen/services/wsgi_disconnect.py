@@ -104,6 +104,7 @@ import dataclasses
 import functools
 import logging
 import os
+import sys
 import threading
 import time
 import typing
@@ -194,6 +195,36 @@ def configured_threads_total() -> int:
 def queue_shed_total() -> int:
     """Requests answered 499 because the client had gone before they started."""
     return _shed_total
+
+
+def _observe_shed(path: str) -> None:
+    """Count one shed request in the rejection taxonomy, or do nothing at all.
+
+    Never *triggers* the import of the metrics middleware — the same rule (and
+    the same ``sys.modules`` lookup) as ``pool_tracker._observe_wait``:
+    prometheus_client binds each metric to its mmap file at construction, so an
+    import landing before PROMETHEUS_MULTIPROC_DIR is set produces metrics no
+    scrape will ever merge, and this module sits on the hot path of every
+    request through the bridge.
+
+    The model label is empty because it genuinely is unknown here: the request
+    body has never been parsed — the whole point of shedding is that the
+    application never ran — so saying "" is honest, exactly as it is for the
+    rate limiter. The source is derived from the path, since ``request_logs``
+    only knows "chat" and "api" and there is no request context to ask.
+
+    Swallows everything: a request already being shed must not fail because a
+    counter did.
+    """
+    middleware = sys.modules.get("lumen.blueprints.metrics.middleware")
+    if middleware is None:
+        return
+    try:
+        middleware.observe_rejection(
+            "queue_shed", "api" if path.startswith("/v1/") else "chat", "",
+        )
+    except Exception:  # noqa: BLE001 - instrumentation must never escalate
+        logger.debug("counting a shed request failed", exc_info=True)
 
 
 @dataclasses.dataclass
@@ -372,11 +403,12 @@ class _DisconnectAwareWSGIResponder(WSGIResponder):
                 _running -= 1
             self._accounted = None
 
-    def _shed_disconnected(self, start_response: typing.Any) -> None:
+    def _shed_disconnected(self, environ: typing.Any, start_response: typing.Any) -> None:
         """Answer a queued request whose client already left, without the app."""
         global _shed_total
         with _counter_lock:
             _shed_total += 1
+        _observe_shed(environ.get("PATH_INFO", ""))
         logger.info(
             "Client disconnected while %s waited for a WSGI worker; shedding it "
             "without running the application.",
@@ -402,7 +434,7 @@ class _DisconnectAwareWSGIResponder(WSGIResponder):
                 # request. Nothing it can receive is worth producing, so skip
                 # the application entirely — no preflight, no DB work, no
                 # upstream generation.
-                self._shed_disconnected(start_response)
+                self._shed_disconnected(environ, start_response)
                 return
             self.wsgi(environ, start_response)
         finally:

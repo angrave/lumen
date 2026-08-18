@@ -210,3 +210,169 @@ def test_subtract_coins_skips_insert_when_balance_exists(app, test_user, test_mo
             event.remove(db.engine, "before_cursor_execute", record)
 
         assert inserts == []
+
+
+# ---------------------------------------------------------------------------
+# Rejection taxonomy: an exhausted budget, counted and dated
+# ---------------------------------------------------------------------------
+
+def _recorder(monkeypatch):
+    """Capture every observe_rejection call the code under test makes."""
+    recorded = []
+    monkeypatch.setattr(
+        "lumen.blueprints.metrics.middleware.observe_rejection",
+        lambda reason, source, model="": recorded.append((reason, source, model)),
+    )
+    return recorded
+
+
+def _exhaust(app, entity_id, refresh_coins=10, refilled_minutes_ago=30):
+    from datetime import timedelta
+    from lumen.extensions import db
+    from lumen.models.entity_balance import EntityBalance
+    from lumen.models.entity_limit import EntityLimit
+    from lumen.timeutils import utcnow
+    db.session.add(EntityLimit(
+        entity_id=entity_id, max_coins=100, refresh_coins=refresh_coins, starting_coins=100,
+    ))
+    db.session.add(EntityBalance(
+        entity_id=entity_id, coins_left=0,
+        last_refill_at=utcnow() - timedelta(minutes=refilled_minutes_ago),
+    ))
+    db.session.commit()
+
+
+def test_coin_budget_rejection_is_counted(app, test_user, test_model, monkeypatch):
+    """An exhausted budget is a rejection with a known model, unlike the limiter's."""
+    from http import HTTPStatus
+    from lumen.services.llm import check_coin_budget
+    entity_id, model_id = test_user["id"], test_model["id"]
+    with app.app_context():
+        _exhaust(app, entity_id)
+        recorded = _recorder(monkeypatch)
+        ok, code, _msg, _eff = check_coin_budget(
+            entity_id, model_id, source="chat", model_name=test_model["model_name"],
+        )
+        assert ok is False
+        assert code == HTTPStatus.TOO_MANY_REQUESTS
+        assert recorded == [("coin_budget", "chat", test_model["model_name"])]
+
+
+def test_coin_budget_counting_never_breaks_the_rejection(app, test_user, test_model, monkeypatch):
+    """A broken counter must not turn a clean 429 into a 500."""
+    from http import HTTPStatus
+    from lumen.services.llm import check_coin_budget
+    entity_id, model_id = test_user["id"], test_model["id"]
+    with app.app_context():
+        _exhaust(app, entity_id)
+
+        def boom(*a, **kw):
+            raise RuntimeError("prometheus is unhappy")
+
+        monkeypatch.setattr("lumen.blueprints.metrics.middleware.observe_rejection", boom)
+        ok, code, msg, _eff = check_coin_budget(
+            entity_id, model_id, source="chat", model_name=test_model["model_name"],
+        )
+        assert ok is False
+        assert code == HTTPStatus.TOO_MANY_REQUESTS
+        assert msg == "Coin budget exhausted"
+
+
+def test_check_coin_budget_does_not_count_without_a_source(app, test_user, test_model, monkeypatch):
+    """Non-request callers (tests, tooling) must not fabricate rejection samples."""
+    from lumen.services.llm import check_coin_budget
+    entity_id, model_id = test_user["id"], test_model["id"]
+    with app.app_context():
+        _exhaust(app, entity_id)
+        recorded = _recorder(monkeypatch)
+        check_coin_budget(entity_id, model_id)
+        assert recorded == []
+
+
+def test_coin_retry_after_tracks_the_next_refill(app, test_user, test_model):
+    """Retry-After has to be derived, not constant — clients obey it.
+
+    The refiller credits a balance an hour after its last refill, so the wait
+    shrinks as that hour is used up: a balance refilled 30 minutes ago is due in
+    ~30 minutes, one refilled 10 minutes ago in ~50.
+    """
+    from lumen.services.llm import coin_retry_after
+    entity_id = test_user["id"]
+    with app.app_context():
+        _exhaust(app, entity_id, refilled_minutes_ago=30)
+        half_way = coin_retry_after(entity_id)
+    assert 29 * 60 <= half_way <= 30 * 60
+
+    from lumen.extensions import db
+    from lumen.models.entity_balance import EntityBalance
+    from datetime import timedelta
+    from lumen.timeutils import utcnow
+    from sqlalchemy import select
+    with app.app_context():
+        bal = db.session.execute(select(EntityBalance).filter_by(entity_id=entity_id)).scalar_one()
+        bal.last_refill_at = utcnow() - timedelta(minutes=10)
+        db.session.commit()
+        early = coin_retry_after(entity_id)
+    assert 49 * 60 <= early <= 50 * 60
+    assert early > half_way
+
+
+def test_coin_retry_after_is_floored_at_one_second(app, test_user, test_model):
+    """A refill already due arrives on the refiller's next pass, not instantly."""
+    from lumen.services.llm import coin_retry_after
+    entity_id = test_user["id"]
+    with app.app_context():
+        _exhaust(app, entity_id, refilled_minutes_ago=180)
+        assert coin_retry_after(entity_id) == 1
+
+
+def test_coin_retry_after_is_none_when_nothing_refills(app, test_user, test_model):
+    """A pool with refresh_coins=0 never refills; inventing a time would lie."""
+    from lumen.services.llm import coin_retry_after
+    entity_id = test_user["id"]
+    with app.app_context():
+        _exhaust(app, entity_id, refresh_coins=0)
+        assert coin_retry_after(entity_id) is None
+
+
+# ---------------------------------------------------------------------------
+# Rejection taxonomy: nothing healthy to send to
+# ---------------------------------------------------------------------------
+
+def test_no_healthy_endpoint_is_counted_on_the_chat_path(app, test_user, test_model, monkeypatch):
+    """The chat stream picks its endpoint inside the generator, not in the view.
+
+    So the only place that knows the request was refused for want of a backend
+    is the selection itself; counting anywhere else would miss it entirely.
+    """
+    import pytest
+    from lumen.services.llm import send_message_stream
+    entity_id = test_user["id"]
+    with app.app_context():
+        recorded = _recorder(monkeypatch)
+        # No ModelEndpoint rows exist for test_model — nothing to select.
+        stream = send_message_stream(
+            [{"role": "user", "content": "hi"}], test_model["model_name"],
+            entity_id=entity_id, source="chat",
+        )
+        with pytest.raises(RuntimeError, match="No healthy endpoints"):
+            next(stream)
+        assert recorded == [("no_healthy_endpoint", "chat", test_model["model_name"])]
+
+
+def test_no_healthy_endpoint_counting_never_breaks_the_error(app, test_user, test_model, monkeypatch):
+    """A broken counter must leave the RuntimeError exactly as it was."""
+    import pytest
+    from lumen.services.llm import send_message_stream
+
+    def boom(*a, **kw):
+        raise RuntimeError("prometheus is unhappy")
+
+    with app.app_context():
+        monkeypatch.setattr("lumen.blueprints.metrics.middleware.observe_rejection", boom)
+        stream = send_message_stream(
+            [{"role": "user", "content": "hi"}], test_model["model_name"],
+            entity_id=test_user["id"], source="chat",
+        )
+        with pytest.raises(RuntimeError, match="No healthy endpoints"):
+            next(stream)

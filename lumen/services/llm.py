@@ -1,7 +1,8 @@
 import logging
+import math
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from typing import NamedTuple, Optional
 
@@ -75,6 +76,29 @@ def _least_default(element, compiler, **kw):
 @compiles(_least, "sqlite")
 def _least_sqlite(element, compiler, **kw):
     return "min(%s)" % compiler.process(element.clauses, **kw)
+
+
+#: How old ``entity_balances.last_refill_at`` must be before the refiller
+#: credits that balance again — the cutoff in ``token_refill.refill_coin_balances``,
+#: which is what makes the next refill instant derivable here. Keep the two in step.
+REFILL_INTERVAL = timedelta(hours=1)
+
+
+def observe_rejection_quietly(reason: str, source: str, model: str = "") -> None:
+    """Count a rejection, never at the cost of the response.
+
+    Same shape (and same reason) as ``_observe_rejection_quietly`` in
+    ``lumen/__init__.py``: a counter that cannot be incremented is not a reason
+    to fail a request that was already being rejected cleanly. The import is
+    deferred so the name resolves at call time — the middleware module is the
+    one place ``observe_rejection`` lives, and rebinding it there (as the tests
+    do) must reach this call site.
+    """
+    try:
+        from lumen.blueprints.metrics.middleware import observe_rejection
+        observe_rejection(reason, source, model)
+    except Exception:  # noqa: BLE001 - instrumentation must never escalate
+        pass
 
 
 def upstream_call_bounds(*, streaming: bool):
@@ -463,11 +487,40 @@ def subtract_coins(entity_id: int, model_config_id: int, coin_cost: float, effec
     db.session.flush()
 
 
-def check_coin_budget(entity_id: int, model_config_id: int, require_consent: bool = True):
+def _observe_denial_quietly(entity_id: int, model_config_id: int, require_consent: bool,
+                            source: str, model_name: str) -> None:
+    """Count a 403 under the reason it was actually decided for.
+
+    ``get_effective_limit`` collapses "blocked" and "requires an acknowledgement
+    nobody has given" into one None, and the taxonomy needs them apart: the
+    second is the user's to fix from the model detail page, the first is not.
+    Re-resolving the status costs a query on a path that is already refusing the
+    request. Never raises, for the same reason ``observe_rejection_quietly``
+    does not.
+    """
+    try:
+        needs_consent = (
+            require_consent
+            and get_model_access_status(entity_id, model_config_id) == "needs_ack"
+            and not has_model_consent(entity_id, model_config_id)
+        )
+    except Exception:  # noqa: BLE001 - instrumentation must never escalate
+        return
+    observe_rejection_quietly("needs_consent" if needs_consent else "no_access", source, model_name)
+
+
+def check_coin_budget(entity_id: int, model_config_id: int, require_consent: bool = True,
+                      source: str = None, model_name: str = ""):
     """Check coin budget. Returns (ok, http_code, error_message, effective).
 
     ``effective`` is the resolved coin pool limit (or None); pass it to subtract_coins
     afterward to avoid re-resolving model access and the pool limit per request.
+
+    ``source`` ("chat" or "api", matching ``request_logs.source``) and
+    ``model_name`` are only used to label the rejection counter; pass them from
+    the view, which is the only caller that knows which surface it is serving.
+    Omitting ``source`` skips the counting entirely, which is what callers that
+    are not serving a request (tests, admin tooling) want.
 
     This is an optimistic gate: it checks that the balance is > 0 before the LLM
     call, but the actual cost is unknown until the call completes. A user with a tiny
@@ -477,14 +530,56 @@ def check_coin_budget(entity_id: int, model_config_id: int, require_consent: boo
     """
     effective = get_effective_limit(entity_id, model_config_id, require_consent=require_consent)
     if effective is None:
+        if source:
+            _observe_denial_quietly(entity_id, model_config_id, require_consent, source, model_name)
         return False, HTTPStatus.FORBIDDEN, "No access to this model", None
     max_coins, _, _starting = effective
     if max_coins == -2:
         return True, None, None, effective
     balance = db.session.execute(select(EntityBalance).filter_by(entity_id=entity_id)).scalar_one_or_none()
     if balance is not None and float(balance.coins_left) <= 0:
+        if source:
+            observe_rejection_quietly("coin_budget", source, model_name)
         return False, HTTPStatus.TOO_MANY_REQUESTS, "Coin budget exhausted", None
     return True, None, None, effective
+
+
+def coin_retry_after(entity_id: int) -> Optional[int]:
+    """Seconds until this entity's coin balance is next credited, or None.
+
+    ``refill_coin_balances`` credits a balance once its ``last_refill_at`` is an
+    hour old (it runs every 60s, so that instant is the earliest, not the exact
+    moment), which makes the next refill a real derivable time rather than a
+    guessed one. None means no refill is coming and the caller must send no
+    ``Retry-After`` at all: an unlimited or blocked pool, a pool whose
+    ``refresh_coins`` is 0 (it never refills — the balance only moves when an
+    admin changes it), or an entity with no balance row yet.
+
+    Never raises: a header that cannot be derived must degrade to a missing
+    header, not to a 500 on a request that was being refused cleanly.
+    """
+    try:
+        pool = get_pool_limit(entity_id)
+        if pool is None:
+            return None
+        max_coins, refresh_coins, _starting = pool
+        if max_coins == -2 or refresh_coins <= 0:
+            return None
+        balance = db.session.execute(
+            select(EntityBalance).filter_by(entity_id=entity_id)
+        ).scalar_one_or_none()
+        if balance is None or balance.last_refill_at is None:
+            return None
+        last_refill = balance.last_refill_at
+        if last_refill.tzinfo is not None:
+            last_refill = last_refill.replace(tzinfo=None)
+        due_in = (last_refill + REFILL_INTERVAL - utcnow()).total_seconds()
+        # Floored at 1: a refill already due arrives within the refiller's next
+        # 60s pass, and "come back in 0 seconds" is an invitation to hot-loop.
+        return max(1, math.ceil(due_in))
+    except Exception:  # noqa: BLE001 - a missing header beats a failed response
+        logger.debug("could not derive Retry-After from the coin balance", exc_info=True)
+        return None
 
 
 #: WSGI environ key holding the seconds the request waited for a WSGI worker.
@@ -839,6 +934,7 @@ def _send_message_stream(app, messages, model, entity_id, source, effective, dis
 
         endpoint = get_next_endpoint(config.id)
         if endpoint is None:
+            observe_rejection_quietly("no_healthy_endpoint", source, model)
             raise RuntimeError(f"No healthy endpoints for model '{model}'")
 
         # Extract all scalars from ORM objects before the context exits. The
