@@ -17,7 +17,7 @@ def app(tmp_path_factory):
     # same time, and it would show up again under pytest-xdist or two terminals.
     # DATABASE_URL wins over the yaml url (see config.py and create_app), so
     # setting it here is enough to isolate the run.
-    db_path = tmp_path_factory.mktemp("db") / f"test_lumen_{os.getpid()}.db"
+    db_path = tmp_path_factory.mktemp("db") / "test_lumen.db"
     os.environ.update({
         "CONFIG_YAML": TEST_CONFIG,
         "BACKGROUND_WORKER": "false",
@@ -38,16 +38,24 @@ def app(tmp_path_factory):
         # weeks after the key moved to `app.database.url`, and the whole suite ran
         # against instance/lumen_dev.db the entire time.
         db_file = db.engine.url.database
-        assert db_file and "lumen_dev" not in Path(db_file).name, (
-            f"tests are pointed at {db_file!r}, which looks like the dev database; "
-            "expected a dedicated test database"
+        assert (
+            db.engine.url.get_backend_name() == "sqlite"
+            and db_file
+            and Path(db_file).name == "test_lumen.db"
+        ), (
+            f"tests are pointed at {db_file!r} (backend "
+            f"{db.engine.url.get_backend_name()}), which is not the dedicated test "
+            "database; this suite drops every table at teardown and deletes every "
+            "row between tests, so a misrouted URI destroys real data silently"
         )
         db.create_all()
     yield application
     with application.app_context():
         from lumen.extensions import db
         db.drop_all()
-    Path(db_file).unlink(missing_ok=True)
+        backend = db.engine.url.get_backend_name()
+    if backend == "sqlite":
+        Path(db_file).unlink(missing_ok=True)
 
 
 @pytest.fixture(autouse=True)

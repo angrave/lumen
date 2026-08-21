@@ -93,7 +93,7 @@ def apply_hot_config(app, yaml_data: dict):
         _version_warned = True
 
     app_cfg = yaml_data.get("app", {})
-    if unknown := sorted(set(app_cfg) - KNOWN_APP_KEYS):
+    if unknown := sorted(str(k) for k in (set(app_cfg) - KNOWN_APP_KEYS)):
         logger.warning(
             "config.yaml: unrecognised key(s) under 'app': %s. They are ignored — check "
             "for a setting renamed by a schema change (app.database_url, for example, "
