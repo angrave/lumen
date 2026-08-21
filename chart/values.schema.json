@@ -13,6 +13,7 @@
         { "type": "string", "enum": ["auto"] }
       ]
     },
+    "wsgiSendTimeout": { "type": "number", "exclusiveMinimum": 0 },
     "image": {
       "type": "object",
       "additionalProperties": false,
@@ -107,6 +108,16 @@
           "type": "object",
           "properties": {
             "limit": { "type": "string" }
+          }
+        },
+        "llm": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "connectTimeout": { "type": "number", "exclusiveMinimum": 0 },
+            "readTimeout": { "type": "number", "exclusiveMinimum": 0 },
+            "requestTimeout": { "type": "number", "exclusiveMinimum": 0 },
+            "maxRetries": { "type": "integer", "minimum": 0 }
           }
         },
         "extraConfig": { "type": "string" }

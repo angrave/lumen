@@ -254,24 +254,43 @@ def test_refill_does_not_clobber_concurrent_deduction(app, test_user):
 
 def test_aware_last_refill_at_does_not_abort_pass(app, test_user):
     """A stray aware last_refill_at must not raise and abort the whole refill pass (CODE-H2)."""
+    from unittest.mock import patch
+
     with app.app_context():
         from lumen.extensions import db
         from lumen.models.entity_balance import EntityBalance
-        from lumen.services.token_refill import refill_coin_balances
+        from lumen.services import token_refill
 
-        # One clock reading for both values: reading it twice makes the elapsed
-        # span fractionally under two hours, so the refill lands on 19.999999
-        # and the assertion below fails intermittently. last_refill_at stays
-        # aware on purpose — that is what this test is about.
-        now_aware = datetime.now(timezone.utc)
-        now = now_aware.replace(tzinfo=None)
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
         _add_limit(db, test_user["id"], max_coins=100, refresh_coins=10)
         _add_balance(db, test_user["id"], coins_left=50,
-                      last_refill_at=now_aware - timedelta(hours=2))
+                      last_refill_at=now - timedelta(hours=2))
         db.session.commit()
 
-        assert refill_coin_balances(now=now) == 1
-        bal = db.session.execute(select(EntityBalance).filter_by(entity_id=test_user["id"])).scalar_one_or_none()
+        # SQLite's naive DateTime bind strips tzinfo on persist, so an aware
+        # value can never survive a round-trip through the DB and the refiller
+        # would always read it back naive — leaving the CODE-H2 branch dead.
+        # Inject the aware value on the in-memory ORM object instead: the
+        # refiller's SELECT returns this same identity-map object un-refreshed.
+        # Writing through __dict__ (not the InstrumentedAttribute) keeps it out
+        # of the dirty state, and synchronize_session=False keeps SQLAlchemy's
+        # ORM<->Core UPDATE post-sync from evaluating the aware value against
+        # the naive cutoff; the DB row itself stays naive and still matches.
+        bal = db.session.execute(
+            select(EntityBalance).filter_by(entity_id=test_user["id"])
+        ).scalar_one()
+        vars(bal)["last_refill_at"] = bal.last_refill_at.replace(tzinfo=timezone.utc)
+
+        real_update = token_refill.sa_update
+
+        def no_sync_update(*args, **kwargs):
+            return real_update(*args, **kwargs).execution_options(synchronize_session=False)
+
+        with patch.object(token_refill, "sa_update", side_effect=no_sync_update):
+            assert token_refill.refill_coin_balances(now=now) == 1
+
+        db.session.expire_all()
+        bal = db.session.execute(select(EntityBalance).filter_by(entity_id=test_user["id"])).scalar_one()
         assert float(bal.coins_left) == 70.0  # 50 + 2*10
 
 

@@ -9,21 +9,35 @@ from functools import wraps
 from http import HTTPStatus
 
 import openai
-from flask import Blueprint, current_app, request, jsonify, g, Response
-from sqlalchemy import case, func, select, update as sa_update
+from flask import Blueprint, Response, current_app, g, jsonify, request
+from sqlalchemy import case, func, select
+from sqlalchemy import update as sa_update
 
-logger = logging.getLogger(__name__)
-
+from lumen.blueprints.metrics.middleware import observe_stream_abort
 from lumen.extensions import db, limiter
-from lumen.timeutils import utcnow
 from lumen.models.api_key import APIKey
-from lumen.services.crypto import hash_api_key, cache_salt_for_entity
 from lumen.models.entity import Entity
 from lumen.models.model_config import ModelConfig
 from lumen.models.model_endpoint import ModelEndpoint
 from lumen.models.request_log import RequestLog
 from lumen.services.cost import calculate_audio_cost
-from lumen.services.llm import bulk_model_access_info, check_coin_budget, subtract_coins, get_effective_limit, get_next_endpoint, get_pool_limit, update_stats, record_aborted_request
+from lumen.services.crypto import cache_salt_for_entity, hash_api_key
+from lumen.services.llm import (
+    bulk_model_access_info,
+    check_coin_budget,
+    estimate_abort_usage,
+    get_effective_limit,
+    get_next_endpoint,
+    get_pool_limit,
+    record_stream_abort,
+    subtract_coins,
+    update_stats,
+    upstream_call_bounds,
+)
+from lumen.services.wsgi_disconnect import client_disconnect_event
+from lumen.timeutils import utcnow
+
+logger = logging.getLogger(__name__)
 
 api_bp = Blueprint("api", __name__, url_prefix="/v1")
 
@@ -359,11 +373,18 @@ def _complete_and_bill(model_name: str, messages: list, **kwargs):
     mc_id        = model_config.id
     mc_in_cost   = float(model_config.input_cost_per_million)
     mc_out_cost  = float(model_config.output_cost_per_million)
+    timeout, max_retries = upstream_call_bounds(streaming=False)
     db.session.remove()  # return connection to pool before the LLM call
 
     try:
         t0 = _time.time()
-        with openai.OpenAI(api_key=ep_api_key, base_url=ep_url) as client:
+        # Non-streaming, so the read timeout bounds the wait for the *entire*
+        # response body rather than the gap between chunks — a generation that
+        # legitimately runs longer than LLM_READ_TIMEOUT is cut off here.
+        # Retries are allowed (unlike the streaming path): this attempt is
+        # finished and nothing has been sent to the client yet.
+        with openai.OpenAI(api_key=ep_api_key, base_url=ep_url,
+                           timeout=timeout, max_retries=max_retries) as client:
             response = client.chat.completions.create(model=remote_model, messages=messages, **kwargs)
         duration = _time.time() - t0
     except Exception as exc:
@@ -436,65 +457,141 @@ def _do_chat(model_name: str, messages: list, stream: bool, **kwargs):
     # context onto that thread and poisons it if the generator is abandoned),
     # so push short-lived app contexts around the DB work — never across a yield.
     app = current_app._get_current_object()
+    # Captured while the request context is still current; polled in the loop
+    # below. GeneratorExit alone never fires under uvicorn + a2wsgi.
+    disconnected = client_disconnect_event()
+    # Likewise read here, not in generate(): the client is constructed inside
+    # the generator, which runs context-free with no current_app to read from.
+    timeout, max_retries = upstream_call_bounds(streaming=True)
 
     def generate():
         billed = False
+        aborted = False
+        # Which stage a failure came from, for the abort metric's reason label.
+        phase = "upstream"
+        usage = None
+        content_deltas = 0
         t0 = _time.time()
-        with openai.OpenAI(api_key=ep_api_key, base_url=ep_url) as client:
-            try:
+
+        def _abort():
+            """Bill and log what this stream consumed before the client went away.
+
+            Reads ``usage``/``content_deltas`` at call time, so it reflects however
+            far the stream got. Shared by the break-on-disconnect path and
+            GeneratorExit so the two cannot bill differently.
+            """
+            input_tokens, output_tokens, cost = estimate_abort_usage(
+                usage, messages, content_deltas, mc_in_cost, mc_out_cost)
+            record_stream_abort(
+                app, billed=billed, entity_id=entity_id, model_config_id=mc_id,
+                source="api", endpoint_id=ep_id, started_at=t0,
+                input_tokens=input_tokens, output_tokens=output_tokens, cost=cost,
+                effective=effective,
+                record_extra=lambda: _record_api_key_usage(ak_id, input_tokens, output_tokens, cost),
+            )
+
+        # The ``with`` is nested inside the ``try`` (matching llm.py) so that an
+        # exit through it — a GeneratorExit from a client disconnect above all —
+        # closes the client, aborting the upstream generation, *before* the
+        # handlers below run. With the ``with`` outside, the abort accounting's
+        # DB round-trip happened while the backend was still generating.
+        try:
+            # max_retries=0: a streaming call is never auto-retried — a retry
+            # restarts the whole generation while the first attempt may still be
+            # draining upstream, i.e. two backend generations for one client
+            # request, with chunks already sent that cannot be un-sent.
+            # LLM_MAX_RETRIES applies to the non-streaming paths only.
+            #
+            # The read timeout is the maximum gap *between* chunks, so a long
+            # generation is unaffected. It is also what bounds F10: the
+            # disconnect flag below is only polled between chunks, so while
+            # blocked awaiting the next upstream chunk a disconnect cannot be
+            # seen at all — the read timeout caps that blind window.
+            with openai.OpenAI(api_key=ep_api_key, base_url=ep_url,
+                               timeout=timeout, max_retries=max_retries) as client:
                 stream_options = {**kwargs.pop("stream_options", {}), "include_usage": True}
                 resp_stream = client.chat.completions.create(
                     model=remote_model, messages=messages, stream=True,
                     stream_options=stream_options,
                     **kwargs,
                 )
-                usage = None
                 for chunk in resp_stream:
+                    # Capture usage before testing the flag — see llm.py: the
+                    # totals ride on the terminal chunk, and a disconnect in that
+                    # window must not discard figures already in hand.
                     if chunk.usage is not None:
                         usage = chunk.usage
+                    if disconnected.is_set():
+                        aborted = True
+                        break
+                    # Counted for the abort estimate: without the terminal usage
+                    # chunk, one content delta is the stand-in for one token.
+                    choices = getattr(chunk, "choices", None)
+                    delta = getattr(choices[0], "delta", None) if choices else None
+                    if getattr(delta, "content", None):
+                        content_deltas += 1
                     yield f"data: {json.dumps(chunk.model_dump())}\n\n"
-                duration = _time.time() - t0
-                yield "data: [DONE]\n\n"
-
-                if usage is not None:
-                    cost = round(
-                        usage.prompt_tokens * mc_in_cost / 1_000_000
-                        + usage.completion_tokens * mc_out_cost / 1_000_000,
-                        6,
-                    )
-                    with app.app_context():
-                        subtract_coins(entity_id, mc_id, cost, effective=effective)
-                        update_stats(entity_id, mc_id, "api", usage.prompt_tokens, usage.completion_tokens, cost,
-                                     endpoint_id=ep_id, duration=duration)
-                        _record_api_key_usage(ak_id, usage.prompt_tokens, usage.completion_tokens, cost)
-                        db.session.commit()
-                    billed = True
-                else:
-                    logger.warning(
-                        "Upstream did not return usage data for streaming request "
-                        "(model=%s, entity_id=%s) — tokens and cost not recorded.",
-                        model_name, entity_id,
-                    )
-            except GeneratorExit:
-                # Client disconnected mid-stream before billing — log a zero-cost
-                # request so we can monitor how often this happens, then re-raise.
-                if not billed:
-                    with app.app_context():
-                        record_aborted_request(entity_id, mc_id, "api", endpoint_id=ep_id,
-                                               duration=_time.time() - t0)
-                raise
-            except Exception as exc:
-                msg, err_type, _ = _classify_upstream_error(
-                    exc,
-                    f"Error during streaming request "
-                    f"(endpoint={ep_id} {ep_url} model={remote_model}, entity_id={entity_id})",
-                )
-                # Any half-finished billing was already rolled back when its app
-                # context exited; nothing is held while the error events below
-                # are in flight — a client that has gone away can leave those
-                # yields pending forever.
-                yield f"data: {json.dumps({'error': {'message': msg, 'type': err_type}})}\n\n"
-                yield "data: [DONE]\n\n"
+                if not aborted:
+                    duration = _time.time() - t0
+                    if usage is not None:
+                        cost = round(
+                            usage.prompt_tokens * mc_in_cost / 1_000_000
+                            + usage.completion_tokens * mc_out_cost / 1_000_000,
+                            6,
+                        )
+                        phase = "billing"
+                        with app.app_context():
+                            subtract_coins(entity_id, mc_id, cost, effective=effective)
+                            update_stats(entity_id, mc_id, "api", usage.prompt_tokens, usage.completion_tokens, cost,
+                                         endpoint_id=ep_id, duration=duration)
+                            _record_api_key_usage(ak_id, usage.prompt_tokens, usage.completion_tokens, cost)
+                            db.session.commit()
+                        billed = True
+                    else:
+                        logger.warning(
+                            "Upstream did not return usage data for streaming request "
+                            "(model=%s, entity_id=%s) — tokens and cost not recorded.",
+                            model_name, entity_id,
+                        )
+                    # [DONE] goes last, after billing, matching llm.py. With the
+                    # yield first, a client vanishing on this final event left
+                    # billed=False, so the GeneratorExit handler wrote a
+                    # completed stream up as an abort: a false aborted=True row
+                    # and a false disconnect on the metric. Billing first makes
+                    # _abort() a no-op here.
+                    yield "data: [DONE]\n\n"
+            if aborted:
+                # Outside the `with`: the client is closed and the upstream
+                # aborted before this DB round-trip runs (same ordering the
+                # GeneratorExit path relies on). Keyed off the break, not the
+                # flag — a client that vanishes after a complete stream still
+                # has usage and is billed normally above.
+                _abort()
+                return
+        except GeneratorExit:
+            # Client disconnected mid-stream before billing — bill what was
+            # consumed and log it as an abort, then re-raise.
+            _abort()
+            raise
+        except Exception as exc:
+            # An upstream failure (including the read timeout above) ends the
+            # stream early too; counted on the same metric as disconnects, with
+            # a reason that tells them apart. `phase` keeps a failed DB commit
+            # from being reported as an upstream failure — the stream succeeded
+            # and only the accounting broke, and conflating the two would send
+            # an operator hunting a backend problem that does not exist.
+            observe_stream_abort("api", f"{phase}_error")
+            msg, err_type, _ = _classify_upstream_error(
+                exc,
+                f"Error during streaming request "
+                f"(endpoint={ep_id} {ep_url} model={remote_model}, entity_id={entity_id})",
+            )
+            # Any half-finished billing was already rolled back when its app
+            # context exited; nothing is held while the error events below
+            # are in flight — a client that has gone away can leave those
+            # yields pending forever.
+            yield f"data: {json.dumps({'error': {'message': msg, 'type': err_type}})}\n\n"
+            yield "data: [DONE]\n\n"
 
     return Response(generate(), content_type="text/event-stream")
 
@@ -549,11 +646,16 @@ def _do_audio(kind: str):
     mc_in_cost       = float(model_config.input_cost_per_million)
     mc_out_cost      = float(model_config.output_cost_per_million)
     mc_audio_per_hour = float(model_config.audio_cost_per_hour or 0)
+    timeout, max_retries = upstream_call_bounds(streaming=False)
     db.session.remove()
 
     try:
         t0 = _time.time()
-        with openai.OpenAI(api_key=ep_api_key, base_url=ep_url) as client:
+        # Non-streaming: the read timeout bounds the whole transcription, and
+        # the write timeout the upload of the audio file. A long recording can
+        # legitimately exceed LLM_READ_TIMEOUT — raise it if that bites.
+        with openai.OpenAI(api_key=ep_api_key, base_url=ep_url,
+                           timeout=timeout, max_retries=max_retries) as client:
             create = getattr(client.audio, kind).create
             response = create(model=remote_model, file=(file_name, file_data, file_type), **extra)
         duration = _time.time() - t0

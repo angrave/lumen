@@ -198,6 +198,7 @@ erDiagram
         int audio_seconds
         numeric cost
         float duration
+        bool aborted
     }
 
     entities ||--o{ api_keys : "owns"
@@ -580,10 +581,12 @@ Append-only log of every proxied request. On PostgreSQL this table is converted 
 | `audio_seconds` | Integer | NO | Seconds of audio transcribed/translated; 0 for text requests |
 | `cost` | Numeric(12,6) | NO | Cost in USD for this request |
 | `duration` | Float | NO | Total proxy response time in seconds |
+| `aborted` | Boolean | NO | True if the client disconnected before the stream completed; token counts may be estimated |
 
 **Notes:**
 - Foreign keys use `SET NULL` on delete (not cascade) to preserve historical log data when entities, models, or endpoints are removed.
 - `time` is indexed but not unique; concurrent workers may insert rows with the same timestamp without collision.
+- `aborted` replaces the earlier "`cost` = 0 identifies an abandoned stream" convention: aborted streams are now billed for what they consumed, so their cost is usually non-zero. Rows written before the column was added are all `false` and were not backfilled — a completed request can also cost 0 (zero-priced model, audio model with no `audio_cost_per_hour`, missing upstream usage, or a cost that rounds to 0 at `Numeric(12,6)`), so the old convention could not be applied retroactively without false positives.
 
 ---
 

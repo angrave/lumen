@@ -21,6 +21,7 @@ from lumen.models.message import Message
 from lumen.models.model_config import ModelConfig
 from lumen.models.model_endpoint import ModelEndpoint
 from lumen.services.llm import bulk_model_access_info, check_coin_budget, get_pool_limit, send_message_stream
+from lumen.services.wsgi_disconnect import client_disconnect_event
 from lumen.timeutils import utcnow
 
 logger = logging.getLogger(__name__)
@@ -242,18 +243,32 @@ def chat_stream():
     # so: create the LLM stream while the request context is still current, and
     # push short-lived app contexts around the DB work — never across a yield.
     app = current_app._get_current_object()
+    disconnected = client_disconnect_event()
     llm_stream = send_message_stream(messages, model, entity_id=entity_id, source="chat", effective=effective)
 
     def generate():
         try:
             result = None
             for chunk, thinking, final in llm_stream:
+                if disconnected.is_set():
+                    break
                 if thinking is not None:
                     yield f"data: {json.dumps({'thinking_chunk': thinking})}\n\n"
                 elif chunk is not None:
                     yield f"data: {json.dumps({'chunk': chunk})}\n\n"
                 else:
                     result = final
+
+            if result is None and disconnected.is_set():
+                # The client left mid-stream; send_message_stream has already
+                # recorded the abort. Return silently rather than falling into
+                # the branch below: the model did not return empty, and on a
+                # half-open connection that error event is delivered to a live
+                # client that just received partial output.
+                # Guarded on `result is None` so a client that disconnects after
+                # a complete reply still reaches the conversation write — that
+                # reply was generated and billed, so it must be saved.
+                return
 
             if result is None:
                 yield f"data: {json.dumps({'error': 'Empty response from model'})}\n\n"

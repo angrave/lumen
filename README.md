@@ -358,6 +358,14 @@ A thread inside a database call holds a pooled connection, so `pool_size + max_o
 
 `auto` sizes for the worst case where every thread is in a database call. Streaming paths release their connection before the LLM call, so if your traffic is mostly streaming you can safely set a number well above `pool_size + max_overflow` instead. Either way, raising threads is usually cheaper than adding worker processes (`--workers` / `WEB_CONCURRENCY`), which divide the same connection budget further and duplicate every per-process cache.
 
+A thread handing a response chunk to the server will wait at most `LUMEN_WSGI_SEND_TIMEOUT` seconds (default 300; Helm: `wsgiSendTimeout`) before declaring the client gone, logging a warning, and releasing itself:
+
+```bash
+LUMEN_WSGI_SEND_TIMEOUT=120 uvicorn asgi:app --host 0.0.0.0 --port 5001
+```
+
+This exists for clients that stop reading *without* closing the connection — a laptop that sleeps, a dropped NAT entry, an app that opens a stream and abandons it. No disconnect is ever reported for those, and the kernel never abandons a peer that is alive but advertising a zero window, so without a bound the thread is pinned forever. It is a stall detector, not a rate limit: a thread only starts waiting once the socket buffer, the server's write buffer, and the whole send queue are already full, which even a very poor mobile link clears in well under a minute. Keep it below the gateway's request timeout so a stalled thread is reclaimed before the request would have been cut off anyway. Non-numeric or non-positive values warn and fall back to the default — the wait cannot be disabled, because unbounded is the failure this prevents.
+
 ### Database connection pool
 
 On PostgreSQL the pool is **auto-sized** from the server's `max_connections`, divided across all worker processes and Kubernetes replicas so combined usage cannot exhaust the server: 60% to `pool_size`, 20% to `max_overflow`, and 20% reserved for psql/migrations/monitoring. Worker count is detected from `WEB_CONCURRENCY` or the uvicorn `--workers` flag; replica count comes from the `LUMEN_REPLICAS` env var (set by the Helm chart from `replicaCount`). Pre-ping is always enabled. SQLite has no connection limit, so sizing is skipped. Changes require a restart.

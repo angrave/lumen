@@ -314,6 +314,56 @@ def test_known_app_keys_do_not_warn(app, caplog, restore_config):
     assert not any("unrecognised key" in r.getMessage() for r in caplog.records)
 
 
+def test_every_app_cfg_read_is_in_known_app_keys():
+    """Reverse guard: every key read off ``app_cfg`` must be recognised.
+
+    KNOWN_APP_KEYS is the allowlist that turns a stale, silently-ignored key
+    into a loud warning. Its forward test (test_known_app_keys_do_not_warn)
+    builds its input from the constant itself, so it cannot catch the constant
+    drifting out of step with the reads in apply_hot_config / _apply_theme —
+    which is exactly what happened when the set shipped incomplete. This walks
+    the module's AST instead and asserts the set actually covers every read.
+    """
+    import ast
+    from pathlib import Path
+
+    from lumen.services.config_watcher import KNOWN_APP_KEYS
+
+    source = Path(
+        Path(__file__).resolve().parents[2] / "lumen" / "services" / "config_watcher.py"
+    ).read_text()
+    tree = ast.parse(source)
+
+    read_keys = set()
+    for node in ast.walk(tree):
+        # app_cfg.get("key", default) — first positional literal is the read
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "app_cfg"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+        ):
+            read_keys.add(node.args[0].value)
+        # app_cfg["key"] — subscription form
+        elif (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "app_cfg"
+            and isinstance(node.slice, ast.Constant)
+            and isinstance(node.slice.value, str)
+        ):
+            read_keys.add(node.slice.value)
+
+    assert read_keys, "no app_cfg reads found — the AST walk may be stale"
+    assert read_keys <= set(KNOWN_APP_KEYS), (
+        f"app_cfg keys read but missing from KNOWN_APP_KEYS: {sorted(read_keys - set(KNOWN_APP_KEYS))}"
+    )
+
+
 def test_shipped_configs_have_no_unknown_app_keys():
     """The fixture and the shipped configs must stay in step with the schema.
 
@@ -389,6 +439,128 @@ def test_apply_hot_config_config_editor_disabled(app, restore_config):
     with app.app_context():
         apply_hot_config(app, {"version": 2, "app": {"config_editor": False}})
         assert app.config["CONFIG_EDITOR"] is False
+
+
+# ---------------------------------------------------------------------------
+# apply_hot_config: upstream LLM call bounds
+# ---------------------------------------------------------------------------
+
+def test_apply_hot_config_llm_bounds_from_yaml(app, restore_config):
+    from lumen.services.config_watcher import apply_hot_config
+    yaml_data = {
+        "version": 2,
+        "llm": {"connect_timeout": 3, "read_timeout": 45, "max_retries": 0},
+    }
+    with app.app_context():
+        apply_hot_config(app, yaml_data)
+        assert app.config["LLM_CONNECT_TIMEOUT"] == 3.0
+        assert app.config["LLM_READ_TIMEOUT"] == 45.0
+        assert app.config["LLM_MAX_RETRIES"] == 0
+
+
+def test_apply_hot_config_llm_defaults_when_section_absent(app, restore_config):
+    from lumen.services.config_watcher import apply_hot_config
+    with app.app_context():
+        apply_hot_config(app, {"version": 2})
+        assert app.config["LLM_CONNECT_TIMEOUT"] == 5.0
+        assert app.config["LLM_READ_TIMEOUT"] == 300.0
+        assert app.config["LLM_MAX_RETRIES"] == 1
+
+
+def test_apply_hot_config_llm_defaults_for_missing_keys(app, restore_config):
+    """A partial llm section keeps the defaults for the keys it omits."""
+    from lumen.services.config_watcher import apply_hot_config
+    with app.app_context():
+        apply_hot_config(app, {"version": 2, "llm": {"read_timeout": 30}})
+        assert app.config["LLM_CONNECT_TIMEOUT"] == 5.0
+        assert app.config["LLM_READ_TIMEOUT"] == 30.0
+        assert app.config["LLM_MAX_RETRIES"] == 1
+
+
+def test_apply_hot_config_llm_blank_key_uses_default(app, restore_config):
+    """'read_timeout:' with no value parses as None and must fall back, not crash."""
+    from lumen.services.config_watcher import apply_hot_config
+    with app.app_context():
+        apply_hot_config(app, {"version": 2, "llm": {"read_timeout": None}})
+        assert app.config["LLM_READ_TIMEOUT"] == 300.0
+
+
+def test_apply_hot_config_llm_values_are_floats_and_int(app, restore_config):
+    """Values are coerced so the SDK never receives a yaml string."""
+    from lumen.services.config_watcher import apply_hot_config
+    with app.app_context():
+        apply_hot_config(app, {"version": 2, "llm": {"connect_timeout": "2.5", "max_retries": "3"}})
+        assert app.config["LLM_CONNECT_TIMEOUT"] == 2.5
+        assert isinstance(app.config["LLM_CONNECT_TIMEOUT"], float)
+        assert app.config["LLM_MAX_RETRIES"] == 3
+        assert isinstance(app.config["LLM_MAX_RETRIES"], int)
+
+
+def test_watcher_reloads_llm_bounds(app, tmp_path, restore_config):
+    """A changed llm section is picked up by a hot reload, not just at startup."""
+    from unittest.mock import patch
+
+    import yaml
+
+    from lumen.services.config_watcher import _watcher, apply_hot_config
+
+    with app.app_context():
+        apply_hot_config(app, {"version": 2, "llm": {"read_timeout": 10, "max_retries": 0}})
+        assert app.config["LLM_READ_TIMEOUT"] == 10.0
+
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(yaml.dump({"version": 2, "llm": {"read_timeout": 90, "max_retries": 2}}))
+
+    sleep_count = 0
+
+    def fake_sleep(n):
+        nonlocal sleep_count
+        sleep_count += 1
+        if sleep_count >= 3:
+            raise SystemExit("stop")
+
+    mtime_values = [1.0, 2.0]
+    mtime_idx = 0
+
+    def fake_getmtime(path):
+        nonlocal mtime_idx
+        v = mtime_values[mtime_idx] if mtime_idx < len(mtime_values) else 2.0
+        mtime_idx += 1
+        return v
+
+    with patch("lumen.services.config_watcher.time.sleep", side_effect=fake_sleep), \
+         patch("lumen.services.config_watcher.sync_models_from_yaml"), \
+         patch("lumen.services.config_watcher.sync_groups_from_yaml"), \
+         patch("lumen.services.config_watcher.sync_projects_from_yaml"), \
+         patch("lumen.services.config_watcher.sync_user_groups_from_yaml"), \
+         patch("lumen.services.config_watcher.sync_user_limits_from_yaml"), \
+         patch("lumen.services.config_watcher.os.path.getmtime", side_effect=fake_getmtime):
+        try:
+            _watcher(app, str(config_file))
+        except SystemExit:
+            pass
+
+    with app.app_context():
+        assert app.config["LLM_READ_TIMEOUT"] == 90.0
+        assert app.config["LLM_MAX_RETRIES"] == 2
+
+
+def test_shipped_config_example_has_llm_section(app, restore_config):
+    """config.yaml.example documents the section and it loads to the stated defaults."""
+    from pathlib import Path
+
+    import yaml as _yaml
+
+    from lumen.services.config_watcher import apply_hot_config
+    root = Path(__file__).resolve().parents[2]
+    data = _yaml.safe_load((root / "config.yaml.example").read_text())
+    assert set(data["llm"]) == {"connect_timeout", "read_timeout", "request_timeout", "max_retries"}
+    with app.app_context():
+        apply_hot_config(app, data)
+        assert app.config["LLM_CONNECT_TIMEOUT"] == 5.0
+        assert app.config["LLM_READ_TIMEOUT"] == 300.0
+        assert app.config["LLM_REQUEST_TIMEOUT"] == 600.0
+        assert app.config["LLM_MAX_RETRIES"] == 1
 
 
 def test_apply_hot_config_v1_emits_version_deprecation_warning(app, caplog, restore_config):

@@ -11,6 +11,14 @@ replicaCount: 1
 # block on the pool.
 wsgiWorkers: 10
 
+# Seconds a worker thread may wait to hand one response chunk to the server
+# before the client is declared gone and the thread reclaimed. This is a stall
+# detector for clients that stop reading without closing the connection (a
+# half-open TCP link the kernel never abandons), not a QoS limit — leave it well
+# above any real client. Keep it below gateway.timeout so a stalled thread is
+# freed before the request would have been cut off anyway.
+wsgiSendTimeout: 300
+
 image:
   # -- Container image repository
   repository: ncsa/lumen
@@ -102,6 +110,25 @@ config:
   rateLimiting:
     # -- Rate limit per user, e.g. "30 per minute"
     limit: "30 per minute"
+  # -- Bounds on the calls Lumen makes to the upstream model endpoints. Without
+  # these the OpenAI SDK defaults apply (600s timeout, 2 retries), so one stalled
+  # backend can hold a worker thread for ~30 minutes.
+  llm:
+    # -- Seconds to establish the upstream connection
+    connectTimeout: 5
+    # -- For a streaming response this is the maximum gap BETWEEN CHUNKS, not the
+    # total call duration: a 20-minute generation is fine as long as tokens keep
+    # arriving. Sized for a reasoning model that goes quiet while thinking before
+    # emitting its first content token.
+    readTimeout: 300
+    # -- NON-streaming calls have no chunks to pace them, so this bounds the
+    # whole generation. Much larger than readTimeout on purpose: a long
+    # completion or a large audio transcription legitimately takes minutes.
+    requestTimeout: 600
+    # -- Retries for non-streaming upstream calls. Streaming calls are never
+    # retried: a retry restarts the whole generation while the first attempt may
+    # still be draining upstream.
+    maxRetries: 1
   # -- Raw YAML appended verbatim to config.yaml (for settings not covered by chart values)
   extraConfig: ""
 

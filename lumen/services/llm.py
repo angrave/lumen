@@ -5,17 +5,38 @@ from datetime import datetime, timezone
 from http import HTTPStatus
 from typing import NamedTuple
 
+import openai
+from flask import current_app
+from sqlalchemy import select
+from sqlalchemy import update as sa_update
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.sql.expression import FunctionElement
+
+from lumen.blueprints.metrics.middleware import observe_stream_abort
+from lumen.extensions import db
+from lumen.models.entity import Entity
+from lumen.models.entity_balance import EntityBalance
+from lumen.models.entity_limit import EntityLimit
+from lumen.models.entity_model_access import EntityModelAccess
+from lumen.models.entity_model_consent import EntityModelConsent
+from lumen.models.entity_stat import EntityStat
+from lumen.models.group import Group
+from lumen.models.group_limit import GroupLimit
+from lumen.models.group_member import GroupMember
+from lumen.models.group_model_access import GroupModelAccess
+from lumen.models.model_config import ModelConfig
+from lumen.models.model_endpoint import ModelEndpoint
+from lumen.models.model_stat import ModelStat
+from lumen.models.request_log import RequestLog
+from lumen.services.crypto import cache_salt_for_entity
+from lumen.services.wsgi_disconnect import client_disconnect_event
+from lumen.timeutils import utcnow
+
 logger = logging.getLogger(__name__)
 
 # Sentinel for "argument not supplied" so callers can pass an explicit None.
 _UNSET = object()
-
-import openai
-from flask import current_app
-from sqlalchemy import select, update as sa_update
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.compiler import compiles
-from sqlalchemy.sql.expression import FunctionElement
 
 
 class _greatest(FunctionElement):
@@ -49,23 +70,47 @@ def _least_default(element, compiler, **kw):
 def _least_sqlite(element, compiler, **kw):
     return "min(%s)" % compiler.process(element.clauses, **kw)
 
-from lumen.extensions import db
-from lumen.timeutils import utcnow
-from lumen.models.entity_balance import EntityBalance
-from lumen.models.entity_limit import EntityLimit
-from lumen.models.entity_model_access import EntityModelAccess
-from lumen.models.entity_model_consent import EntityModelConsent
-from lumen.models.model_config import ModelConfig
-from lumen.models.model_endpoint import ModelEndpoint
-from lumen.models.entity_stat import EntityStat
-from lumen.models.model_stat import ModelStat
-from lumen.models.request_log import RequestLog
-from lumen.models.group import Group
-from lumen.models.group_member import GroupMember
-from lumen.models.group_limit import GroupLimit
-from lumen.models.group_model_access import GroupModelAccess
-from lumen.services.crypto import cache_salt_for_entity
-from lumen.models.entity import Entity
+
+def upstream_call_bounds(*, streaming: bool):
+    """Return (timeout, max_retries) for an upstream ``openai.OpenAI`` client.
+
+    ``streaming`` selects which read bound applies, and they mean genuinely
+    different things — one value cannot serve both. On a streaming call the read
+    timeout is the maximum gap *between chunks*, so a low value is safe however
+    long the generation runs. On a non-streaming call the same setting bounds the
+    entire wait for the response body, and a non-streaming completion or a long
+    audio transcription can legitimately take minutes. Sharing one number would
+    either leave streams unbounded or start failing slow non-streaming requests
+    that work today.
+
+    Every proxy client must be bounded. The SDK's own defaults are 600 s and
+    two retries, so a silently stalled backend can pin a WSGI worker thread for
+    ~30 minutes across three attempts of a single client request — long past
+    the gateway deadline that made those attempts orphan work.
+
+    ``openai.Timeout`` is ``httpx.Timeout`` re-exported; a structured timeout
+    rather than a bare float so connecting and reading are bounded separately.
+
+    Must be called while an application context is current; streaming callers
+    capture the result into their generator's closure, since the generator runs
+    context-free and has no ``current_app``.
+    """
+    cfg = current_app.config
+    connect = float(cfg.get("LLM_CONNECT_TIMEOUT", 5.0))
+    if streaming:
+        read = float(cfg.get("LLM_READ_TIMEOUT", 300.0))
+        # Never auto-retry a stream: a retry restarts the whole generation while
+        # the first attempt may still be draining upstream, which is duplicate
+        # backend work for one client request. Not configurable for that reason.
+        max_retries = 0
+    else:
+        read = float(cfg.get("LLM_REQUEST_TIMEOUT", 600.0))
+        max_retries = int(cfg.get("LLM_MAX_RETRIES", 1))
+    # write is bounded like read (it covers pushing the request body, e.g. an
+    # audio upload); pool is bounded like connect, and is near-instant anyway
+    # because every call site builds its own single-use client.
+    return openai.Timeout(connect=connect, read=read, write=read, pool=connect), max_retries
+
 
 def _resolve_allow_block(
     ema_type: str,
@@ -446,8 +491,14 @@ def update_stats(
     endpoint_id: int = None,
     duration: float = 0.0,
     audio_seconds: int = 0,
+    aborted: bool = False,
 ):
-    """Update or create ModelStat/EntityStat running totals and append a RequestLog row."""
+    """Update or create ModelStat/EntityStat running totals and append a RequestLog row.
+
+    ``aborted`` marks the RequestLog row as one whose stream ended before the
+    client had read it; its token counts may be estimated (see
+    estimate_abort_usage).
+    """
     now = utcnow()
 
     # Ensure ModelStat row exists before the atomic increment.
@@ -512,35 +563,133 @@ def update_stats(
         audio_seconds=audio_seconds,
         cost=cost,
         duration=duration,
+        aborted=aborted,
     )
     db.session.add(log)
     db.session.flush()
 
 
-def record_aborted_request(entity_id, model_config_id, source, endpoint_id=None, duration=0.0):
-    """Log a zero-cost request_logs row for a stream the client abandoned mid-response.
+# Characters per token for the prompt fallback estimate. The upstream reports the
+# exact prompt_tokens only in its terminal usage chunk, which an aborted stream
+# never reaches, and Lumen has no tokenizer for the (arbitrary, per-endpoint) model.
+_CHARS_PER_TOKEN = 4
 
-    Lets us monitor how often clients disconnect mid-stream. Tokens and cost are 0
-    because the upstream usage totals only arrive in the final chunk, which we never
-    received; since every hosted model has a coin cost, ``cost = 0`` identifies these
-    aborted requests. Best-effort: never raise into the (already closing) generator.
+
+def estimate_prompt_tokens(messages) -> int:
+    """Estimate prompt tokens from the request messages at ~4 characters per token.
+
+    Multimodal content arrives as a list of parts; only their text is counted, so a
+    prompt carrying images or audio is under-estimated.
+    """
+    chars = 0
+    for message in messages or ():
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, str):
+            chars += len(content)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and isinstance(part.get("text"), str):
+                    chars += len(part["text"])
+    return round(chars / _CHARS_PER_TOKEN)
+
+
+def estimate_abort_usage(usage, messages, content_deltas, in_cost_per_million, out_cost_per_million):
+    """Return (input_tokens, output_tokens, cost) for a stream that ended early.
+
+    Prefers the upstream's exact totals when the terminal usage chunk had already
+    arrived — both streaming loops capture ``chunk.usage`` before they test the
+    disconnect flag precisely so a disconnect landing in that window keeps the real
+    figures. Otherwise both counts are estimates: the prompt from its character
+    count, and the output as one token per content delta received, the ratio most
+    OpenAI-compatible backends emit.
+    """
+    if usage is not None:
+        input_tokens = usage.prompt_tokens or 0
+        output_tokens = usage.completion_tokens or 0
+    else:
+        input_tokens = estimate_prompt_tokens(messages)
+        output_tokens = content_deltas
+    cost = round(
+        input_tokens * in_cost_per_million / 1_000_000
+        + output_tokens * out_cost_per_million / 1_000_000,
+        6,
+    )
+    return input_tokens, output_tokens, cost
+
+
+def record_aborted_request(entity_id, model_config_id, source, endpoint_id=None, duration=0.0,
+                           input_tokens=0, output_tokens=0, cost=0.0,
+                           effective=_UNSET, record_extra=None):
+    """Bill and log a request_logs row for a stream the client abandoned mid-response.
+
+    Billed exactly like a completed request — coins deducted and running totals
+    updated — because the backend really produced the tokens the client walked away
+    from; leaving it free is an unlimited free-inference method. The counts are the
+    upstream's exact totals when its terminal usage chunk had arrived, and otherwise
+    the estimate from estimate_abort_usage.
+
+    The row is marked ``aborted``, which is how mid-stream disconnects are monitored.
+    That replaces the old "cost == 0 identifies an abort" convention, which stopped
+    being unique the moment aborted requests started carrying a real cost.
+
+    ``record_extra``, if given, runs inside the same session before the commit, for
+    accounting the caller owns (the API path's per-API-key totals).
+
+    Best-effort: never raise into the (already closing) generator.
     """
     try:
-        db.session.add(RequestLog(
-            time=datetime.now(timezone.utc),
-            entity_id=entity_id,
-            model_config_id=model_config_id,
-            model_endpoint_id=endpoint_id,
-            source=source,
-            input_tokens=0,
-            output_tokens=0,
-            cost=0,
-            duration=duration,
-        ))
+        subtract_coins(entity_id, model_config_id, cost, effective=effective)
+        update_stats(
+            entity_id, model_config_id, source,
+            input_tokens, output_tokens, cost,
+            endpoint_id=endpoint_id, duration=duration, aborted=True,
+        )
+        if record_extra is not None:
+            record_extra()
         db.session.commit()
     except Exception:
         logger.exception("failed to record aborted request (entity_id=%s, model=%s)", entity_id, model_config_id)
         db.session.rollback()
+
+
+def record_stream_abort(app, *, billed, entity_id, model_config_id, source, endpoint_id, started_at,
+                        input_tokens=0, output_tokens=0, cost=0.0, effective=_UNSET, record_extra=None,
+                        reason="disconnect"):
+    """Abort accounting for a streaming generator that ends before billing.
+
+    Every path that can end a stream early shares this, so they cannot drift:
+    the ``GeneratorExit`` raised when the response iterable is closed, and the
+    polled client-disconnect flag. Does nothing once billing has completed.
+
+    ``reason`` labels the ``lumen_stream_aborts_total`` counter. It is passed in
+    rather than inferred here: both of this function's callers arrive from a
+    client going away, so nothing distinguishable is available at this seam.
+
+    Pushes its own short-lived application context because the streaming
+    generators run context-free; call it only from a point with no ``yield``
+    in scope, so no context can span one. Best-effort, like the
+    ``record_aborted_request`` it wraps: the caller is usually a generator that
+    is already unwinding, so a failure here (including one raised by the
+    context teardown's session release) must not replace the original exit.
+    """
+    if billed:
+        return
+    # Counted before the anonymous-stream guard so the metric measures aborts,
+    # not billable aborts — and outside the try below so a DB failure still
+    # leaves the abort visible.
+    observe_stream_abort(source, reason)
+    if entity_id is None:
+        return
+    try:
+        with app.app_context():
+            record_aborted_request(
+                entity_id, model_config_id, source,
+                endpoint_id=endpoint_id, duration=time.time() - started_at,
+                input_tokens=input_tokens, output_tokens=output_tokens, cost=cost,
+                effective=effective, record_extra=record_extra,
+            )
+    except Exception:
+        logger.exception("abort accounting failed (entity_id=%s, model=%s)", entity_id, model_config_id)
 
 
 def send_message_stream(
@@ -562,12 +711,18 @@ def send_message_stream(
     re-pushes the request's context onto whichever worker thread iterates the
     body, and an abandoned generator leaves it stuck there, poisoning every
     later request on that thread.
+
+    The client-disconnect flag is captured here, while the request context is
+    still current, and polled inside the generator. GeneratorExit alone is not
+    enough: under uvicorn + a2wsgi the response generator is never closed on a
+    disconnect, so that handler never fires in production.
     """
     app = current_app._get_current_object()
-    return _send_message_stream(app, messages, model, entity_id, source, effective)
+    disconnected = client_disconnect_event()
+    return _send_message_stream(app, messages, model, entity_id, source, effective, disconnected)
 
 
-def _send_message_stream(app, messages, model, entity_id, source, effective):
+def _send_message_stream(app, messages, model, entity_id, source, effective, disconnected):
     with app.app_context():
         config = db.session.execute(select(ModelConfig).where(ModelConfig.model_name == model, ModelConfig.active)).scalar_one_or_none()
         if config is None:
@@ -590,15 +745,50 @@ def _send_message_stream(app, messages, model, entity_id, source, effective):
         # Derive the per-entity prefix-cache salt while a context is current;
         # the create() call below runs context-free (no current_app). See #36.
         cache_salt   = cache_salt_for_entity(entity_id) if entity_id is not None else None
+        # Same reason: read the upstream bounds here, into plain scalars in this
+        # generator's frame. openai.OpenAI() below is constructed after this
+        # context has exited, where current_app does not exist.
+        timeout, max_retries = upstream_call_bounds(streaming=True)
 
     t0 = time.time()
     t_first = None
     parts = []
     usage = None
     billed = False
+    aborted = False
+    # Which stage a failure came from, for the abort metric's reason label.
+    phase = "upstream"
+
+    def _abort():
+        """Bill and log what this stream consumed before the client went away.
+
+        Reads ``usage``/``parts`` at call time, so it reflects however far the
+        stream got. Shared by the break-on-disconnect path and GeneratorExit so
+        the two cannot bill differently.
+        """
+        input_tokens, output_tokens, cost = estimate_abort_usage(
+            usage, messages, len(parts), mc_in_cost, mc_out_cost)
+        record_stream_abort(
+            app, billed=billed, entity_id=entity_id, model_config_id=mc_id,
+            source=source, endpoint_id=ep_id, started_at=t0,
+            input_tokens=input_tokens, output_tokens=output_tokens, cost=cost,
+            effective=effective,
+        )
 
     try:
-        with openai.OpenAI(api_key=ep_api_key, base_url=ep_url) as client:
+        # max_retries=0: a streaming call is never auto-retried. A retry
+        # restarts the whole generation while the first attempt may still be
+        # draining upstream, so one client request becomes two backend
+        # generations — and the tokens already streamed to the client cannot be
+        # un-sent. LLM_MAX_RETRIES applies to the non-streaming paths only.
+        #
+        # The read timeout here is the maximum gap *between* chunks, so a long
+        # generation is unaffected. It is also what bounds F10: the disconnect
+        # flag is only polled between chunks, so while blocked in the upstream's
+        # __next__() a disconnect cannot be observed at all — the read timeout
+        # caps that blind window instead of leaving it unbounded.
+        with openai.OpenAI(api_key=ep_api_key, base_url=ep_url,
+                           timeout=timeout, max_retries=max_retries) as client:
             stream = client.chat.completions.create(
                 model=remote_model,
                 messages=messages,
@@ -609,8 +799,15 @@ def _send_message_stream(app, messages, model, entity_id, source, effective):
 
             thinking_parts = []
             for chunk in stream:
+                # Capture usage before testing the flag. The totals ride on the
+                # terminal chunk, so a disconnect landing in that same window
+                # would otherwise throw away figures already in hand — and bill
+                # nothing for work the backend actually did.
                 if chunk.usage:
                     usage = chunk.usage
+                if disconnected.is_set():
+                    aborted = True
+                    break
                 if chunk.choices:
                     delta = chunk.choices[0].delta
                     reasoning = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
@@ -623,6 +820,15 @@ def _send_message_stream(app, messages, model, entity_id, source, effective):
                             t_first = time.time() - t0
                         parts.append(text)
                         yield text, None, None
+
+        if aborted:
+            # Control has left the `with`, so the client is closed and the
+            # upstream generation already aborted; only now do the DB work.
+            # Keyed off the break rather than the flag itself: a client that
+            # disappears *after* a complete stream still has usage in hand and
+            # must be billed normally, not written off as an abort.
+            _abort()
+            return
 
         duration = time.time() - t0
         reply = "".join(parts)
@@ -637,6 +843,7 @@ def _send_message_stream(app, messages, model, entity_id, source, effective):
         output_speed = output_tokens / duration if duration > 0 else 0.0
 
         if entity_id is not None:
+            phase = "billing"
             with app.app_context():
                 subtract_coins(entity_id, mc_id, cost, effective=effective)
                 update_stats(
@@ -647,11 +854,21 @@ def _send_message_stream(app, messages, model, entity_id, source, effective):
                 db.session.commit()
             billed = True
     except GeneratorExit:
-        # Client disconnected mid-stream before billing — log a zero-cost request
-        # so we can monitor how often this happens, then re-raise to close cleanly.
-        if entity_id is not None and not billed:
-            with app.app_context():
-                record_aborted_request(entity_id, mc_id, source, endpoint_id=ep_id, duration=time.time() - t0)
+        # Client disconnected mid-stream before billing — bill what was consumed
+        # and log it as an abort, then re-raise to close cleanly.
+        _abort()
+        raise
+    except Exception:
+        # An upstream failure (including the read timeout above) ends the stream
+        # just as surely as a disconnect, and is counted so the two are
+        # distinguishable on the same metric. No billing here: the exception
+        # propagates to the view, which owns the client-facing error.
+        #
+        # `phase` keeps a failed DB commit out of the upstream bucket: the
+        # stream succeeded and only the accounting broke, and reporting that as
+        # an upstream failure sends an operator hunting a backend problem that
+        # does not exist.
+        observe_stream_abort(source, f"{phase}_error")
         raise
 
     yield None, None, {

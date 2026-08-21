@@ -62,3 +62,15 @@ class RequestLog(db.Model):
     audio_seconds: Mapped[int] = mapped_column(db.Integer, default=0, comment="Seconds of audio transcribed/translated; 0 for text requests")
     # Total proxy response time in seconds
     duration: Mapped[float] = mapped_column(db.Float, default=0.0, comment="Total proxy response time in seconds")
+    # Set when the client went away before the stream finished. The upstream
+    # reports usage only in its terminal chunk, so an aborted request's token
+    # counts are an estimate unless that chunk had already arrived. This replaces
+    # the old "cost == 0 identifies an abort" convention, which stops being
+    # unique once aborted requests are billed for what they consumed.
+    aborted: Mapped[bool] = mapped_column(
+        db.Boolean,
+        default=False,
+        server_default=sa.false(),
+        nullable=False,
+        comment="Client disconnected before the stream completed; token counts may be estimated",
+    )
