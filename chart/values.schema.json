@@ -434,5 +434,39 @@
         }
       }
     }
-  }
+  },
+  "allOf": [
+    {
+      "description": "Multi-worker metric aggregation needs a shared directory.",
+      "if": {
+        "properties": {
+          "wsgiProcesses": { "type": "integer", "minimum": 2 },
+          "api": {
+            "properties": {
+              "prometheus": {
+                "properties": {
+                  "enabled": { "const": true }
+                }
+              }
+            }
+          }
+        },
+        "required": ["wsgiProcesses", "api"]
+      },
+      "then": {
+        "properties": {
+          "api": {
+            "properties": {
+              "prometheus": {
+                "required": ["multiprocDir"],
+                "properties": {
+                  "multiprocDir": { "type": "string", "minLength": 1 }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
 }

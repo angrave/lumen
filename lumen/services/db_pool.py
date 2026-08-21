@@ -222,9 +222,11 @@ def build_engine_options(uri: str, db_cfg: dict, *, workers: int, replicas: int)
         "pool_pre_ping": True,
         # QueuePool is what SQLAlchemy would pick for Postgres anyway; the
         # subclass only times how long each checkout blocks (lumen_db_pool_wait_
-        # seconds), which no pool event can report. Not set on the
-        # max_connections-unavailable fallback above, which deliberately leaves
-        # every pool setting to SQLAlchemy's defaults.
+        # seconds), which no pool event can report. Also set on the
+        # max_connections-unavailable fallback (_passthrough_options): a DB that
+        # was unreachable at startup is exactly when checkout waits are worth
+        # seeing, so the instrumentation must not be missing where it matters
+        # most.
         "poolclass": TimingQueuePool,
     }
     for key in _PASSTHROUGH_KEYS:

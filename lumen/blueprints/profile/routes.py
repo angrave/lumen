@@ -458,14 +458,35 @@ def _usage_entity_id():
 
 
 def _entity_aggregate_earliest_bucket():
-    """Earliest bucket held by ``request_counts_hourly_by_entity`` (None if empty).
+    """Earliest *materialized* bucket held by ``request_counts_hourly_by_entity``
+    (None if empty).
 
-    One cheap ``MIN()`` over the aggregate, cached on ``g`` for the life of the
-    request. PostgreSQL only; every caller sits behind a dialect check.
+    Reads the aggregate's materialization hypertable, not the real-time view
+    itself: the view is ``materialized_only = false`` and in the un-backfilled
+    state it is created ``WITH NO DATA``, so ``MIN(bucket)`` against it scans
+    every raw ``request_logs`` row below the policy watermark. Only the
+    materialization hypertable holds what has actually been refreshed — which
+    is exactly what ``_entity_aggregate_covers`` needs to decide — and it is a
+    fast ``MIN`` regardless of backfill lag. Resolved via the catalog — the
+    same approach as ``commands.py`` (which, to be precise, also resolves the
+    bucket *column*; here that column is hardcoded to ``bucket``, the
+    aggregate's first column). Then cached on ``g``. PostgreSQL only; every
+    caller sits behind a dialect check.
     """
     if "usage_entity_agg_earliest" not in g:
+        mat_table = db.session.execute(text(
+            "SELECT materialization_hypertable_schema || '.' || "
+            "materialization_hypertable_name "
+            "FROM timescaledb_information.continuous_aggregates "
+            "WHERE view_name = 'request_counts_hourly_by_entity'"
+        )).scalar()
+        # The catalog row exists whenever the aggregate does (the pair is
+        # created atomically), so this None-guard only protects against a
+        # dialect the caller should have filtered out. Falling back to the view
+        # name keeps an unexpected state from turning into a confusing
+        # "FROM None" instead of a normal query error.
         g.usage_entity_agg_earliest = db.session.execute(
-            text("SELECT MIN(bucket) FROM request_counts_hourly_by_entity")
+            text(f"SELECT MIN(bucket) FROM {mat_table or 'request_counts_hourly_by_entity'}")
         ).scalar()
     return g.usage_entity_agg_earliest
 

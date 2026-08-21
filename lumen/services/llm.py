@@ -1,5 +1,6 @@
 import logging
 import math
+import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -89,14 +90,23 @@ def observe_rejection_quietly(reason: str, source: str, model: str = "") -> None
 
     Same shape (and same reason) as ``_observe_rejection_quietly`` in
     ``lumen/__init__.py``: a counter that cannot be incremented is not a reason
-    to fail a request that was already being rejected cleanly. The import is
-    deferred so the name resolves at call time — the middleware module is the
-    one place ``observe_rejection`` lives, and rebinding it there (as the tests
-    do) must reach this call site.
+    to fail a request that was already being rejected cleanly.
+
+    Never *triggers* the import of the metrics middleware — the same rule (and
+    the same ``sys.modules`` lookup) as ``pool_tracker._observe_wait`` and
+    ``wsgi_disconnect._observe_shed``: prometheus_client binds each metric to
+    its mmap file at construction, so an import landing before
+    PROMETHEUS_MULTIPROC_DIR is set produces metrics no scrape will ever merge.
+    Looking the module up keeps this a no-op until the app has imported it in
+    the right order. Rebinding ``observe_rejection`` on the module (as the tests
+    do) still reaches this call site, because the attribute lookup happens here
+    at call time.
     """
+    middleware = sys.modules.get("lumen.blueprints.metrics.middleware")
+    if middleware is None:
+        return
     try:
-        from lumen.blueprints.metrics.middleware import observe_rejection
-        observe_rejection(reason, source, model)
+        middleware.observe_rejection(reason, source, model)
     except Exception:  # noqa: BLE001 - instrumentation must never escalate
         pass
 
@@ -572,7 +582,10 @@ def coin_retry_after(entity_id: int) -> Optional[int]:
             return None
         last_refill = balance.last_refill_at
         if last_refill.tzinfo is not None:
-            last_refill = last_refill.replace(tzinfo=None)
+            # last_refill_at is documented as UTC; a stray aware value is
+            # interpreted as such, so normalize rather than discarding an offset
+            # that means something else.
+            last_refill = last_refill.astimezone(timezone.utc).replace(tzinfo=None)
         due_in = (last_refill + REFILL_INTERVAL - utcnow()).total_seconds()
         # Floored at 1: a refill already due arrives within the refiller's next
         # 60s pass, and "come back in 0 seconds" is an invitation to hot-loop.

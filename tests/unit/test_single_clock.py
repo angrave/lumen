@@ -1,7 +1,8 @@
 """Guard the LLM timing paths against a second clock.
 
-Every span measured in ``lumen/services/llm.py`` and
-``lumen/blueprints/api/routes.py`` — ``duration``, ``t_first``, and the abort
+Every span measured in ``lumen/services/llm.py``, ``lumen/blueprints/api/routes.py``,
+``lumen/blueprints/chat/routes.py``, and ``lumen/services/wsgi_disconnect.py`` —
+``duration``, ``t_first``, ``queue_wait``, ``send_blocked``, and the abort
 accounting's ``duration`` computed from the caller's ``stream_t0`` — must come
 from ``time.monotonic()``, the same clock the request-arrival instrumentation
 stamps with. Mixing the two produces sums with no meaning, and a subtraction
@@ -27,6 +28,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 GUARDED_FILES = [
     REPO_ROOT / "lumen" / "services" / "llm.py",
     REPO_ROOT / "lumen" / "blueprints" / "api" / "routes.py",
+    # Timing spans start and are consumed on these paths too:
+    REPO_ROOT / "lumen" / "blueprints" / "chat" / "routes.py",
+    REPO_ROOT / "lumen" / "services" / "wsgi_disconnect.py",
 ]
 
 # (relative path, line number) pairs exempted from the rule. Each entry needs a

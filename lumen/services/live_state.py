@@ -57,6 +57,18 @@ _DEFAULT_REQUEST_BUDGET = 600.0
 
 #: Added to the request budget so a request that is merely finishing late is not
 #: dropped from the count while it is still running.
+#:
+#: This grace is also the wall-clock skew tolerance between the process that
+#: *mints* a deadline (writer's ``time.time()``, in :func:`_mint`) and the
+#: process that *prunes* it (:class:`RedisLiveState.snapshot` removes scores at
+#: or below the reader's own ``time.time()``). A reader whose clock *leads* the
+#: writer's by more than ``request_budget + grace`` prunes too aggressively and
+#: wrongly drops a still-live in-flight ticket — an under-count — so raise
+#: ``_DEADLINE_GRACE`` to keep that leading edge inside tolerance. A reader that
+#: *lags* prunes too little and holds expired tickets past their deadline, an
+#: over-count that self-corrects once the lagging reader catches up; it is the
+#: other skew direction and needs no code, only awareness. (Local, per-process
+#: state never crosses a clock, so only the Redis backend is affected.)
 _DEADLINE_GRACE = 60.0
 
 #: One sorted set per model under this fixed prefix. The URL comes from rate

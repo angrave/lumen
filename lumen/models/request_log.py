@@ -24,6 +24,12 @@ class RequestLog(db.Model):
         db.Index("ix_request_logs_time", "time"),
         db.Index("ix_request_logs_entity_id", "entity_id"),
         db.Index("ix_request_logs_model_config_id", "model_config_id"),
+        # Composite on the analytics predicate (model + time). Created by
+        # migration f7a8b9c0d1e2 on PostgreSQL only; declared here so the model
+        # and a fresh create_all agree with an upgraded schema (no autogenerate
+        # drift). Column names are the string form because __table_args__ is
+        # evaluated before the mapped columns exist.
+        db.Index("ix_request_logs_model_config_id_time", "model_config_id", sa.desc("time")),
         {"comment": "Append-only request log; TimescaleDB hypertable on PostgreSQL, plain table on SQLite"},
     )
 

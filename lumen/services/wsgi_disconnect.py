@@ -389,11 +389,12 @@ class _DisconnectAwareWSGIResponder(WSGIResponder):
     def _release(self) -> None:
         """Drop this request from whichever counter holds it.
 
-        Idempotent, and called from both the worker thread's ``finally`` and
-        ``__call__``'s: the second one is what covers a request that never
-        reached a thread at all (a submit that raised, or the ASGI task being
-        cancelled while the item was still queued). A counter that only ever
-        goes up is the failure this guards against.
+        Idempotent, and called from the worker thread's ``finally`` — the
+        request is done writing, so whichever state it was in is released here.
+        A counter that only ever goes up is the failure this guards against.
+        (``__call__``'s cancellation path must use :meth:`_release_if_queued`
+        instead: a cancelled ASGI task must not release a request that is still
+        running on a worker thread.)
         """
         global _queued, _running
         with _counter_lock:
@@ -402,6 +403,26 @@ class _DisconnectAwareWSGIResponder(WSGIResponder):
             elif self._accounted == "running":
                 _running -= 1
             self._accounted = None
+
+    def _release_if_queued(self) -> None:
+        """Release a request that never reached a worker thread, or do nothing.
+
+        ``__call__``'s ``finally`` must NOT use plain ``_release()``. When the
+        ASGI task is cancelled, cancelling the ``run_in_executor`` wrapper
+        future succeeds even though the underlying work item may already be
+        executing on a worker thread — cancelling the asyncio future does not
+        cancel the ``concurrent.futures`` item behind it. Releasing the
+        ``running`` count here would under-count busy threads for however long
+        the abandoned request keeps draining upstream. So this releases the
+        ``queued`` ticket only; if the worker thread already picked the item up,
+        ``_run_wsgi``'s own ``finally`` owns the release once it truly finishes.
+        Idempotent.
+        """
+        global _queued
+        with _counter_lock:
+            if self._accounted == "queued":
+                _queued -= 1
+                self._accounted = None
 
     def _shed_disconnected(self, environ: typing.Any, start_response: typing.Any) -> None:
         """Answer a queued request whose client already left, without the app."""
@@ -540,7 +561,7 @@ class _DisconnectAwareWSGIResponder(WSGIResponder):
                     self.exc_info[1], self.exc_info[2]
                 )
         finally:
-            self._release()
+            self._release_if_queued()
             if pump and not pump.done():
                 pump.cancel()
             if sender and not sender.done():

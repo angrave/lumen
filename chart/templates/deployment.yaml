@@ -102,7 +102,7 @@ spec:
               value: {{ .Values.wsgiWorkers | quote }}
             - name: LUMEN_WSGI_SEND_TIMEOUT
               value: {{ .Values.wsgiSendTimeout | quote }}
-            {{- if .Values.api.prometheus.multiprocDir }}
+            {{- if and .Values.api.prometheus.enabled .Values.api.prometheus.multiprocDir }}
             - name: PROMETHEUS_MULTIPROC_DIR
               value: {{ .Values.api.prometheus.multiprocDir | quote }}
             {{- end }}
@@ -181,7 +181,7 @@ spec:
               mountPath: {{ printf "/app/themes/%s" $name }}
               readOnly: true
             {{- end }}
-            {{- if .Values.api.prometheus.multiprocDir }}
+            {{- if and .Values.api.prometheus.enabled .Values.api.prometheus.multiprocDir }}
             - name: prometheus-multiproc
               mountPath: {{ .Values.api.prometheus.multiprocDir }}
             {{- end }}
@@ -194,11 +194,11 @@ spec:
           persistentVolumeClaim:
             claimName: {{ $theme.pvc }}
         {{- end }}
-        {{- if .Values.api.prometheus.multiprocDir }}
-        # Mounted whenever multiprocDir is configured, not only when
-        # wsgiProcesses > 1: prometheus_client enters multiprocess mode as soon as
-        # PROMETHEUS_MULTIPROC_DIR is set (lumen/__init__.py setdefaults it from
-        # config independently of the process count) and raises if the directory
+        {{- if and .Values.api.prometheus.enabled .Values.api.prometheus.multiprocDir }}
+        # Mounted whenever Prometheus is enabled AND multiprocDir is configured, not
+        # only when wsgiProcesses > 1: prometheus_client enters multiprocess mode as
+        # soon as PROMETHEUS_MULTIPROC_DIR is set (lumen/__init__.py setdefaults it
+        # from config independently of the process count) and raises if the directory
         # does not exist. Env var set must imply directory present.
         - name: prometheus-multiproc
           emptyDir: {}

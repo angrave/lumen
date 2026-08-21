@@ -369,6 +369,13 @@ def chat_stream():
             logger.exception("chat_stream error (model=%s, entity=%s)", model, entity_id)
             yield f"data: {json.dumps({'error': 'An error occurred. Please try again.'})}\n\n"
         finally:
+            # Bound the live count before anything that could raise. close()
+            # can itself raise (a generator that does not handle the
+            # GeneratorExit thrown at its yield propagates RuntimeError), so it
+            # must never run ahead of the release — a leak that only shows as an
+            # inflated count. The ticket's deadline is the backstop, but the
+            # release is the honest path.
+            live_state.release(ticket)
             # Close the LLM stream here rather than leaving it to be collected.
             # Closing it is what raises GeneratorExit inside send_message_stream,
             # and that handler is where an abandoned stream gets billed. Two
@@ -380,11 +387,6 @@ def chat_stream():
             # collection is swallowed — so the abort accounting would silently
             # never happen. A no-op once the stream has run to completion.
             llm_stream.close()
-            # Best effort, not the correctness argument: an abandoned generator
-            # is never closed, so this may never run. The ticket's deadline is
-            # what bounds the count. Context-free — no db.session, no
-            # current_app.
-            live_state.release(ticket)
 
     resp = Response(generate(), content_type="text/event-stream")
     resp.headers["X-Accel-Buffering"] = "no"

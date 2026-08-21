@@ -61,14 +61,18 @@ def _rejection_source() -> str:
 def _observe_rejection_quietly(reason: str, source: str, model: str) -> None:
     """Count a rejection, never at the cost of the response.
 
-    The metrics middleware is only imported when Prometheus is enabled (see the
-    ordering constraint in create_app), so this import has to be lazy and its
-    absence has to be survivable. A counter that cannot be incremented is not a
-    reason to fail a request that was already being rejected cleanly.
+    Never *triggers* the import of the metrics middleware — the same rule (and
+    the same ``sys.modules`` lookup) as ``pool_tracker._observe_wait``: the
+    metrics middleware is only imported when Prometheus is enabled, and like the
+    other quiet observers it must stay a no-op until the app imports it in the
+    right order. A counter that cannot be incremented is not a reason to fail a
+    request that was already being rejected cleanly.
     """
+    middleware = sys.modules.get("lumen.blueprints.metrics.middleware")
+    if middleware is None:
+        return
     try:
-        from lumen.blueprints.metrics.middleware import observe_rejection
-        observe_rejection(reason, source, model)
+        middleware.observe_rejection(reason, source, model)
     except Exception:  # noqa: BLE001 - instrumentation must never escalate
         pass
 
