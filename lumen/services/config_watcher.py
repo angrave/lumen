@@ -25,9 +25,9 @@ _version_warned = False
 # dev database and dropping its tables on every run. Warn rather than fail, so a
 # config written for a newer version still boots.
 KNOWN_APP_KEYS = frozenset({
-    "announcement", "database", "debug", "dev_user", "encryption_key",
-    "github_url", "graylist_default_notice", "logs", "name", "secret_key",
-    "tagline", "theme",
+    "announcement", "config_editor", "database", "debug", "dev_user",
+    "email_themes", "encryption_key", "github_url", "graylist_default_notice",
+    "logs", "name", "secret_key", "tagline", "theme",
 })
 
 
