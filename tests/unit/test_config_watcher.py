@@ -314,6 +314,56 @@ def test_known_app_keys_do_not_warn(app, caplog, restore_config):
     assert not any("unrecognised key" in r.getMessage() for r in caplog.records)
 
 
+def test_every_app_cfg_read_is_in_known_app_keys():
+    """Reverse guard: every key read off ``app_cfg`` must be recognised.
+
+    KNOWN_APP_KEYS is the allowlist that turns a stale, silently-ignored key
+    into a loud warning. Its forward test (test_known_app_keys_do_not_warn)
+    builds its input from the constant itself, so it cannot catch the constant
+    drifting out of step with the reads in apply_hot_config / _apply_theme —
+    which is exactly what happened when the set shipped incomplete. This walks
+    the module's AST instead and asserts the set actually covers every read.
+    """
+    import ast
+    from pathlib import Path
+
+    from lumen.services.config_watcher import KNOWN_APP_KEYS
+
+    source = Path(
+        Path(__file__).resolve().parents[2] / "lumen" / "services" / "config_watcher.py"
+    ).read_text()
+    tree = ast.parse(source)
+
+    read_keys = set()
+    for node in ast.walk(tree):
+        # app_cfg.get("key", default) — first positional literal is the read
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "app_cfg"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+        ):
+            read_keys.add(node.args[0].value)
+        # app_cfg["key"] — subscription form
+        elif (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "app_cfg"
+            and isinstance(node.slice, ast.Constant)
+            and isinstance(node.slice.value, str)
+        ):
+            read_keys.add(node.slice.value)
+
+    assert read_keys, "no app_cfg reads found — the AST walk may be stale"
+    assert read_keys <= set(KNOWN_APP_KEYS), (
+        f"app_cfg keys read but missing from KNOWN_APP_KEYS: {sorted(read_keys - set(KNOWN_APP_KEYS))}"
+    )
+
+
 def test_shipped_configs_have_no_unknown_app_keys():
     """The fixture and the shipped configs must stay in step with the schema.
 
