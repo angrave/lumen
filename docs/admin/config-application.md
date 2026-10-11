@@ -182,8 +182,6 @@ config live **under `api:`** (e.g. `api.monitoring.token`, `api.prometheus.enabl
 
 ```yaml
 api:
-  consent: true        # set to false to exempt API requests from the model acknowledgement requirement
-
   monitoring:
     token: "my-secret-token"
 
@@ -194,9 +192,7 @@ api:
     multiproc_dir: ""  # path for multi-worker aggregation (e.g. /tmp/prometheus_multiproc)
 ```
 
-| Field | Description |
-|-------|-------------|
-| `consent` | When `true` (default), API requests to models with `needs_ack: true` require recorded acknowledgement, just like the web UI. Set to `false` to exempt API requests from the acknowledgement requirement. |
+API requests always require model acknowledgment, just like the web UI: an API key cannot list or use a model with `needs_ack` or `early_access` until its user or project has acknowledged it. See [API access to models awaiting acknowledgment](../guides/connect.md#models-awaiting-acknowledgment).
 
 ### api.monitoring
 
