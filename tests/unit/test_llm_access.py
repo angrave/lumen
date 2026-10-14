@@ -32,6 +32,14 @@ def _set_needs_ack(app, model_id):
     db.session.commit()
 
 
+def _grant_pool(app, entity_id):
+    """Give the entity a usable pool: a needs_consent denial presupposes one."""
+    from lumen.extensions import db
+    from lumen.models.entity_limit import EntityLimit
+    db.session.add(EntityLimit(entity_id=entity_id, max_coins=-2, refresh_coins=0, starting_coins=0))
+    db.session.commit()
+
+
 def _set_early_access(app, model_id):
     from lumen.extensions import db
     from lumen.models.model_config import ModelConfig
@@ -436,11 +444,12 @@ def test_blocked_model_is_counted_as_no_access(app, ids, test_model, monkeypatch
         owner_id = _make_entity()
         set_model_owner(model_id, owner_id)
         recorded = _recorder(monkeypatch)
-        ok, code, _msg, _eff = check_coin_budget(
+        ok, code, _msg, _eff, reason = check_coin_budget(
             entity_id, model_id, source="api", model_name=test_model["model_name"],
         )
         assert ok is False
         assert code == HTTPStatus.FORBIDDEN
+        assert reason == "no_access"
         assert recorded == [("no_access", "api", test_model["model_name"])]
 
 
@@ -455,14 +464,44 @@ def test_unacknowledged_model_is_counted_as_needs_consent(app, ids, test_model, 
     from lumen.services.llm import check_coin_budget
     entity_id, model_id = ids
     with app.app_context():
+        _grant_pool(app, entity_id)
         _set_needs_ack(app, model_id)
         recorded = _recorder(monkeypatch)
-        ok, code, _msg, _eff = check_coin_budget(
+        ok, code, _msg, _eff, reason = check_coin_budget(
             entity_id, model_id, source="chat", model_name=test_model["model_name"],
         )
         assert ok is False
         assert code == HTTPStatus.FORBIDDEN
+        assert reason == "needs_consent"
         assert recorded == [("needs_consent", "chat", test_model["model_name"])]
+
+
+def test_zero_pool_unacknowledged_model_is_counted_as_no_access(app, ids, test_model, monkeypatch):
+    """Pool eligibility outranks the acknowledgement gate in the taxonomy.
+
+    An entity with a 0-coin pool is refused by the acknowledge endpoint too, so
+    labelling its denial needs_consent would send it chasing a 404.
+    """
+    from http import HTTPStatus
+
+    from lumen.extensions import db
+    from lumen.models.entity_limit import EntityLimit
+    from lumen.services.llm import check_coin_budget
+    entity_id, model_id = ids
+    with app.app_context():
+        db.session.add(EntityLimit(
+            entity_id=entity_id, max_coins=0, refresh_coins=0, starting_coins=0,
+        ))
+        _set_needs_ack(app, model_id)
+        db.session.commit()
+        recorded = _recorder(monkeypatch)
+        ok, code, _msg, _eff, reason = check_coin_budget(
+            entity_id, model_id, source="api", model_name=test_model["model_name"],
+        )
+        assert ok is False
+        assert code == HTTPStatus.FORBIDDEN
+        assert reason == "no_access"
+        assert recorded == [("no_access", "api", test_model["model_name"])]
 
 
 def test_acknowledged_blocked_model_is_counted_as_no_access(app, ids, test_model, monkeypatch):
@@ -496,7 +535,7 @@ def test_access_counting_never_breaks_the_rejection(app, ids, test_model, monkey
     with app.app_context():
         _set_needs_ack(app, model_id)
         monkeypatch.setattr("lumen.blueprints.metrics.middleware.observe_rejection", boom)
-        ok, code, msg, _eff = check_coin_budget(
+        ok, code, msg, _eff, _reason = check_coin_budget(
             entity_id, model_id, source="chat", model_name=test_model["model_name"],
         )
         assert ok is False
